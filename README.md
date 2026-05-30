@@ -140,3 +140,4 @@ runtime provide `modelPath` plus `libraryPath` or `libraryDir`. Image input addi
 
 The port intentionally keeps capabilities in one native library instead of reproducing the NodeJS workspace's plugin package split. External service adapters from the TypeScript version are represented by C++ interfaces first; native provider implementations can be added behind those interfaces without introducing plugins.
 # cpp-Agent
+# cpp-agent
