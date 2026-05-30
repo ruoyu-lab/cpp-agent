@@ -1,6 +1,26 @@
 # Native Agent Framework
 
-This directory is the parallel native C++ version of the TypeScript `@node-agent` workspace in `../NodeJS`.
+This directory is the parallel native C++ version of the TypeScript
+`@node-agent` workspace in `../NodeJS`.
+
+## Positioning
+
+This tree is not just a "next version" of the NodeJS workspace.
+
+| Tree | Primary role | Best fit |
+|---|---|---|
+| `../NodeJS` | Node-specific SDK and integration surface | Node.js applications and npm-centric deployments |
+| `./` | Cross-language embeddable native kernel | Java, Rust, C, C#, Go, Python, and other hosts that want to call the framework through a C ABI and own the host runtime boundaries |
+
+The C++ runtime tracks NodeJS where externally observable behavior should stay
+compatible, but the deployment model is intentionally different:
+
+- zero-dependency core by default
+- host-owned transports, drivers, browser engines, and external service clients
+- one embeddable native library instead of the npm workspace package split
+
+See [`../ENGINEERING.md`](../ENGINEERING.md) for the repo-level engineering
+roadmap, technical debt priorities, and recommended abstraction work.
 
 Current migration stage:
 

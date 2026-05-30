@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "event bus publishes stable observable envelope",
+      "publish": {
+        "category": "tool.completed",
+        "target": "tool",
+        "payload": {
+          "toolName": "fixture.weather",
+          "toolCallId": "call_weather"
+        },
+        "trace": {
+          "traceId": "trace_contract",
+          "spanId": "span_contract",
+          "parentSpanId": "parent_contract",
+          "spanName": "tool fixture",
+          "runId": "run_contract",
+          "workflowRunId": "workflow_contract"
+        }
+      },
+      "expectedShape": {
+        "eventId": {
+          "$type": "string",
+          "nonEmpty": true
+        },
+        "timestamp": {
+          "$type": "string",
+          "nonEmpty": true
+        },
+        "category": "tool.completed",
+        "target": "tool",
+        "payload": {
+          "toolName": "fixture.weather",
+          "toolCallId": "call_weather"
+        },
+        "traceId": "trace_contract",
+        "spanId": "span_contract",
+        "parentSpanId": "parent_contract",
+        "spanName": "tool fixture",
+        "runId": "run_contract",
+        "workflowRunId": "workflow_contract"
+      }
+    },
+    {
+      "name": "event bus emits null trace fields when no trace is supplied",
+      "publish": {
+        "category": "model.text_delta",
+        "target": "model",
+        "payload": {
+          "delta": "hello"
+        }
+      },
+      "expectedShape": {
+        "eventId": {
+          "$type": "string",
+          "nonEmpty": true
+        },
+        "timestamp": {
+          "$type": "string",
+          "nonEmpty": true
+        },
+        "category": "model.text_delta",
+        "target": "model",
+        "payload": {
+          "delta": "hello"
+        },
+        "traceId": null,
+        "spanId": null,
+        "parentSpanId": null,
+        "spanName": null,
+        "runId": null,
+        "workflowRunId": null
+      }
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+build/
+build-*/
+build-release/
+build-debug/
+build-llama/
+.DS_Store
+compile_commands.json
+.cache/
+.clangd/
+# Stray smoke-artifacts directories from older runs that wrote under the
+# source tree. Newer smoke runs use the OS temp directory and never touch
+# the repo. Kept as belt-and-suspenders against legacy checkouts.
+smoke-artifacts/

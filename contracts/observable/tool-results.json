@@ -1,0 +1,129 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "tool result envelope keeps content and value output",
+      "toolCall": {
+        "id": "call_weather",
+        "name": "fixture.weather",
+        "arguments": {
+          "city": "Seoul"
+        }
+      },
+      "handler": {
+        "kind": "envelope",
+        "content": [
+          {
+            "type": "text",
+            "text": "Weather: sunny 21c",
+            "metadata": {
+              "source": "contract"
+            }
+          }
+        ],
+        "value": {
+          "answer": 42,
+          "ok": true
+        },
+        "metadata": {
+          "source": "fixture"
+        }
+      },
+      "expected": {
+        "ok": true,
+        "resultKind": "envelope",
+        "error": "",
+        "output": "{\n  \"answer\": 42,\n  \"ok\": true\n}",
+        "message": {
+          "role": "tool",
+          "content": [
+            {
+              "type": "text",
+              "text": "Weather: sunny 21c",
+              "metadata": {
+                "source": "contract"
+              }
+            }
+          ],
+          "name": "fixture.weather",
+          "toolCallId": "call_weather",
+          "toolCalls": [],
+          "metadata": {
+            "ok": true,
+            "source": "fixture"
+          }
+        }
+      }
+    },
+    {
+      "name": "plain value result becomes text tool message",
+      "toolCall": {
+        "id": "call_echo",
+        "name": "fixture.echo",
+        "arguments": {
+          "text": "hello"
+        }
+      },
+      "handler": {
+        "kind": "value",
+        "value": {
+          "echo": "hello"
+        }
+      },
+      "expected": {
+        "ok": true,
+        "resultKind": "value",
+        "error": "",
+        "output": "{\n  \"echo\": \"hello\"\n}",
+        "message": {
+          "role": "tool",
+          "content": [
+            {
+              "type": "text",
+              "text": "{\n  \"echo\": \"hello\"\n}"
+            }
+          ],
+          "name": "fixture.echo",
+          "toolCallId": "call_echo",
+          "toolCalls": [],
+          "metadata": {
+            "ok": true
+          }
+        }
+      }
+    },
+    {
+      "name": "throwing tool returns failure envelope",
+      "toolCall": {
+        "id": "call_fail",
+        "name": "fixture.fail",
+        "arguments": {}
+      },
+      "handler": {
+        "kind": "throw",
+        "error": "contract failure"
+      },
+      "expected": {
+        "ok": false,
+        "resultKind": null,
+        "error": "Tool \"fixture.fail\" failed.",
+        "output": "{\n  \"error\": \"contract failure\",\n  \"ok\": false\n}",
+        "message": {
+          "role": "tool",
+          "content": [
+            {
+              "type": "text",
+              "text": "{\n  \"error\": \"contract failure\",\n  \"ok\": false\n}"
+            }
+          ],
+          "name": "fixture.fail",
+          "toolCallId": "call_fail",
+          "toolCalls": [],
+          "metadata": {
+            "ok": false
+          }
+        }
+      }
+    }
+  ]
+}

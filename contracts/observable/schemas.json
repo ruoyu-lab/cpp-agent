@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "object schema fills closed-object defaults",
+      "input": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": ["name"]
+      },
+      "expected": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "object schema preserves typed additional properties",
+      "input": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string",
+          "maxLength": 12
+        }
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": {
+          "type": "string",
+          "maxLength": 12
+        }
+      }
+    },
+    {
+      "name": "string schema stays scalar",
+      "input": {
+        "type": "string",
+        "enum": ["alpha", "beta"],
+        "pattern": "^[a-z]+$"
+      },
+      "expected": {
+        "type": "string",
+        "enum": ["alpha", "beta"],
+        "pattern": "^[a-z]+$"
+      }
+    }
+  ]
+}

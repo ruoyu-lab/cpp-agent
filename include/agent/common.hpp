@@ -1,0 +1,27 @@
+#pragma once
+
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <initializer_list>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <random>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+#include <vector>

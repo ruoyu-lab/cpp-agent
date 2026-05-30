@@ -1,0 +1,20 @@
+# clangd configuration for agent_native.
+#
+# This project intentionally exposes `agent/agent.hpp` as an umbrella header
+# that re-exports every public submodule. Translation units typically include
+# only that one header instead of enumerating sub-headers — that's the
+# documented public API surface (see docs/architecture.md and bindings.md).
+#
+# clangd's include-cleaner is IWYU-style and doesn't know about this
+# convention, so it flags the umbrella include as "unused" on every .cpp.
+# It also flags common STL headers (`<iomanip>`, `<limits>`, `<numeric>`,
+# `<sstream>`, …) as "unused" when symbols come transitively through
+# `agent.hpp` — the same false-positive pattern.
+#
+# We disable the lint to keep IDE diagnostics aligned with the project's
+# actual coding convention. Real compiler warnings (and clangd's other
+# checks like type errors) are unaffected.
+
+Diagnostics:
+  UnusedIncludes: None
+  MissingIncludes: None

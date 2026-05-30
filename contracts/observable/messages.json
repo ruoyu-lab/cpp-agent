@@ -1,0 +1,124 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "user text message",
+      "input": {
+        "role": "user",
+        "content": "hello contract"
+      },
+      "expected": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "hello contract"
+          }
+        ],
+        "name": null,
+        "toolCallId": null,
+        "toolCalls": [],
+        "metadata": {}
+      }
+    },
+    {
+      "name": "assistant tool call with json string arguments",
+      "input": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "checking weather",
+            "metadata": {
+              "source": "contract"
+            }
+          }
+        ],
+        "toolCalls": [
+          {
+            "id": "call_weather",
+            "name": "weather.lookup",
+            "arguments": "{\"city\":\"Seoul\",\"units\":\"metric\"}"
+          }
+        ],
+        "metadata": {
+          "provider": "fixture",
+          "finishReason": "tool_calls"
+        }
+      },
+      "expected": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "checking weather",
+            "metadata": {
+              "source": "contract"
+            }
+          }
+        ],
+        "name": null,
+        "toolCallId": null,
+        "toolCalls": [
+          {
+            "id": "call_weather",
+            "name": "weather.lookup",
+            "arguments": {
+              "city": "Seoul",
+              "units": "metric"
+            }
+          }
+        ],
+        "metadata": {
+          "provider": "fixture",
+          "finishReason": "tool_calls"
+        }
+      }
+    },
+    {
+      "name": "tool result message",
+      "input": {
+        "role": "tool",
+        "name": "weather.lookup",
+        "toolCallId": "call_weather",
+        "content": {
+          "type": "file",
+          "source": {
+            "kind": "artifact",
+            "key": "artifact://weather.json",
+            "mimeType": "application/json",
+            "filename": "weather.json"
+          },
+          "title": "Weather data",
+          "textHint": "sunny 21c",
+          "metadata": {
+            "ok": true
+          }
+        }
+      },
+      "expected": {
+        "role": "tool",
+        "content": [
+          {
+            "type": "file",
+            "source": {
+              "kind": "artifact",
+              "key": "artifact://weather.json",
+              "mimeType": "application/json",
+              "filename": "weather.json"
+            },
+            "title": "Weather data",
+            "textHint": "sunny 21c",
+            "metadata": {
+              "ok": true
+            }
+          }
+        ],
+        "name": "weather.lookup",
+        "toolCallId": "call_weather",
+        "toolCalls": [],
+        "metadata": {}
+      }
+    }
+  ]
+}

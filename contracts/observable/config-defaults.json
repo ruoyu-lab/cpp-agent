@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "agent runner config defaults",
+      "target": "agentRunnerConfig",
+      "expected": {
+        "maxIterations": 8,
+        "enablePlanning": true,
+        "advertiseSkills": true,
+        "lazyToolMode": false,
+        "defaultSkills": [],
+        "forcedVisibleTools": [],
+        "skillModelConflictPolicy": "error",
+        "skillEffortConflictPolicy": "error",
+        "hasAdapter": false,
+        "hasThinkingAdapter": false,
+        "hasCritiqueAdapter": false,
+        "hasMemoryStore": false,
+        "hasScratchStore": false,
+        "hasPlanner": false
+      }
+    },
+    {
+      "name": "agent loop config defaults",
+      "target": "agentLoopConfig",
+      "expected": {
+        "systemPrompt": "",
+        "maxIterations": 8,
+        "hasModel": false,
+        "hasToolRegistry": false,
+        "hasToolExecutor": false,
+        "hasContextManager": false,
+        "hasEventBus": false
+      }
+    },
+    {
+      "name": "model settings defaults",
+      "target": "modelSettings",
+      "expected": {
+        "model": "",
+        "temperature": null,
+        "maxOutputTokens": null,
+        "reasoning": null,
+        "cacheStrategy": "none",
+        "cacheScope": "system-and-tools",
+        "cacheKey": "",
+        "extra": {}
+      }
+    }
+  ]
+}
