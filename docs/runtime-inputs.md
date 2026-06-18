@@ -15,7 +15,12 @@ Use a string for simple user text:
 
 ```cpp
 auto result = runner.run("summarize this", "session-1");
-auto stream = runner.stream("summarize this", "session-1");
+auto stream = runner.stream(
+    "summarize this",
+    [](const agent::AgentRunnerStreamEvent& event) {
+      (void)event;
+    },
+    "session-1");
 ```
 
 Use content parts for the existing C++ multimodal convenience path:
@@ -41,12 +46,16 @@ auto message = agent::create_message(
     },
     agent::Value::object({{"source", "api"}}));
 
-auto stream = runner.stream(message, "session-1");
+auto stream = runner.stream(
+    message,
+    [](const agent::AgentRunnerStreamEvent& event) {
+      (void)event;
+    },
+    "session-1");
 ```
 
-`AgentLoop::run` and `AgentLoop::stream` expose the same string, content-part,
-and `AgentMessage` overloads for lower-level callers that manage their own
-session memory.
+`AgentRunner` is the main public entry and exposes the same string,
+content-part, and `AgentMessage` overloads.
 
 ## Shape Semantics
 

@@ -1,30 +1,14 @@
 #pragma once
 
-#include "agent/http.hpp"
 #include "agent/messages.hpp"
+#include "agent/streaming.hpp"
 
+#include <cstdint>
 #include <mutex>
 
 namespace agent {
 
 class CancellationToken;
-
-struct ModelReasoning {
-  std::string text;
-  std::string format = "summary";
-};
-
-struct ModelResponse {
-  std::string id;
-  std::string provider;
-  std::string model;
-  std::vector<MessageContentPart> content;
-  std::string text;
-  std::optional<ModelReasoning> reasoning;
-  std::vector<ToolCall> tool_calls;
-  std::string finish_reason = "stop";
-  Value raw;
-};
 
 struct TaggedReasoningExtraction {
   std::string text;
@@ -43,7 +27,6 @@ struct TaggedReasoningDelta {
   std::string reasoning_text;
 };
 
-AgentMessage assistant_message_from_response(const ModelResponse& response);
 std::string normalize_finish_reason(std::string raw);
 bool is_incomplete_finish_reason(const std::string& value);
 
@@ -53,16 +36,43 @@ enum class ReasoningSource {
   Unknown = 2,    // no data; model may not have reasoned, or provider doesn't expose it
 };
 
+enum class TokenUsageSource {
+  Provider = 0,   // provider/runtime directly reported the count
+  Derived = 1,    // deterministically computed from other token fields
+  Estimated = 2,  // tokenizer/heuristic estimate
+  Unknown = 3,    // no trustworthy count
+};
+
+enum class TokenUsageQuality {
+  Provider = 0,   // input/output/total are provider-reported or exact derived values
+  Mixed = 1,      // at least one field has weaker provenance than the others
+  Estimated = 2,  // all known token fields are estimates
+  Unknown = 3,    // no usable token counts
+};
+
 std::string to_string(ReasoningSource source);
 ReasoningSource reasoning_source_from_string(std::string_view text,
                                              ReasoningSource fallback = ReasoningSource::Unknown);
 ReasoningSource merge_reasoning_source(ReasoningSource a, ReasoningSource b);
+std::string to_string(TokenUsageSource source);
+TokenUsageSource token_usage_source_from_string(
+    std::string_view text,
+    TokenUsageSource fallback = TokenUsageSource::Unknown);
+TokenUsageSource merge_token_usage_source(TokenUsageSource a, TokenUsageSource b);
+std::string to_string(TokenUsageQuality quality);
+TokenUsageQuality token_usage_quality_from_sources(
+    const std::vector<TokenUsageSource>& sources);
 
 struct ModelUsage {
   int input_tokens = 0;
   int output_tokens = 0;
   int total_tokens = 0;
+  TokenUsageSource input_tokens_source = TokenUsageSource::Unknown;
+  TokenUsageSource output_tokens_source = TokenUsageSource::Unknown;
+  TokenUsageSource total_tokens_source = TokenUsageSource::Unknown;
+  TokenUsageQuality quality = TokenUsageQuality::Unknown;
   int cached_input_tokens = 0;  // tokens billed at cache-hit rate (provider-reported)
+  TokenUsageSource cached_input_tokens_source = TokenUsageSource::Unknown;
   int reasoning_tokens = 0;
   ReasoningSource reasoning_source = ReasoningSource::Unknown;
   std::string provider;
@@ -84,7 +94,7 @@ struct UsageCostEstimate {
 };
 
 ModelUsage extract_model_usage(const Value& response_or_raw, std::string provider = {});
-ModelUsage extract_model_usage(const ModelResponse& response);
+ModelUsage extract_model_usage(const AgentOutput& response);
 UsageCostEstimate estimate_usage_cost(const ModelUsage& usage, const UsagePricing& pricing,
                                       std::string provider, std::string model);
 ModelUsage merge_model_usage(const std::vector<ModelUsage>& usages);
@@ -169,6 +179,8 @@ class TaggedReasoningStreamParser {
   std::string buffer_;
   std::string text_;
   std::string reasoning_text_;
+  std::string pending_text_utf8_;
+  std::string pending_reasoning_utf8_;
 };
 Value model_settings_to_json_value(const ModelSettings& settings);
 ModelSettings model_settings_from_json_value(const Value& value);
@@ -193,7 +205,31 @@ enum class ModelStreamEventType {
 
 std::string to_string(ModelStreamEventType type);
 
+enum class ModelStreamFrameBoundary {
+  None,
+  SseEvent,
+  JsonLine,
+  NativeCallback,
+};
+
+std::string to_string(ModelStreamFrameBoundary boundary);
+
+struct ModelProviderStreamContract {
+  int schema_version = kAgentStreamEventSchemaVersion;
+  std::string provider;
+  std::string model;
+  ModelStreamFrameBoundary frame_boundary = ModelStreamFrameBoundary::None;
+  bool text_delta = true;
+  bool reasoning_delta = false;
+  bool tool_call_delta = false;
+  bool content_part = false;
+};
+
+Value model_provider_stream_contract_to_value(const ModelProviderStreamContract& contract);
+
 struct ModelStreamEvent {
+  int schema_version = kAgentStreamEventSchemaVersion;
+  std::uint64_t sequence = 0;
   ModelStreamEventType type = ModelStreamEventType::ResponseStart;
   std::string provider;
   std::string model;
@@ -201,7 +237,7 @@ struct ModelStreamEvent {
   std::string text;
   std::string reasoning;
   MessageContentPart part;
-  ModelResponse response;
+  AgentOutput response;
   // Populated only when type == ToolCallDelta.
   std::string tool_call_id;
   std::string tool_call_name;
@@ -220,12 +256,12 @@ class ChatModelAdapter {
   [[nodiscard]] const std::string& model() const noexcept;
   [[nodiscard]] const std::set<std::string>& capabilities() const noexcept;
   [[nodiscard]] bool supports(const std::string& capability) const;
+  [[nodiscard]] virtual ModelProviderStreamContract stream_contract() const;
   [[nodiscard]] ModelSettings resolve_settings(const ModelSettings& settings = {}) const;
-  [[nodiscard]] ModelResponse build_response(ModelResponse payload = {}) const;
+  [[nodiscard]] AgentOutput build_output(AgentOutput payload = {}) const;
   void set_capabilities(std::set<std::string> capabilities);
 
-  virtual ModelResponse generate(const GenerateParams& params) = 0;
-  virtual std::vector<ModelStreamEvent> stream(const GenerateParams& params);
+  virtual AgentOutput generate(const GenerateParams& params) = 0;
   using StreamEventHandler = std::function<void(const ModelStreamEvent&)>;
   virtual void stream(const GenerateParams& params, StreamEventHandler on_event);
 
@@ -241,15 +277,14 @@ class ChatModelAdapter {
 class EchoChatModelAdapter : public ChatModelAdapter {
  public:
   EchoChatModelAdapter();
-  ModelResponse generate(const GenerateParams& params) override;
+  AgentOutput generate(const GenerateParams& params) override;
 };
 
 class FallbackChatModelAdapter : public ChatModelAdapter {
  public:
   explicit FallbackChatModelAdapter(std::vector<std::shared_ptr<ChatModelAdapter>> adapters);
 
-  ModelResponse generate(const GenerateParams& params) override;
-  std::vector<ModelStreamEvent> stream(const GenerateParams& params) override;
+  AgentOutput generate(const GenerateParams& params) override;
   void stream(const GenerateParams& params, StreamEventHandler on_event) override;
   [[nodiscard]] const std::vector<std::shared_ptr<ChatModelAdapter>>& adapters() const noexcept;
 
@@ -258,435 +293,6 @@ class FallbackChatModelAdapter : public ChatModelAdapter {
                                                   const GenerateParams& params) const;
 
   std::vector<std::shared_ptr<ChatModelAdapter>> adapters_;
-};
-
-struct NativeProviderRequest {
-  std::string provider;
-  std::string endpoint;
-  Value body = Value::object({});
-  std::map<std::string, std::string> headers;
-  std::string base_url;
-  CancellationToken* cancellation = nullptr;
-};
-
-using NativeProviderTransport = std::function<Value(const NativeProviderRequest&)>;
-using NativeProviderStreamTransport = std::function<std::vector<std::string>(const NativeProviderRequest&)>;
-using NativeProviderStreamingChunkHandler = std::function<void(std::string_view chunk)>;
-using NativeProviderStreamingTransport =
-    std::function<void(const NativeProviderRequest&,
-                       NativeProviderStreamingChunkHandler on_chunk)>;
-
-using LlamaCppNativePooling = std::string;
-using LlamaCppNativeToolMode = std::string;
-
-struct LlamaCppNativeLoraAdapter {
-  std::string path;
-  double scale = 1.0;
-};
-
-struct LlamaCppNativeRuntimeConfig {
-  std::string model_path;
-  std::string library_path;
-  std::string library_dir;
-  std::optional<int> context_size;
-  std::optional<int> batch_size;
-  std::optional<int> threads;
-  std::optional<int> batch_threads;
-  std::optional<int> gpu_layers;
-  std::optional<bool> mmap;
-  std::optional<bool> mlock;
-  std::vector<LlamaCppNativeLoraAdapter> lora_adapters;
-  std::string mmproj_path;
-  std::string mtmd_library_path;
-  std::string mtmd_library_dir;
-  std::optional<bool> mmproj_use_gpu;
-  std::optional<int> mmproj_threads;
-  std::optional<int> mmproj_image_min_tokens;
-  std::optional<int> mmproj_image_max_tokens;
-  std::string media_marker = "<__media__>";
-};
-
-struct LlamaCppNativeSamplingConfig {
-  std::optional<double> temperature;
-  std::optional<int> max_output_tokens;
-  std::optional<int> top_k;
-  std::optional<double> top_p;
-  std::optional<double> min_p;
-  std::optional<double> repeat_penalty;
-  std::optional<int> seed;
-};
-
-struct LlamaCppNativeChatMessage {
-  std::string role;
-  std::string content;
-};
-
-struct LlamaCppNativeChatMedia {
-  std::vector<std::uint8_t> bytes;
-  std::string mime_type;
-  std::string id;
-  std::string filename;
-};
-
-struct LlamaCppNativeChatRequest : LlamaCppNativeSamplingConfig {
-  std::string request_id;
-  std::string model;
-  std::vector<LlamaCppNativeChatMessage> messages;
-  std::vector<LlamaCppNativeChatMedia> media;
-  std::vector<ChatToolDescriptor> tools;
-  std::string chat_template;
-  bool strict_template = false;
-  std::string grammar;
-  std::string grammar_root;
-  std::string session_id;
-  std::optional<JsonSchema> output_schema;
-  LlamaCppNativeToolMode tool_mode = "auto";
-  std::string reasoning_tag_name = "think";
-};
-
-struct LlamaCppNativeChatDelta {
-  std::string type = "text";
-  std::string delta;
-};
-
-struct LlamaCppNativeChatResult {
-  std::string id;
-  std::string model;
-  std::string text;
-  std::optional<ModelReasoning> reasoning;
-  std::string finish_reason = "stop";
-  Value raw;
-};
-
-struct LlamaCppNativeEmbeddingRequest {
-  std::string request_id;
-  std::string model;
-  std::vector<std::string> texts;
-  LlamaCppNativePooling pooling = "mean";
-  bool normalize = true;
-  std::optional<int> dimensions;
-};
-
-struct LlamaCppNativeEmbeddingResult {
-  std::string model;
-  std::vector<EmbeddingVector> embeddings;
-  std::optional<int> dimensions;
-};
-
-struct LlamaCppNativeBinding {
-  using ChatDeltaHandler = std::function<void(const LlamaCppNativeChatDelta&)>;
-  std::function<LlamaCppNativeChatResult(const LlamaCppNativeRuntimeConfig&,
-                                         const LlamaCppNativeChatRequest&,
-                                         ChatDeltaHandler)> generate_chat;
-  std::function<LlamaCppNativeEmbeddingResult(const LlamaCppNativeRuntimeConfig&,
-                                              const LlamaCppNativeEmbeddingRequest&)> embed_texts;
-  std::function<void(const std::string& request_id)> cancel;
-};
-
-std::shared_ptr<LlamaCppNativeBinding> create_llama_cpp_native_binding();
-
-struct LlamaCppNativeChatModelAdapterConfig : LlamaCppNativeRuntimeConfig, LlamaCppNativeSamplingConfig {
-  std::string model;
-  std::string chat_template;
-  bool strict_template = false;
-  LlamaCppNativeToolMode tool_mode = "auto";
-  std::string grammar;
-  std::string grammar_root;
-  std::string session_id;
-  std::optional<ReasoningSettings> reasoning;
-  std::shared_ptr<LlamaCppNativeBinding> binding;
-};
-
-struct LlamaCppNativeEmbeddingAdapterConfig : LlamaCppNativeRuntimeConfig {
-  std::string model;
-  LlamaCppNativePooling pooling = "mean";
-  bool normalize = true;
-  std::optional<int> dimensions;
-  std::string space_id;
-  std::shared_ptr<LlamaCppNativeBinding> binding;
-};
-
-NativeProviderTransport create_native_provider_http_transport(
-    HttpTransport transport = create_native_http_transport());
-NativeProviderStreamTransport create_native_provider_http_stream_transport(
-    HttpTransport transport = create_native_http_transport());
-NativeProviderStreamingTransport create_native_provider_http_streaming_transport(
-    HttpStreamingTransport transport = create_native_http_streaming_transport());
-Value serialize_chat_tool_descriptor(const ChatToolDescriptor& tool);
-Value serialize_openai_chat_messages(const std::vector<AgentMessage>& messages);
-NativeProviderRequest build_openai_chat_request(const GenerateParams& params, std::string model,
-                                                std::string endpoint = "/v1/chat/completions",
-                                                std::string base_url = {});
-// Applies `reasoning_effort` (low / medium / high) to a Chat Completions
-// request body when reasoning is enabled. Intended for OpenAI's o-series /
-// gpt-5 chat-completions calls; do NOT call this on the shared
-// `build_openai_chat_request` output for non-OpenAI providers (Qwen / Ollama /
-// vLLM / MiMo / etc) — they use their own reasoning conventions.
-void apply_openai_reasoning_effort(NativeProviderRequest& request,
-                                   const std::optional<ReasoningSettings>& reasoning);
-NativeProviderRequest build_openai_chat_stream_request(const GenerateParams& params, std::string model,
-                                                       std::string endpoint = "/v1/chat/completions",
-                                                       std::string base_url = {});
-NativeProviderRequest build_openai_responses_request(const GenerateParams& params, std::string model,
-                                                      std::string endpoint = "/v1/responses",
-                                                      std::string base_url = {});
-NativeProviderRequest build_openai_responses_stream_request(const GenerateParams& params, std::string model,
-                                                            std::string endpoint = "/v1/responses",
-                                                            std::string base_url = {});
-ModelResponse parse_openai_chat_response(const Value& raw, std::string provider, std::string model);
-std::vector<ModelStreamEvent> parse_openai_chat_stream_events(
-    const std::vector<std::string>& chunks,
-    std::string provider,
-    std::string model);
-ModelResponse parse_openai_responses_response(const Value& raw, std::string provider, std::string model);
-std::vector<ModelStreamEvent> parse_openai_responses_stream_events(
-    const std::vector<std::string>& chunks,
-    std::string provider,
-    std::string model);
-NativeProviderRequest build_qwen_chat_request(const GenerateParams& params, std::string model,
-                                              std::string api_key = {},
-                                              std::string base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1");
-NativeProviderRequest build_qwen_chat_stream_request(
-    const GenerateParams& params,
-    std::string model,
-    std::string api_key = {},
-    std::string base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1");
-ModelResponse parse_qwen_chat_response(const Value& raw, std::string model);
-NativeProviderRequest build_qwen_responses_request(
-    const GenerateParams& params,
-    std::string model,
-    std::string api_key = {},
-    std::string base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1");
-NativeProviderRequest build_qwen_responses_stream_request(
-    const GenerateParams& params,
-    std::string model,
-    std::string api_key = {},
-    std::string base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1");
-ModelResponse parse_qwen_responses_response(const Value& raw, std::string model);
-std::vector<ModelStreamEvent> parse_qwen_responses_stream_events(
-    const std::vector<std::string>& chunks,
-    std::string model);
-NativeProviderRequest build_mimo_chat_request(const GenerateParams& params, std::string model,
-                                              std::string api_key = {},
-                                              std::string base_url = "https://api.xiaomimimo.com/v1");
-NativeProviderRequest build_mimo_chat_stream_request(
-    const GenerateParams& params,
-    std::string model,
-    std::string api_key = {},
-    std::string base_url = "https://api.xiaomimimo.com/v1");
-ModelResponse parse_mimo_chat_response(const Value& raw, std::string model);
-NativeProviderRequest build_anthropic_messages_request(const GenerateParams& params, std::string model,
-                                                       std::string api_key = {},
-                                                       std::string base_url = "https://api.anthropic.com/v1");
-NativeProviderRequest build_anthropic_messages_stream_request(
-    const GenerateParams& params,
-    std::string model,
-    std::string api_key = {},
-    std::string base_url = "https://api.anthropic.com/v1");
-ModelResponse parse_anthropic_messages_response(const Value& raw, std::string provider, std::string model);
-std::vector<ModelStreamEvent> parse_anthropic_messages_stream_events(
-    const std::vector<std::string>& chunks,
-    std::string provider,
-    std::string model);
-NativeProviderRequest build_deepseek_messages_request(const GenerateParams& params, std::string model,
-                                                      std::string api_key = {},
-                                                      std::string base_url = "https://api.deepseek.com/anthropic");
-NativeProviderRequest build_deepseek_messages_stream_request(
-    const GenerateParams& params,
-    std::string model,
-    std::string api_key = {},
-    std::string base_url = "https://api.deepseek.com/anthropic");
-ModelResponse parse_deepseek_messages_response(const Value& raw, std::string model);
-NativeProviderRequest build_ollama_chat_request(const GenerateParams& params, std::string model,
-                                                std::string base_url = "http://127.0.0.1:11434/api");
-NativeProviderRequest build_ollama_chat_stream_request(const GenerateParams& params, std::string model,
-                                                       std::string base_url = "http://127.0.0.1:11434/api");
-ModelResponse parse_ollama_chat_response(const Value& raw, std::string model);
-std::vector<ModelStreamEvent> parse_ollama_chat_stream_events(
-    const std::vector<std::string>& chunks,
-    std::string model);
-NativeProviderRequest build_gemini_generate_content_request(
-    const GenerateParams& params,
-    std::string model,
-    std::string api_key = {},
-    std::string base_url = "https://generativelanguage.googleapis.com/v1beta");
-NativeProviderRequest build_gemini_generate_content_stream_request(
-    const GenerateParams& params,
-    std::string model,
-    std::string api_key = {},
-    std::string base_url = "https://generativelanguage.googleapis.com/v1beta");
-ModelResponse parse_gemini_generate_content_response(const Value& raw, std::string model);
-std::vector<ModelStreamEvent> parse_gemini_generate_content_stream_events(
-    const std::vector<std::string>& chunks,
-    std::string model);
-std::string json_schema_to_gbnf(const JsonSchema& schema);
-std::string llama_tool_envelope_gbnf(const std::vector<ChatToolDescriptor>& tools,
-                                     bool required_only = false);
-
-class OpenAICompatibleChatModelAdapter : public ChatModelAdapter {
- public:
-  OpenAICompatibleChatModelAdapter(std::string provider, std::string model,
-                                   NativeProviderTransport transport,
-                                   std::string endpoint = "/v1/chat/completions",
-                                   std::string base_url = {},
-                                   std::string api_key = {},
-                                   NativeProviderStreamTransport stream_transport = {},
-                                   std::string organization = {},
-                                   NativeProviderStreamingTransport streaming_transport = {});
-  ModelResponse generate(const GenerateParams& params) override;
-  std::vector<ModelStreamEvent> stream(const GenerateParams& params) override;
-  void stream(const GenerateParams& params, StreamEventHandler on_event) override;
-
- private:
-  NativeProviderTransport transport_;
-  NativeProviderStreamTransport stream_transport_;
-  NativeProviderStreamingTransport streaming_transport_;
-  std::string endpoint_;
-  std::string base_url_;
-  std::string api_key_;
-  std::string organization_;
-};
-
-class QwenChatModelAdapter : public ChatModelAdapter {
- public:
-  QwenChatModelAdapter(std::string model, NativeProviderTransport transport,
-                       std::string api_key = {},
-                       std::string base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                       NativeProviderStreamTransport stream_transport = {},
-                       std::string reasoning_api = "chat-completions",
-                       NativeProviderStreamingTransport streaming_transport = {});
-  ModelResponse generate(const GenerateParams& params) override;
-  std::vector<ModelStreamEvent> stream(const GenerateParams& params) override;
-  void stream(const GenerateParams& params, StreamEventHandler on_event) override;
-
- private:
-  NativeProviderTransport transport_;
-  NativeProviderStreamTransport stream_transport_;
-  NativeProviderStreamingTransport streaming_transport_;
-  std::string api_key_;
-  std::string base_url_;
-  std::string reasoning_api_;
-};
-
-class MiMoChatModelAdapter : public ChatModelAdapter {
- public:
-  MiMoChatModelAdapter(std::string model, NativeProviderTransport transport,
-                       std::string api_key = {},
-                       std::string base_url = "https://api.xiaomimimo.com/v1",
-                       NativeProviderStreamTransport stream_transport = {},
-                       NativeProviderStreamingTransport streaming_transport = {});
-  ModelResponse generate(const GenerateParams& params) override;
-  std::vector<ModelStreamEvent> stream(const GenerateParams& params) override;
-  void stream(const GenerateParams& params, StreamEventHandler on_event) override;
-
- private:
-  NativeProviderTransport transport_;
-  NativeProviderStreamTransport stream_transport_;
-  NativeProviderStreamingTransport streaming_transport_;
-  std::string api_key_;
-  std::string base_url_;
-};
-
-class AnthropicChatModelAdapter : public ChatModelAdapter {
- public:
-  AnthropicChatModelAdapter(std::string model, NativeProviderTransport transport,
-                            std::string api_key = {},
-                            std::string base_url = "https://api.anthropic.com/v1",
-                            NativeProviderStreamTransport stream_transport = {},
-                            NativeProviderStreamingTransport streaming_transport = {});
-  ModelResponse generate(const GenerateParams& params) override;
-  std::vector<ModelStreamEvent> stream(const GenerateParams& params) override;
-  void stream(const GenerateParams& params, StreamEventHandler on_event) override;
-
- private:
-  NativeProviderTransport transport_;
-  NativeProviderStreamTransport stream_transport_;
-  NativeProviderStreamingTransport streaming_transport_;
-  std::string api_key_;
-  std::string base_url_;
-};
-
-class DeepSeekChatModelAdapter : public ChatModelAdapter {
- public:
-  DeepSeekChatModelAdapter(std::string model, NativeProviderTransport transport,
-                           std::string api_key = {},
-                           std::string base_url = "https://api.deepseek.com/anthropic",
-                           NativeProviderStreamTransport stream_transport = {},
-                           NativeProviderStreamingTransport streaming_transport = {});
-  ModelResponse generate(const GenerateParams& params) override;
-  std::vector<ModelStreamEvent> stream(const GenerateParams& params) override;
-  void stream(const GenerateParams& params, StreamEventHandler on_event) override;
-
- private:
-  NativeProviderTransport transport_;
-  NativeProviderStreamTransport stream_transport_;
-  NativeProviderStreamingTransport streaming_transport_;
-  std::string api_key_;
-  std::string base_url_;
-};
-
-class OllamaChatModelAdapter : public ChatModelAdapter {
- public:
-  OllamaChatModelAdapter(std::string model, NativeProviderTransport transport,
-                         std::string base_url = "http://127.0.0.1:11434/api",
-                         NativeProviderStreamTransport stream_transport = {},
-                         NativeProviderStreamingTransport streaming_transport = {});
-  ModelResponse generate(const GenerateParams& params) override;
-  std::vector<ModelStreamEvent> stream(const GenerateParams& params) override;
-  void stream(const GenerateParams& params, StreamEventHandler on_event) override;
-
- private:
-  NativeProviderTransport transport_;
-  NativeProviderStreamTransport stream_transport_;
-  NativeProviderStreamingTransport streaming_transport_;
-  std::string base_url_;
-};
-
-class GeminiChatModelAdapter : public ChatModelAdapter {
- public:
-  GeminiChatModelAdapter(std::string model, NativeProviderTransport transport,
-                         std::string api_key = {},
-                         std::string base_url = "https://generativelanguage.googleapis.com/v1beta",
-                         NativeProviderStreamTransport stream_transport = {},
-                         NativeProviderStreamingTransport streaming_transport = {});
-  ModelResponse generate(const GenerateParams& params) override;
-  std::vector<ModelStreamEvent> stream(const GenerateParams& params) override;
-  void stream(const GenerateParams& params, StreamEventHandler on_event) override;
-
- private:
-  NativeProviderTransport transport_;
-  NativeProviderStreamTransport stream_transport_;
-  NativeProviderStreamingTransport streaming_transport_;
-  std::string api_key_;
-  std::string base_url_;
-};
-
-class LlamaCppNativeChatModelAdapter : public ChatModelAdapter {
- public:
-  explicit LlamaCppNativeChatModelAdapter(LlamaCppNativeChatModelAdapterConfig config);
-  ModelResponse generate(const GenerateParams& params) override;
-  std::vector<ModelStreamEvent> stream(const GenerateParams& params) override;
-  void stream(const GenerateParams& params, StreamEventHandler on_event) override;
-
-  [[nodiscard]] const LlamaCppNativeRuntimeConfig& native_config() const noexcept;
-
- private:
-  LlamaCppNativeChatRequest build_request(const GenerateParams& params,
-                                          const ModelSettings& settings) const;
-  ModelResponse build_model_response(const LlamaCppNativeChatResult& raw,
-                                     const LlamaCppNativeChatRequest& request,
-                                     bool reasoning_enabled,
-                                     const std::string& fallback_text = {}) const;
-
-  LlamaCppNativeRuntimeConfig native_config_;
-  LlamaCppNativeSamplingConfig sampling_;
-  std::string chat_template_;
-  bool strict_template_ = false;
-  LlamaCppNativeToolMode tool_mode_ = "auto";
-  std::string grammar_;
-  std::string grammar_root_;
-  std::string session_id_;
-  std::shared_ptr<LlamaCppNativeBinding> binding_;
 };
 
 using ChatAdapterFactory = std::function<std::shared_ptr<ChatModelAdapter>(const Value& config)>;
@@ -770,79 +376,6 @@ class ClipTextEmbeddingAdapter : public TextEmbeddingAdapter {
 
  private:
   ClipTextEmbeddingBatch embed_batch_;
-};
-
-class OpenAIEmbeddingAdapter : public TextEmbeddingAdapter {
- public:
-  OpenAIEmbeddingAdapter(std::string model, NativeProviderTransport transport, std::string api_key = {},
-                         std::string base_url = "https://api.openai.com/v1", std::string organization = {},
-                         int dimensions = 0, std::string space_id = {});
-  std::vector<EmbeddingVector> embed(const std::vector<std::string>& texts, const Value& settings = {},
-                                     CancellationToken* cancellation = nullptr) override;
-
- private:
-  NativeProviderTransport transport_;
-  std::string api_key_;
-  std::string base_url_;
-  std::string organization_;
-};
-
-class QwenEmbeddingAdapter : public TextEmbeddingAdapter {
- public:
-  QwenEmbeddingAdapter(std::string model, NativeProviderTransport transport, std::string api_key = {},
-                       std::string base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1",
-                       int dimensions = 0, std::string space_id = {});
-  std::vector<EmbeddingVector> embed(const std::vector<std::string>& texts, const Value& settings = {},
-                                     CancellationToken* cancellation = nullptr) override;
-
- private:
-  NativeProviderTransport transport_;
-  std::string api_key_;
-  std::string base_url_;
-};
-
-class OllamaEmbeddingAdapter : public TextEmbeddingAdapter {
- public:
-  OllamaEmbeddingAdapter(std::string model, NativeProviderTransport transport,
-                         std::string base_url = "http://127.0.0.1:11434", int dimensions = 0,
-                         std::string space_id = {});
-  std::vector<EmbeddingVector> embed(const std::vector<std::string>& texts, const Value& settings = {},
-                                     CancellationToken* cancellation = nullptr) override;
-
- private:
-  NativeProviderTransport transport_;
-  std::string base_url_;
-};
-
-class GeminiEmbeddingAdapter : public TextEmbeddingAdapter {
- public:
-  GeminiEmbeddingAdapter(std::string model, NativeProviderTransport transport, std::string api_key = {},
-                         std::string base_url = "https://generativelanguage.googleapis.com/v1beta",
-                         int dimensions = 0, std::string task_type = {}, std::string space_id = {});
-  std::vector<EmbeddingVector> embed(const std::vector<std::string>& texts, const Value& settings = {},
-                                     CancellationToken* cancellation = nullptr) override;
-
- private:
-  NativeProviderTransport transport_;
-  std::string api_key_;
-  std::string base_url_;
-  std::string task_type_;
-};
-
-class LlamaCppNativeTextEmbeddingAdapter : public TextEmbeddingAdapter {
- public:
-  explicit LlamaCppNativeTextEmbeddingAdapter(LlamaCppNativeEmbeddingAdapterConfig config);
-  std::vector<EmbeddingVector> embed(const std::vector<std::string>& texts,
-                                     const Value& settings = {},
-                                     CancellationToken* cancellation = nullptr) override;
-
-  [[nodiscard]] const LlamaCppNativeRuntimeConfig& native_config() const noexcept;
-
- private:
-  LlamaCppNativeRuntimeConfig native_config_;
-  LlamaCppNativePooling pooling_ = "mean";
-  bool normalize_ = true;
-  std::shared_ptr<LlamaCppNativeBinding> binding_;
 };
 
 struct ImageEmbeddingInput {

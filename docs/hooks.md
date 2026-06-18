@@ -1,9 +1,9 @@
 # Hooks API
 
 Hooks provide synchronous lifecycle callbacks around runner, model, tool,
-retrieval, permission, workflow, workflow-node, and child-agent work. They are
-plain callbacks so applications can attach logging, policy, or observability
-without a plugin runtime.
+retrieval, permission, workflow, workflow-node, child-agent, and skill
+resolution work. They are plain callbacks so applications can attach logging,
+policy, or observability without a plugin runtime.
 
 ## Hook Contexts
 
@@ -30,6 +30,11 @@ Specialized contexts add stage-specific data:
 - `WorkflowNodeHookContext`: workflow id, node id, node type, input, result,
   error.
 - `ChildAgentHookContext`: workflow id, agent id, input, result, error.
+- `SkillActivationHookContext`: skill name, activation source, arguments,
+  manifest, rendered prompt, allowed tools, model/effort request, error.
+- `SkillsResolveHookContext`: input text, requested activations, available
+  skills, active skills, allowed tools, effective input text, model settings
+  before/after, result, error.
 
 ## Hook Set
 
@@ -56,10 +61,18 @@ Available callbacks:
 - `before_workflow`, `after_workflow`, `on_workflow_error`
 - `before_workflow_node`, `after_workflow_node`, `on_workflow_node_error`
 - `before_child_agent`, `after_child_agent`, `on_child_agent_error`
+- `before_skill_activation`, `after_skill_activation`,
+  `on_skill_activation_error`
+- `before_skills_resolve`, `after_skills_resolve`, `on_skills_resolve_error`
 - `before_fs_write` — fired by `fs.writeText` (and other opt-in fs-write tools)
   immediately before the on-disk write. Receives the resolved `path` and
   proposed `content`. Not default-on; intended for snapshot / audit
   integrations such as registering `git.snapshot` as a pre-write hook.
+
+`before_skill_activation` runs before the framework's built-in
+`user_invocable` enforcement. If a skill hook blocks, built-in validation fails,
+or prompt rendering fails, `on_skill_activation_error` fires and the aggregate
+`on_skills_resolve_error` hook also fires.
 
 Runtime, tools, and workflow components populate whichever fields are available
 for that lifecycle stage.
@@ -106,6 +119,10 @@ when nothing is wrong, and any failure already comes through as a warn entry.
 
 ## Out-of-process hooks
 
+Include `agent/process_hook.hpp` and link a target that opts into
+`agent_platform` (`agent_full`, `agent_app`, or `agent_runtime_io_native`) for the
+native process adapter.
+
 `make_process_tool_hook(ProcessHookConfig)` returns a
 `std::function<void(const ToolHookContext&)>` that spawns an external
 executable per invocation, pipes the hook payload as JSON to stdin, and reads
@@ -114,6 +131,8 @@ process's stderr becomes the block reason); any other non-zero exit emits a
 warning event but allows the call to proceed. Unix-only.
 
 ```cpp
+#include "agent/process_hook.hpp"
+
 agent::ProcessHookConfig config{
     .executable = "/usr/local/bin/policy-check",
     .timeout = std::chrono::seconds(2),
@@ -121,6 +140,25 @@ agent::ProcessHookConfig config{
 agent::HookSet hooks;
 hooks.before_tool = agent::make_process_tool_hook(config);
 ```
+
+The native process hook has an explicit timeout and never inherits any agent
+runtime object. It is intentionally a low-level adapter, not a declarative
+policy engine. NodeJS provides a higher-level `createConfiguredHooks` helper
+with `event + matcher + command/http/process` actions, required `source`,
+isolated process environments, timeout, and fail-closed behavior. Native hosts
+that need the same declarative shape should build it as a host-layer `HookSet`
+wrapper:
+
+- require a non-empty source identifier per configured hook
+- match only on explicit context fields such as target, tool name, skill name,
+  workflow id, node type, or metadata source
+- invoke external commands without a shell
+- pass only explicit environment variables to hook processes
+- apply a per-hook timeout
+- throw from the hook on timeout, process non-zero exit, or HTTP non-2xx
+
+This keeps the C++ library zero-dependency while preserving the same fail-closed
+contract at the embedding boundary.
 
 ## Zero-Dependency Boundary
 

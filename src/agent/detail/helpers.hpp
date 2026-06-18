@@ -1,12 +1,13 @@
 #pragma once
 
-#include "agent/agent.hpp"
+#include "agent/core_api.hpp"
 
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace agent {
@@ -23,8 +24,8 @@ std::string content_part_type_label(ContentPartType type);
 ContentPartType content_part_type_from_label(const std::string& type);
 long long time_point_to_ms(std::chrono::system_clock::time_point value);
 std::chrono::system_clock::time_point ms_to_time_point(long long value);
-EmbeddingVector normalize_vector(EmbeddingVector vector);
-double dot_product(const EmbeddingVector& left, const EmbeddingVector& right);
+std::vector<double> normalize_vector(std::vector<double> vector);
+double dot_product(const std::vector<double>& left, const std::vector<double>& right);
 std::uint32_t hash_token(const std::string& token);
 std::vector<std::string> tokenize(const std::string& text);
 std::string summarize_messages(const std::vector<AgentMessage>& messages);
@@ -42,6 +43,25 @@ std::string sanitize_segment(std::string value);
 std::string encode_uri_component(const std::string& value);
 std::optional<std::string> decode_uri_component(const std::string& value);
 Value select_json_path(const Value& value, const std::string& path);
+
+std::size_t complete_utf8_prefix_size(std::string_view text,
+                                      std::string_view context = "UTF-8 stream");
+std::string take_complete_utf8_prefix(std::string& buffer,
+                                      std::string_view context = "UTF-8 stream");
+void require_complete_utf8(std::string_view text,
+                           std::string_view context = "UTF-8 stream");
+
+class Utf8StreamBuffer {
+ public:
+  explicit Utf8StreamBuffer(std::string context = "UTF-8 stream");
+  std::string push(std::string_view chunk);
+  std::string finish();
+  [[nodiscard]] bool empty() const noexcept;
+
+ private:
+  std::string context_;
+  std::string pending_;
+};
 
 // Math: safe expression evaluator (shunting-yard). No identifiers, no I/O,
 // no recursion past parser depth. Throws ConfigurationError on bad input.

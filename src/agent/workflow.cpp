@@ -1,4 +1,6 @@
-#include "agent/agent.hpp"
+#include "agent/workflow.hpp"
+#include "agent/runtime.hpp"
+#include "agent/tool_services_modules.hpp"
 #include "detail/helpers.hpp"
 
 #include <algorithm>
@@ -1504,8 +1506,8 @@ Value WorkflowEngine::execute_node(const WorkflowNode& node, WorkflowRunState& s
         {"nodes", workflow_run_state_to_value(state).at("nodes")},
     });
     ToolExecutionServices runtime_services;
-    runtime_services.workflow_engine = this;
-    runtime_services.workflow_definition = &state.definition_snapshot;
+    runtime_services.service_container.set(kToolServiceWorkflowEngine, this);
+    runtime_services.service_container.set(kToolServiceWorkflowDefinition, &state.definition_snapshot);
     runtime_services.values = Value::object({
         {"workflowRunId", state.workflow_run_id},
         {"workflowId", state.definition_snapshot.id},
@@ -1564,7 +1566,7 @@ Value WorkflowEngine::execute_node(const WorkflowNode& node, WorkflowRunState& s
             TraceContext{.workflow_run_id = state.workflow_run_id}));
         const std::string child_session_id = state.workflow_run_id + ":agent:" + agent_id;
         result = workflow_agent_runner_result_to_value(
-            agent->runner->run(workflow_child_agent_input_text(child_input),
+            agent->runner->execution().run(workflow_child_agent_input_text(child_input),
                                child_session_id,
                                {},
                                {},

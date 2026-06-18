@@ -1,4 +1,5 @@
-#include "agent/agent.hpp"
+#include "agent/skills_core.hpp"
+#include "agent/hooks.hpp"
 #include "detail/helpers.hpp"
 
 #include <algorithm>
@@ -9,102 +10,12 @@
 #include <iomanip>
 #include <limits>
 #include <numeric>
+#include <regex>
 #include <sstream>
 
 namespace agent {
 
 namespace {
-
-bool path_exists(const std::filesystem::path& path) {
-  std::error_code error;
-  return std::filesystem::exists(path, error);
-}
-
-bool path_is_directory(const std::filesystem::path& path) {
-  std::error_code error;
-  return std::filesystem::is_directory(path, error);
-}
-
-std::filesystem::path absolute_normalized_path(const std::filesystem::path& path) {
-  std::error_code error;
-  auto absolute = std::filesystem::absolute(path, error);
-  if (error) {
-    absolute = path;
-  }
-  return absolute.lexically_normal();
-}
-
-std::string unquote_scalar(std::string value) {
-  value = trim_copy(std::move(value));
-  if ((value.size() >= 2 && value.front() == '"' && value.back() == '"') ||
-      (value.size() >= 2 && value.front() == '\'' && value.back() == '\'')) {
-    return value.substr(1, value.size() - 2);
-  }
-  return value;
-}
-
-Value parse_frontmatter_scalar_value(std::string value) {
-  value = trim_copy(std::move(value));
-  if (value.empty()) {
-    return "";
-  }
-  if (value == "true") {
-    return true;
-  }
-  if (value == "false") {
-    return false;
-  }
-  if ((value.size() >= 2 && value.front() == '"' && value.back() == '"') ||
-      (value.size() >= 2 && value.front() == '\'' && value.back() == '\'')) {
-    return value.substr(1, value.size() - 2);
-  }
-  if (value.size() >= 2 && value.front() == '[' && value.back() == ']') {
-    Value::Array values;
-    std::string current;
-    for (const char ch : value.substr(1, value.size() - 2)) {
-      if (ch == ',') {
-        const auto item = trim_copy(current);
-        if (!item.empty()) {
-          values.push_back(parse_frontmatter_scalar_value(item));
-        }
-        current.clear();
-      } else {
-        current.push_back(ch);
-      }
-    }
-    const auto item = trim_copy(current);
-    if (!item.empty()) {
-      values.push_back(parse_frontmatter_scalar_value(item));
-    }
-    return Value(std::move(values));
-  }
-  return value;
-}
-
-std::vector<std::string> split_comma_list(std::string value) {
-  value = trim_copy(std::move(value));
-  if (value.size() >= 2 && value.front() == '[' && value.back() == ']') {
-    value = value.substr(1, value.size() - 2);
-  }
-  std::vector<std::string> items;
-  std::string current;
-  for (const char ch : value) {
-    if (ch == ',') {
-      const auto item = unquote_scalar(current);
-      if (!item.empty()) {
-        items.push_back(item);
-      }
-      current.clear();
-    } else {
-      current.push_back(ch);
-    }
-  }
-  const auto item = unquote_scalar(current);
-  if (!item.empty()) {
-    items.push_back(item);
-  }
-  return items;
-}
 
 std::vector<std::string> tokenize_skill_arguments(const std::string& value) {
   std::vector<std::string> tokens;
@@ -136,38 +47,6 @@ std::vector<std::string> tokenize_skill_arguments(const std::string& value) {
     tokens.push_back(token);
   }
   return tokens;
-}
-
-std::string frontmatter_value_to_string(const Value& value) {
-  if (value.is_string()) {
-    return value.as_string();
-  }
-  if (value.is_bool()) {
-    return value.as_bool() ? "true" : "false";
-  }
-  if (value.is_number()) {
-    return value.stringify();
-  }
-  return {};
-}
-
-std::vector<std::string> string_array_from_frontmatter_value(const Value& value,
-                                                             bool tokenize_tools = false) {
-  std::vector<std::string> items;
-  if (value.is_array()) {
-    for (const auto& item : value.as_array()) {
-      const auto text = frontmatter_value_to_string(item);
-      if (!text.empty()) {
-        items.push_back(text);
-      }
-    }
-    return items;
-  }
-  if (value.is_string()) {
-    return tokenize_tools ? tokenize_skill_arguments(value.as_string())
-                          : split_comma_list(value.as_string());
-  }
-  return items;
 }
 
 bool is_env_placeholder_name(const std::string& value) {
@@ -223,47 +102,6 @@ void replace_all(std::string& text, const std::string& needle, const std::string
     text.replace(pos, needle.size(), replacement);
     pos += replacement.size();
   }
-}
-
-Value metadata_value_from_frontmatter(const std::map<std::string, Value>& values) {
-  static const std::set<std::string> known = {
-      "name",
-      "description",
-      "argumentHint",
-      "argument-hint",
-      "userInvocable",
-      "user-invocable",
-      "disableModelInvocation",
-      "disable-model-invocation",
-      "allowedTools",
-      "allowed-tools",
-      "tools",
-      "model",
-      "effort",
-      "context",
-      "agent",
-      "paths",
-      "tier",
-  };
-
-  Value::Object object;
-  for (const auto& [key, value] : values) {
-    if (known.contains(key)) {
-      continue;
-    }
-    object[key] = value;
-  }
-  return Value(std::move(object));
-}
-
-std::filesystem::path default_user_home() {
-  if (const char* home = std::getenv("HOME"); home && *home) {
-    return home;
-  }
-  if (const char* profile = std::getenv("USERPROFILE"); profile && *profile) {
-    return profile;
-  }
-  return {};
 }
 
 bool is_skill_selection_stop_word(const std::string& token) {
@@ -375,6 +213,116 @@ int score_skill_selection(const SkillDefinition& skill, const std::set<std::stri
   return score;
 }
 
+std::string normalize_skill_match_path(std::string path, const std::filesystem::path& cwd) {
+  path = trim_copy(std::move(path));
+  if (path.empty()) {
+    return {};
+  }
+  std::filesystem::path fs_path(path);
+  if (!cwd.empty()) {
+    std::error_code error;
+    if (fs_path.is_absolute()) {
+      auto relative_path = std::filesystem::relative(fs_path, cwd, error);
+      if (!error && !relative_path.empty()) {
+        const auto text = relative_path.string();
+        if (text.rfind("..", 0) != 0) {
+          path = text;
+        }
+      }
+    } else if (path.rfind("./", 0) == 0 || path.rfind(".\\", 0) == 0) {
+      path = (cwd / fs_path).lexically_normal().lexically_relative(cwd).string();
+    }
+  }
+  std::replace(path.begin(), path.end(), '\\', '/');
+  while (path.rfind("./", 0) == 0) {
+    path.erase(0, 2);
+  }
+  while (path.find("//") != std::string::npos) {
+    path.replace(path.find("//"), 2, "/");
+  }
+  while (path.size() > 1 && path.back() == '/') {
+    path.pop_back();
+  }
+  return path;
+}
+
+std::string glob_to_regex_source(const std::string& pattern) {
+  std::string source = "^";
+  for (std::size_t index = 0; index < pattern.size(); ++index) {
+    const char ch = pattern[index];
+    if (ch == '*') {
+      const bool is_double = index + 1 < pattern.size() && pattern[index + 1] == '*';
+      if (is_double && index + 2 < pattern.size() && pattern[index + 2] == '/') {
+        source += "(?:.*/)?";
+        index += 2;
+      } else if (is_double) {
+        source += ".*";
+        index += 1;
+      } else {
+        source += "[^/]*";
+      }
+      continue;
+    }
+    if (ch == '?') {
+      source += "[^/]";
+      continue;
+    }
+    if (std::string(".+^${}()|[]\\").find(ch) != std::string::npos) {
+      source += '\\';
+    }
+    source += ch;
+  }
+  source += "$";
+  return source;
+}
+
+bool skill_path_matches_pattern(const std::string& path,
+                                const std::string& pattern,
+                                const std::filesystem::path& cwd) {
+  const auto normalized_path = normalize_skill_match_path(path, cwd);
+  const auto normalized_pattern = normalize_skill_match_path(pattern, cwd);
+  if (normalized_path.empty() || normalized_pattern.empty()) {
+    return false;
+  }
+  if (normalized_pattern.find('*') == std::string::npos &&
+      normalized_pattern.find('?') == std::string::npos) {
+    return normalized_path == normalized_pattern ||
+           normalized_path.rfind(normalized_pattern + "/", 0) == 0;
+  }
+  return std::regex_match(normalized_path, std::regex(glob_to_regex_source(normalized_pattern)));
+}
+
+std::vector<std::string> select_path_triggered_skills(const SkillRegistry* registry,
+                                                      const std::set<std::string>& requested,
+                                                      const std::vector<std::string>& paths,
+                                                      const std::filesystem::path& cwd) {
+  if (!registry || paths.empty()) {
+    return {};
+  }
+  std::vector<std::string> selected;
+  for (const auto& skill : registry->model_invocable()) {
+    if (requested.contains(skill.manifest.name) || skill.manifest.paths.empty()) {
+      continue;
+    }
+    bool matched = false;
+    for (const auto& pattern : skill.manifest.paths) {
+      for (const auto& path : paths) {
+        if (skill_path_matches_pattern(path, pattern, cwd)) {
+          matched = true;
+          break;
+        }
+      }
+      if (matched) {
+        break;
+      }
+    }
+    if (matched) {
+      selected.push_back(skill.manifest.name);
+    }
+  }
+  return selected;
+}
+
 std::vector<std::string> auto_select_skills(const SkillRegistry* registry, const std::set<std::string>& requested,
                                             const std::string& input_text, const ModelSettings& model_settings,
                                             const std::string& invoked_skill) {
@@ -462,99 +410,6 @@ std::vector<std::string> auto_select_skills(const SkillRegistry* registry, const
 
 }  // namespace
 
-SkillDefinition parse_anthropic_skill_markdown(const std::string& markdown, std::string file_path,
-                                               std::string source) {
-  std::string normalized = markdown;
-  std::replace(normalized.begin(), normalized.end(), '\r', '\n');
-  std::string frontmatter;
-  std::string body = normalized;
-  if (normalized.rfind("---\n", 0) == 0) {
-    const auto end = normalized.find("\n---\n", 4);
-    if (end == std::string::npos) {
-      throw ConfigurationError("Skill frontmatter is missing a closing --- line.");
-    }
-    frontmatter = normalized.substr(4, end - 4);
-    body = normalized.substr(end + 5);
-  }
-
-  std::map<std::string, std::string> scalars;
-  std::map<std::string, std::vector<std::string>> lists;
-  std::map<std::string, Value> parsed_values;
-  std::istringstream stream(frontmatter);
-  std::string line;
-  std::string active_list;
-  while (std::getline(stream, line)) {
-    const std::string trimmed = trim_copy(line);
-    if (trimmed.empty() || trimmed[0] == '#') {
-      continue;
-    }
-    if (!active_list.empty() && trimmed.rfind("- ", 0) == 0) {
-      lists[active_list].push_back(unquote_scalar(trimmed.substr(2)));
-      parsed_values[active_list].as_array().push_back(parse_frontmatter_scalar_value(trimmed.substr(2)));
-      continue;
-    }
-    active_list.clear();
-    const auto colon = line.find(':');
-    if (colon == std::string::npos) {
-      continue;
-    }
-    const std::string key = trim_copy(line.substr(0, colon));
-    std::string value = trim_copy(line.substr(colon + 1));
-    if (value.empty()) {
-      active_list = key;
-      lists[key] = {};
-      parsed_values[key] = Value::array({});
-      continue;
-    }
-    scalars[key] = unquote_scalar(value);
-    parsed_values[key] = parse_frontmatter_scalar_value(value);
-  }
-
-  const std::filesystem::path path(file_path);
-  const auto directory = path.parent_path().string();
-  const std::string derived_name = path.parent_path().filename().empty()
-                                       ? path.stem().string()
-                                       : path.parent_path().filename().string();
-  const std::string prompt = trim_copy(body);
-  if (prompt.empty()) {
-    throw ConfigurationError("Skill \"" + file_path + "\" has an empty body.");
-  }
-
-  SkillManifest manifest;
-  manifest.name = scalars.contains("name") && !trim_copy(scalars["name"]).empty() ? trim_copy(scalars["name"])
-                                                                                  : derived_name;
-  manifest.description = scalars.contains("description") ? trim_copy(scalars["description"]) : "";
-  if (manifest.description.empty()) {
-    std::istringstream body_lines(prompt);
-    std::getline(body_lines, manifest.description);
-    manifest.description = trim_copy(manifest.description);
-  }
-  manifest.argument_hint = scalars.contains("argumentHint") ? scalars["argumentHint"] : scalars["argument-hint"];
-  manifest.user_invocable = parsed_values["userInvocable"].as_bool(false) ||
-                             parsed_values["user-invocable"].as_bool(false);
-  manifest.disable_model_invocation =
-      parsed_values["disableModelInvocation"].as_bool(false) ||
-      parsed_values["disable-model-invocation"].as_bool(false);
-  if (parsed_values.contains("allowedTools")) {
-    manifest.allowed_tools = string_array_from_frontmatter_value(parsed_values["allowedTools"], true);
-  } else if (parsed_values.contains("allowed-tools")) {
-    manifest.allowed_tools = string_array_from_frontmatter_value(parsed_values["allowed-tools"], true);
-  } else if (parsed_values.contains("tools")) {
-    manifest.allowed_tools = string_array_from_frontmatter_value(parsed_values["tools"], true);
-  }
-  manifest.model = scalars["model"];
-  manifest.effort = scalars["effort"];
-  manifest.context = scalars["context"] == "fork" ? "fork" : "inline";
-  manifest.agent = scalars["agent"];
-  manifest.paths = parsed_values.contains("paths")
-                       ? string_array_from_frontmatter_value(parsed_values["paths"])
-                       : std::vector<std::string>{};
-  manifest.tier = scalars.contains("tier") ? scalars["tier"] : "core-safe";
-  manifest.metadata = metadata_value_from_frontmatter(parsed_values);
-
-  return SkillDefinition{manifest, prompt, std::move(file_path), directory, std::move(source)};
-}
-
 std::string render_skill_prompt(const SkillDefinition& skill, SkillRenderContext context) {
   std::string rendered = skill.prompt;
   const std::string skill_dir = context.skill_dir.empty() ? skill.directory : context.skill_dir;
@@ -571,78 +426,6 @@ std::string render_skill_prompt(const SkillDefinition& skill, SkillRenderContext
   replace_all(rendered, "${CLAUDE_SESSION_ID}", context.session_id);
   replace_all(rendered, "${CLAUDE_SKILL_DIR}", skill_dir);
   return trim_copy(replace_skill_env_placeholders(std::move(rendered), context.env));
-}
-
-SkillDefinition load_skill_file(const std::filesystem::path& file_path, std::string source) {
-  const auto markdown = bytes_to_text(read_binary_file(file_path));
-  return parse_anthropic_skill_markdown(markdown, file_path.string(), std::move(source));
-}
-
-std::vector<SkillDefinition> load_skill_directory(const std::filesystem::path& directory,
-                                                  std::string source) {
-  if (!path_is_directory(directory)) {
-    return {};
-  }
-
-  std::vector<std::filesystem::directory_entry> entries;
-  std::error_code error;
-  for (std::filesystem::directory_iterator it(directory, std::filesystem::directory_options::skip_permission_denied,
-                                             error), end;
-       !error && it != end; it.increment(error)) {
-    entries.push_back(*it);
-  }
-  std::sort(entries.begin(), entries.end(), [](const auto& left, const auto& right) {
-    return left.path().filename().string() < right.path().filename().string();
-  });
-
-  std::vector<SkillDefinition> skills;
-  for (const auto& entry : entries) {
-    std::error_code entry_error;
-    if (!entry.is_directory(entry_error)) {
-      continue;
-    }
-    const auto skill_path = entry.path() / "SKILL.md";
-    if (!path_exists(skill_path)) {
-      continue;
-    }
-    skills.push_back(load_skill_file(skill_path, source));
-  }
-  return skills;
-}
-
-std::vector<std::filesystem::path> collect_project_skill_directories(const std::filesystem::path& cwd) {
-  std::vector<std::filesystem::path> directories;
-  auto current = absolute_normalized_path(cwd.empty() ? std::filesystem::current_path() : cwd);
-  while (true) {
-    directories.push_back(current / ".claude" / "skills");
-    const auto parent = current.parent_path();
-    if (parent.empty() || parent == current) {
-      break;
-    }
-    current = parent;
-  }
-  return directories;
-}
-
-SkillRegistry load_anthropic_skill_registry(AnthropicSkillRegistryLoadOptions options) {
-  SkillRegistry registry;
-  for (const auto& directory : collect_project_skill_directories(options.cwd)) {
-    for (auto& skill : load_skill_directory(directory, "project")) {
-      if (!registry.has(skill.manifest.name)) {
-        registry.register_skill(std::move(skill));
-      }
-    }
-  }
-
-  if (options.include_user) {
-    const auto home = options.user_home.empty() ? default_user_home() : options.user_home;
-    if (!home.empty()) {
-      for (auto& skill : load_skill_directory(home / ".claude" / "skills", "user")) {
-        registry.register_skill(std::move(skill));
-      }
-    }
-  }
-  return registry;
 }
 
 SkillRegistry::SkillRegistry(std::vector<SkillDefinition> skills) {
@@ -844,7 +627,212 @@ struct ActivationRecord {
   SkillActivationSource source = SkillActivationSource::Host;
   int priority = 0;
   std::size_t order = 0;  // position in the final activations list
+  bool auto_selected = false;
 };
+
+Value string_list_value(const std::vector<std::string>& values) {
+  Value::Array array;
+  array.reserve(values.size());
+  for (const auto& value : values) {
+    array.emplace_back(value);
+  }
+  return Value(std::move(array));
+}
+
+Value skill_manifest_value(const SkillManifest& manifest) {
+  return Value::object({
+      {"name", manifest.name},
+      {"description", manifest.description},
+      {"argumentHint", manifest.argument_hint},
+      {"userInvocable", manifest.user_invocable},
+      {"disableModelInvocation", manifest.disable_model_invocation},
+      {"allowedTools", string_list_value(manifest.allowed_tools)},
+      {"model", manifest.model},
+      {"effort", manifest.effort},
+      {"context", manifest.context},
+      {"agent", manifest.agent},
+      {"paths", string_list_value(manifest.paths)},
+      {"tier", manifest.tier},
+      {"metadata", manifest.metadata},
+  });
+}
+
+Value skill_definition_value(const SkillDefinition& skill) {
+  return Value::object({
+      {"manifest", skill_manifest_value(skill.manifest)},
+      {"prompt", skill.prompt},
+      {"filePath", skill.file_path},
+      {"directory", skill.directory},
+      {"source", skill.source},
+  });
+}
+
+Value activation_record_value(const ActivationRecord& record) {
+  return Value::object({
+      {"name", record.name},
+      {"argumentsText", record.arguments_text},
+      {"source", to_string(record.source)},
+      {"priority", record.priority},
+      {"order", static_cast<long long>(record.order)},
+      {"autoSelected", record.auto_selected},
+  });
+}
+
+Value skill_activations_value(const std::vector<SkillActivation>& activations) {
+  Value::Array array;
+  array.reserve(activations.size());
+  for (std::size_t index = 0; index < activations.size(); ++index) {
+    const auto& activation = activations[index];
+    array.push_back(Value::object({
+        {"name", activation.name},
+        {"argumentsText", activation.arguments_text},
+        {"source", to_string(activation.source)},
+        {"priority", activation.priority},
+        {"order", static_cast<long long>(index)},
+    }));
+  }
+  return Value(std::move(array));
+}
+
+Value available_skills_value(const std::vector<SkillDefinition>& skills) {
+  Value::Array array;
+  array.reserve(skills.size());
+  for (const auto& skill : skills) {
+    array.push_back(Value::object({
+        {"name", skill.manifest.name},
+        {"description", skill.manifest.description},
+        {"argumentHint", skill.manifest.argument_hint},
+        {"userInvocable", skill.manifest.user_invocable},
+        {"modelInvocable", !skill.manifest.disable_model_invocation},
+        {"tier", skill.manifest.tier},
+    }));
+  }
+  return Value(std::move(array));
+}
+
+Value active_skills_value(const std::vector<ResolvedSkillUse>& skills) {
+  Value::Array array;
+  array.reserve(skills.size());
+  for (const auto& entry : skills) {
+    array.push_back(Value::object({
+        {"name", entry.skill.manifest.name},
+        {"argumentsText", entry.arguments_text},
+        {"manifest", skill_manifest_value(entry.skill.manifest)},
+        {"renderedPrompt", entry.rendered_prompt},
+    }));
+  }
+  return Value(std::move(array));
+}
+
+Value resolved_skills_state_value(const ResolvedSkillsState& state) {
+  return Value::object({
+      {"availableMessage", state.available_message ? agent_message_to_value(*state.available_message) : Value()},
+      {"activeMessages", [&] {
+         Value::Array messages;
+         messages.reserve(state.active_messages.size());
+         for (const auto& message : state.active_messages) {
+           messages.push_back(agent_message_to_value(message));
+         }
+         return Value(std::move(messages));
+       }()},
+      {"activeSkills", active_skills_value(state.active_skills)},
+      {"autoSelectedSkills", string_list_value(state.auto_selected_skills)},
+      {"allowedTools", string_list_value(state.allowed_tools)},
+      {"effectiveInputText", state.effective_input_text},
+      {"modelSettings", model_settings_to_json_value(state.model_settings)},
+  });
+}
+
+void populate_skill_hook_base(HookExecutionContext& context, const SkillResolveOptions& options) {
+  context.target = ExecutionTarget::Skill;
+  context.trace_id = options.trace_context.trace_id;
+  context.run_id = options.trace_context.run_id;
+  context.workflow_run_id = options.trace_context.workflow_run_id;
+  context.metadata = options.metadata;
+}
+
+SkillActivationHookContext skill_activation_hook_context(const SkillResolveOptions& options,
+                                                        const ActivationRecord& record,
+                                                        const SkillDefinition& skill,
+                                                        std::string rendered_prompt = {},
+                                                        std::string error = {}) {
+  SkillActivationHookContext context;
+  populate_skill_hook_base(context, options);
+  context.skill_name = skill.manifest.name;
+  context.activation_source = to_string(record.source);
+  context.arguments_text = record.arguments_text;
+  context.priority = record.priority;
+  context.auto_selected = record.auto_selected;
+  context.activation = activation_record_value(record);
+  context.manifest = skill_manifest_value(skill.manifest);
+  context.skill = skill_definition_value(skill);
+  context.rendered_prompt = std::move(rendered_prompt);
+  context.allowed_tools = skill.manifest.allowed_tools;
+  context.model = skill.manifest.model;
+  context.effort = skill.manifest.effort;
+  context.error = std::move(error);
+  return context;
+}
+
+SkillsResolveHookContext skills_resolve_hook_context(const SkillResolveOptions& options,
+                                                     const std::vector<SkillActivation>& activations,
+                                                     const std::vector<SkillDefinition>& available,
+                                                     const ResolvedSkillsState& state,
+                                                     std::string error = {}) {
+  SkillsResolveHookContext context;
+  populate_skill_hook_base(context, options);
+  context.input_text = options.input_text;
+  context.activations = skill_activations_value(activations);
+  context.available_skills = available_skills_value(available);
+  context.active_skills = active_skills_value(state.active_skills);
+  context.auto_selected_skills = string_list_value(state.auto_selected_skills);
+  context.allowed_tools = string_list_value(state.allowed_tools);
+  context.effective_input_text = state.effective_input_text;
+  context.model_settings_before = model_settings_to_json_value(options.model_settings);
+  context.model_settings_after = model_settings_to_json_value(state.model_settings);
+  context.result = resolved_skills_state_value(state);
+  context.error = std::move(error);
+  return context;
+}
+
+void publish_skill_event(const SkillResolveOptions& options, const std::string& category, Value payload) {
+  if (options.event_bus) {
+    options.event_bus->publish(category, ExecutionTarget::Skill, std::move(payload), options.trace_context);
+  }
+}
+
+Value skill_activation_event_payload(const SkillActivationHookContext& context) {
+  return Value::object({
+      {"skillName", context.skill_name},
+      {"activationSource", context.activation_source},
+      {"argumentsText", context.arguments_text},
+      {"priority", context.priority},
+      {"autoSelected", context.auto_selected},
+      {"activation", context.activation},
+      {"manifest", context.manifest},
+      {"model", context.model},
+      {"effort", context.effort},
+      {"allowedTools", string_list_value(context.allowed_tools)},
+      {"renderedPrompt", context.rendered_prompt},
+      {"error", context.error},
+  });
+}
+
+Value skills_resolve_event_payload(const SkillsResolveHookContext& context) {
+  return Value::object({
+      {"inputText", context.input_text},
+      {"activations", context.activations},
+      {"availableSkills", context.available_skills},
+      {"activeSkills", context.active_skills},
+      {"autoSelectedSkills", context.auto_selected_skills},
+      {"allowedTools", context.allowed_tools},
+      {"effectiveInputText", context.effective_input_text},
+      {"modelSettingsBefore", context.model_settings_before},
+      {"modelSettingsAfter", context.model_settings_after},
+      {"result", context.result},
+      {"error", context.error},
+  });
+}
 
 // Picks a winner from `entries` according to `policy`. Each entry is
 // `(value, priority, order)`. Throws ConfigurationError if `policy ==
@@ -911,155 +899,247 @@ std::string resolve_conflict(SkillConflictPolicy policy,
 ResolvedSkillsState resolve_skills_state(const SkillRegistry* registry, SkillResolveOptions options) {
   ResolvedSkillsState state;
   state.model_settings = options.model_settings;
-  if (!registry) {
-    return state;
-  }
+  std::vector<SkillActivation> observed_activations = options.activations;
+  std::vector<SkillDefinition> available;
 
-  // 1. Run the slash parser. Prepend its activations so that names not already
-  // covered by explicit caller activations become visible to dedup.
-  ParsedSlashActivations parsed = parse_slash_activations(options.input_text, *registry);
-  std::set<std::string> existing_names;
-  for (const auto& act : options.activations) {
-    existing_names.insert(act.name);
-  }
-  std::vector<SkillActivation> merged;
-  merged.reserve(parsed.activations.size() + options.activations.size());
-  for (auto& act : parsed.activations) {
-    if (existing_names.count(act.name)) {
-      continue;  // explicit caller wins
+  try {
+    auto before_context = skills_resolve_hook_context(options, observed_activations, available, state);
+    publish_skill_event(options, "skills.resolve.started", skills_resolve_event_payload(before_context));
+    if (options.hooks && options.hooks->before_skills_resolve) {
+      options.hooks->before_skills_resolve(before_context);
     }
-    merged.push_back(std::move(act));
-  }
-  for (auto& act : options.activations) {
-    merged.push_back(std::move(act));
-  }
 
-  // 2. Dedup by name, preserving FIRST occurrence's source/args/priority.
-  std::vector<ActivationRecord> records;
-  std::set<std::string> seen;
-  for (auto& act : merged) {
-    if (act.name.empty()) continue;
-    if (!seen.insert(act.name).second) continue;
-    ActivationRecord rec;
-    rec.name = act.name;
-    rec.arguments_text = act.arguments_text;
-    rec.source = act.source;
-    rec.priority = act.priority;
-    rec.order = records.size();
-    records.push_back(std::move(rec));
-  }
-
-  // 3. User-source enforcement & unknown-skill drop.
-  std::vector<ActivationRecord> active_records;
-  active_records.reserve(records.size());
-  std::set<std::string> active_names;
-  bool any_user_from_parser = !parsed.activations.empty();
-  for (auto& rec : records) {
-    const auto* skill = registry->get(rec.name);
-    if (!skill) {
-      continue;  // unknown — drop silently
-    }
-    if (rec.source == SkillActivationSource::User && !skill->manifest.user_invocable) {
-      throw ConfigurationError("Skill \"" + rec.name +
-                               "\" is not user-invocable; refusing user-source activation.");
-    }
-    active_records.push_back(std::move(rec));
-    active_names.insert(active_records.back().name);
-  }
-
-  // 4. Auto-select. Treat any User-source activation as the "invoked" skill so
-  // auto-selection stays consistent with the legacy slash-command behavior.
-  std::string invoked_skill;
-  for (const auto& rec : active_records) {
-    if (rec.source == SkillActivationSource::User) {
-      invoked_skill = rec.name;
-      break;
-    }
-  }
-  state.auto_selected_skills =
-      auto_select_skills(registry, active_names, options.input_text, options.model_settings, invoked_skill);
-  for (const auto& name : state.auto_selected_skills) {
-    if (active_names.count(name)) continue;
-    ActivationRecord rec;
-    rec.name = name;
-    rec.source = SkillActivationSource::Model;
-    rec.priority = 0;
-    rec.order = active_records.size();
-    active_records.push_back(std::move(rec));
-    active_names.insert(name);
-  }
-
-  // 5. Available catalog message (same as legacy behavior).
-  const auto available = registry->model_invocable();
-  if (!available.empty()) {
-    std::string catalog = "Available Anthropic-style skills";
-    Value::Array names;
-    for (const auto& skill : available) {
-      catalog += "\n- " + skill.manifest.name + ": " + skill.manifest.description;
-      if (!skill.manifest.argument_hint.empty()) {
-        catalog += " | args: " + skill.manifest.argument_hint;
+    if (!registry) {
+      auto after_context = skills_resolve_hook_context(options, observed_activations, available, state);
+      if (options.hooks && options.hooks->after_skills_resolve) {
+        options.hooks->after_skills_resolve(after_context);
       }
-      names.emplace_back(skill.manifest.name);
+      publish_skill_event(options, "skills.resolve.completed", skills_resolve_event_payload(after_context));
+      return state;
     }
-    state.available_message = create_message(MessageRole::System, catalog,
-                                             Value::object({{"source", "skills-catalog"}, {"skills", Value(names)}}));
-  }
 
-  // 6. Render & collect model/effort signals.
-  std::vector<std::tuple<std::string, int, std::size_t>> model_entries;
-  std::vector<std::tuple<std::string, int, std::size_t>> effort_entries;
-  for (const auto& rec : active_records) {
-    const auto* skill = registry->get(rec.name);
-    if (!skill) continue;
-    SkillRenderContext render_context;
-    render_context.arguments_text = rec.arguments_text;
-    render_context.session_id = options.session_id;
-    render_context.skill_dir = skill->directory;
-    const std::string prompt = render_skill_prompt(*skill, render_context);
-    state.active_skills.push_back(ResolvedSkillUse{*skill, prompt, rec.arguments_text});
-    state.active_messages.push_back(create_message(MessageRole::System, prompt,
-                                                   Value::object({{"source", "skill"},
-                                                                  {"skill", skill->manifest.name},
-                                                                  {"argumentsText", rec.arguments_text},
-                                                                  {"activationSource", to_string(rec.source)}})));
-    state.allowed_tools.insert(state.allowed_tools.end(), skill->manifest.allowed_tools.begin(),
-                               skill->manifest.allowed_tools.end());
-    if (!skill->manifest.model.empty()) {
-      model_entries.emplace_back(skill->manifest.model, rec.priority, rec.order);
+    // 1. Run the slash parser. Prepend its activations so that names not already
+    // covered by explicit caller activations become visible to dedup.
+    ParsedSlashActivations parsed = parse_slash_activations(options.input_text, *registry);
+    std::set<std::string> existing_names;
+    for (const auto& act : options.activations) {
+      existing_names.insert(act.name);
     }
-    if (!skill->manifest.effort.empty()) {
-      effort_entries.emplace_back(skill->manifest.effort, rec.priority, rec.order);
+    std::vector<SkillActivation> merged;
+    merged.reserve(parsed.activations.size() + options.activations.size());
+    for (auto& act : parsed.activations) {
+      if (existing_names.count(act.name)) {
+        continue;  // explicit caller wins
+      }
+      merged.push_back(std::move(act));
     }
-  }
-  std::sort(state.allowed_tools.begin(), state.allowed_tools.end());
-  state.allowed_tools.erase(std::unique(state.allowed_tools.begin(), state.allowed_tools.end()),
-                            state.allowed_tools.end());
-
-  // 7. Model conflict resolution (caller's explicit model wins).
-  if (state.model_settings.model.empty() && !model_entries.empty()) {
-    const std::string winner = resolve_conflict(options.model_conflict, model_entries, "models");
-    if (!winner.empty()) {
-      state.model_settings.model = winner;
+    for (auto& act : options.activations) {
+      merged.push_back(std::move(act));
     }
-  }
+    observed_activations = merged;
 
-  // 8. Effort conflict resolution (caller's explicit reasoning wins).
-  if (!state.model_settings.reasoning && !effort_entries.empty()) {
-    const std::string effort = resolve_conflict(options.effort_conflict, effort_entries, "effort");
-    if (!effort.empty()) {
-      ReasoningSettings reasoning;
-      reasoning.budget = effort == "minimal" ? std::string("low")
-                        : effort == "max"    ? std::string("high")
-                                              : effort;
-      state.model_settings.reasoning = reasoning;
+    // 2. Dedup by name, preserving FIRST occurrence's source/args/priority.
+    std::vector<ActivationRecord> records;
+    std::set<std::string> seen;
+    for (auto& act : merged) {
+      if (act.name.empty()) continue;
+      if (!seen.insert(act.name).second) continue;
+      ActivationRecord rec;
+      rec.name = act.name;
+      rec.arguments_text = act.arguments_text;
+      rec.source = act.source;
+      rec.priority = act.priority;
+      rec.order = records.size();
+      records.push_back(std::move(rec));
     }
-  }
 
-  // 9. effective_input_text — only when the parser actually changed the input.
-  if (any_user_from_parser && parsed.stripped_input != options.input_text) {
-    state.effective_input_text = parsed.stripped_input;
-  }
+    std::vector<std::string> path_selected_skills =
+        select_path_triggered_skills(registry, seen, options.paths, options.cwd);
+    for (const auto& name : path_selected_skills) {
+      if (!seen.insert(name).second) {
+        continue;
+      }
+      ActivationRecord rec;
+      rec.name = name;
+      rec.source = SkillActivationSource::Model;
+      rec.priority = 0;
+      rec.order = records.size();
+      rec.auto_selected = true;
+      records.push_back(std::move(rec));
+      observed_activations.push_back(SkillActivation{
+          .name = name,
+          .arguments_text = "",
+          .source = SkillActivationSource::Model,
+          .priority = 0,
+      });
+    }
 
-  return state;
+    auto begin_activation = [&](ActivationRecord rec,
+                                std::vector<ActivationRecord>& active_records,
+                                std::set<std::string>& active_names) {
+      const auto* skill = registry->get(rec.name);
+      if (!skill) {
+        return;  // unknown — drop silently
+      }
+
+      auto hook_context = skill_activation_hook_context(options, rec, *skill);
+      publish_skill_event(options, "skill.activation.started", skill_activation_event_payload(hook_context));
+      try {
+        if (options.hooks && options.hooks->before_skill_activation) {
+          options.hooks->before_skill_activation(hook_context);
+        }
+        if (rec.source == SkillActivationSource::User && !skill->manifest.user_invocable) {
+          throw ConfigurationError("Skill \"" + rec.name +
+                                   "\" is not user-invocable; refusing user-source activation.");
+        }
+      } catch (const std::exception& error) {
+        auto error_context = skill_activation_hook_context(options, rec, *skill, {}, error.what());
+        if (options.hooks && options.hooks->on_skill_activation_error) {
+          options.hooks->on_skill_activation_error(error_context);
+        }
+        publish_skill_event(options, "skill.activation.failed", skill_activation_event_payload(error_context));
+        throw;
+      }
+
+      active_names.insert(rec.name);
+      active_records.push_back(std::move(rec));
+    };
+
+    // 3. User-source enforcement & unknown-skill drop.
+    std::vector<ActivationRecord> active_records;
+    active_records.reserve(records.size());
+    std::set<std::string> active_names;
+    bool any_user_from_parser = !parsed.activations.empty();
+    for (auto& rec : records) {
+      begin_activation(std::move(rec), active_records, active_names);
+    }
+
+    // 4. Auto-select. Treat any User-source activation as the "invoked" skill so
+    // auto-selection stays consistent with the legacy slash-command behavior.
+    std::string invoked_skill;
+    for (const auto& rec : active_records) {
+      if (rec.source == SkillActivationSource::User) {
+        invoked_skill = rec.name;
+        break;
+      }
+    }
+    state.auto_selected_skills = path_selected_skills;
+    for (const auto& name : auto_select_skills(registry, active_names, options.input_text, options.model_settings, invoked_skill)) {
+      if (std::find(state.auto_selected_skills.begin(), state.auto_selected_skills.end(), name) ==
+          state.auto_selected_skills.end()) {
+        state.auto_selected_skills.push_back(name);
+      }
+    }
+    for (const auto& name : state.auto_selected_skills) {
+      if (active_names.count(name)) continue;
+      ActivationRecord rec;
+      rec.name = name;
+      rec.source = SkillActivationSource::Model;
+      rec.priority = 0;
+      rec.order = active_records.size();
+      rec.auto_selected = true;
+      begin_activation(std::move(rec), active_records, active_names);
+    }
+
+    // 5. Available catalog message (same as legacy behavior).
+    available = registry->model_invocable();
+    if (!available.empty()) {
+      std::string catalog = "Available Anthropic-style skills";
+      Value::Array names;
+      for (const auto& skill : available) {
+        catalog += "\n- " + skill.manifest.name + ": " + skill.manifest.description;
+        if (!skill.manifest.argument_hint.empty()) {
+          catalog += " | args: " + skill.manifest.argument_hint;
+        }
+        names.emplace_back(skill.manifest.name);
+      }
+      state.available_message = create_message(MessageRole::System, catalog,
+                                               Value::object({{"source", "skills-catalog"}, {"skills", Value(names)}}));
+    }
+
+    // 6. Render & collect model/effort signals.
+    std::vector<std::tuple<std::string, int, std::size_t>> model_entries;
+    std::vector<std::tuple<std::string, int, std::size_t>> effort_entries;
+    for (const auto& rec : active_records) {
+      const auto* skill = registry->get(rec.name);
+      if (!skill) continue;
+      try {
+        SkillRenderContext render_context;
+        render_context.arguments_text = rec.arguments_text;
+        render_context.session_id = options.session_id;
+        render_context.skill_dir = skill->directory;
+        const std::string prompt = render_skill_prompt(*skill, render_context);
+        state.active_skills.push_back(ResolvedSkillUse{*skill, prompt, rec.arguments_text});
+        state.active_messages.push_back(create_message(MessageRole::System, prompt,
+                                                       Value::object({{"source", "skill"},
+                                                                      {"skill", skill->manifest.name},
+                                                                      {"argumentsText", rec.arguments_text},
+                                                                      {"activationSource", to_string(rec.source)}})));
+        state.allowed_tools.insert(state.allowed_tools.end(), skill->manifest.allowed_tools.begin(),
+                                   skill->manifest.allowed_tools.end());
+        if (!skill->manifest.model.empty()) {
+          model_entries.emplace_back(skill->manifest.model, rec.priority, rec.order);
+        }
+        if (!skill->manifest.effort.empty()) {
+          effort_entries.emplace_back(skill->manifest.effort, rec.priority, rec.order);
+        }
+
+        auto hook_context = skill_activation_hook_context(options, rec, *skill, prompt);
+        if (options.hooks && options.hooks->after_skill_activation) {
+          options.hooks->after_skill_activation(hook_context);
+        }
+        publish_skill_event(options, "skill.activation.completed", skill_activation_event_payload(hook_context));
+      } catch (const std::exception& error) {
+        auto error_context = skill_activation_hook_context(options, rec, *skill, {}, error.what());
+        if (options.hooks && options.hooks->on_skill_activation_error) {
+          options.hooks->on_skill_activation_error(error_context);
+        }
+        publish_skill_event(options, "skill.activation.failed", skill_activation_event_payload(error_context));
+        throw;
+      }
+    }
+    std::sort(state.allowed_tools.begin(), state.allowed_tools.end());
+    state.allowed_tools.erase(std::unique(state.allowed_tools.begin(), state.allowed_tools.end()),
+                              state.allowed_tools.end());
+
+    // 7. Model conflict resolution (caller's explicit model wins).
+    if (state.model_settings.model.empty() && !model_entries.empty()) {
+      const std::string winner = resolve_conflict(options.model_conflict, model_entries, "models");
+      if (!winner.empty()) {
+        state.model_settings.model = winner;
+      }
+    }
+
+    // 8. Effort conflict resolution (caller's explicit reasoning wins).
+    if (!state.model_settings.reasoning && !effort_entries.empty()) {
+      const std::string effort = resolve_conflict(options.effort_conflict, effort_entries, "effort");
+      if (!effort.empty()) {
+        ReasoningSettings reasoning;
+        reasoning.budget = effort == "minimal" ? std::string("low")
+                          : effort == "max"    ? std::string("high")
+                                                : effort;
+        state.model_settings.reasoning = reasoning;
+      }
+    }
+
+    // 9. effective_input_text — only when the parser actually changed the input.
+    if (any_user_from_parser && parsed.stripped_input != options.input_text) {
+      state.effective_input_text = parsed.stripped_input;
+    }
+
+    auto after_context = skills_resolve_hook_context(options, observed_activations, available, state);
+    if (options.hooks && options.hooks->after_skills_resolve) {
+      options.hooks->after_skills_resolve(after_context);
+    }
+    publish_skill_event(options, "skills.resolve.completed", skills_resolve_event_payload(after_context));
+    return state;
+  } catch (const std::exception& error) {
+    auto error_context = skills_resolve_hook_context(options, observed_activations, available, state, error.what());
+    if (options.hooks && options.hooks->on_skills_resolve_error) {
+      options.hooks->on_skills_resolve_error(error_context);
+    }
+    publish_skill_event(options, "skills.resolve.failed", skills_resolve_event_payload(error_context));
+    throw;
+  }
 }
 }  // namespace agent

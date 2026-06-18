@@ -5,6 +5,11 @@ serialization, in-memory/file-backed stores, node and agent registries, built-in
 node handlers, persisted resume, human/webhook signals, and workflow inspection
 tools.
 
+Workflow stores hold `runtime-owned` run state: definition snapshots, node
+state, wait signals, checkpoints, and event logs. They are suitable as the
+canonical store for small local deployments, but they are not a framework-owned
+business repository for orders, tickets, approvals, or other domain entities.
+
 ## File Store
 
 `FileWorkflowStore` supports NodeJS-style config-object construction:

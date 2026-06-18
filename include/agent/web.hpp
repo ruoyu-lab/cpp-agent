@@ -102,9 +102,7 @@ using NativeWebFetchTransport = std::function<WebFetchedPage(const NativeWebFetc
 
 Value web_search_result_to_value(const WebSearchResult& result);
 Value web_fetched_page_to_value(const WebFetchedPage& page);
-NativeWebSearchTransport create_native_web_search_transport(
-    HttpTransport transport = create_native_http_transport());
-NativeWebFetchTransport create_native_web_fetch_transport(NativeHttpClientConfig config = {});
+NativeWebSearchTransport create_native_web_search_transport(HttpTransport transport);
 NativeWebFetchTransport create_native_web_fetch_transport(HttpTransport transport);
 StaticWebSearchProvider create_brave_web_search_provider(NativeWebSearchTransport transport,
                                                          std::string api_key = {},

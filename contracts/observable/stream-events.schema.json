@@ -1,0 +1,297 @@
+{
+  "version": 1,
+  "schema": {
+    "type": "object",
+    "required": ["schemaVersion", "sequence", "type"],
+    "additionalProperties": true,
+    "properties": {
+      "schemaVersion": {
+        "type": "integer",
+        "const": 1
+      },
+      "sequence": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "type": {
+        "type": "string",
+        "enum": [
+          "status",
+          "knowledge-retrieval",
+          "memory-retrieval",
+          "plan",
+          "user-visible-delta",
+          "loop",
+          "tool-call-argument-delta",
+          "done",
+          "cancelled",
+          "error"
+        ]
+      },
+      "status": {
+        "type": "object",
+        "required": ["kind", "stage", "state", "message"],
+        "additionalProperties": true,
+        "properties": {
+          "kind": { "type": "string" },
+          "stage": { "type": "string" },
+          "state": { "type": "string" },
+          "message": { "type": "string" }
+        }
+      },
+      "loop": {
+        "type": "object",
+        "required": ["schemaVersion", "sequence", "type", "iteration"],
+        "additionalProperties": true,
+        "properties": {
+          "schemaVersion": { "type": "integer", "const": 1 },
+          "sequence": { "type": "integer", "minimum": 1 },
+          "type": {
+            "type": "string",
+            "enum": [
+              "iteration-start",
+              "model-start",
+              "model-text-delta",
+              "user-visible-delta",
+              "model-reasoning-delta",
+              "model-reasoning-completed",
+              "model-response",
+              "tool-call-argument-delta",
+              "react-action-batch",
+              "tool-batch-start",
+              "tool-start",
+              "tool-delta",
+              "tool-complete",
+              "tool-batch-complete",
+              "react-message",
+              "react-observation",
+              "react-final",
+              "react-final-rejected",
+              "react-reasoning-protocol-leak",
+              "react-parse-error",
+              "done"
+            ]
+          },
+          "iteration": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "result": {
+        "type": "object",
+        "required": ["sessionId", "text", "iterationCount", "terminationReason"],
+        "additionalProperties": true,
+        "properties": {
+          "sessionId": { "type": "string" },
+          "text": { "type": "string" },
+          "iterationCount": { "type": "integer", "minimum": 0 },
+          "terminationReason": {
+            "type": "string",
+            "enum": ["completed", "max-iterations", "incomplete-response"]
+          }
+        }
+      },
+      "error": {
+        "type": "object"
+      },
+      "cancellation": {
+        "type": "object",
+        "required": ["message", "name", "category", "code"],
+        "additionalProperties": true,
+        "properties": {
+          "message": { "type": "string" },
+          "name": { "const": "CancellationError" },
+          "category": { "const": "cancelled" },
+          "code": { "const": "cancelled" },
+          "target": { "type": "string" },
+          "reason": { "type": "string" }
+        }
+      },
+      "toolCallId": {
+        "type": "string",
+        "minLength": 1
+      },
+      "toolName": {
+        "type": "string",
+        "minLength": 1
+      },
+      "argsDelta": {
+        "type": "string"
+      },
+      "argsAccumulated": {
+        "type": "string"
+      }
+    },
+    "oneOf": [
+      {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["status"],
+        "properties": {
+          "type": { "const": "status" }
+        }
+      },
+      {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["knowledgeHits"],
+        "properties": {
+          "type": { "const": "knowledge-retrieval" },
+          "knowledgeHits": { "type": "array" }
+        }
+      },
+      {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["memoryHits"],
+        "properties": {
+          "type": { "const": "memory-retrieval" },
+          "memoryHits": { "type": "array" }
+        }
+      },
+      {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["plan"],
+        "properties": {
+          "type": { "const": "plan" },
+          "plan": { "type": "object" }
+        }
+      },
+      {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["delta", "text"],
+        "properties": {
+          "type": { "const": "user-visible-delta" },
+          "delta": { "type": "string" },
+          "text": { "type": "string" }
+        }
+      },
+      {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["loop"],
+        "properties": {
+          "type": { "const": "loop" }
+        }
+      },
+      {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["toolCallId", "toolName", "argsDelta", "argsAccumulated"],
+        "properties": {
+          "type": { "const": "tool-call-argument-delta" }
+        }
+      },
+      {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["result"],
+        "properties": {
+          "type": { "const": "done" }
+        }
+      },
+      {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["error"],
+        "properties": {
+          "type": { "const": "error" }
+        }
+      },
+      {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["cancellation"],
+        "properties": {
+          "type": { "const": "cancelled" }
+        }
+      }
+    ]
+  },
+  "validSamples": [
+    {
+      "schemaVersion": 1,
+      "sequence": 1,
+      "type": "status",
+      "status": {
+        "kind": "runner.start",
+        "stage": "runner",
+        "state": "started",
+        "message": "Run started."
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "sequence": 2,
+      "type": "user-visible-delta",
+      "delta": "你好",
+      "text": "你好"
+    },
+    {
+      "schemaVersion": 1,
+      "sequence": 3,
+      "type": "loop",
+      "loop": {
+        "schemaVersion": 1,
+        "sequence": 1,
+        "type": "user-visible-delta",
+        "iteration": 0,
+        "delta": "你好",
+        "text": "你好"
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "sequence": 4,
+      "type": "done",
+      "result": {
+        "sessionId": "contract",
+        "text": "你好",
+        "iterationCount": 1,
+        "terminationReason": "completed"
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "sequence": 5,
+      "type": "cancelled",
+      "cancellation": {
+        "message": "Execution aborted for model: caller aborted",
+        "name": "CancellationError",
+        "category": "cancelled",
+        "code": "cancelled",
+        "target": "model",
+        "reason": "caller aborted"
+      }
+    }
+  ],
+  "invalidSamples": [
+    {
+      "sequence": 1,
+      "type": "loop"
+    },
+    {
+      "schemaVersion": 1,
+      "sequence": 0,
+      "type": "loop"
+    },
+    {
+      "schemaVersion": 1,
+      "sequence": 1,
+      "type": "unknown"
+    },
+    {
+      "schemaVersion": 1,
+      "sequence": 1,
+      "type": "done"
+    },
+    {
+      "schemaVersion": 1,
+      "sequence": 1,
+      "type": "tool-call-argument-delta",
+      "toolCallId": "call_1",
+      "argsDelta": "{}",
+      "argsAccumulated": "{}"
+    }
+  ]
+}

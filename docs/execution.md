@@ -24,9 +24,9 @@ Use `throw_if_cancelled(target)` inside long-running work:
 token.throw_if_cancelled(agent::ExecutionTarget::Tool);
 ```
 
-The thrown error includes the execution target and cancellation reason. When a
-callback is added after cancellation, it is invoked immediately with the stored
-reason.
+The thrown error is `agent::CancellationError`; it includes the execution target
+and cancellation reason. When a callback is added after cancellation, it is
+invoked immediately with the stored reason.
 
 ## Execution Targets
 

@@ -1,0 +1,1117 @@
+{
+  "version": 1,
+  "protocol": "async-agent-run",
+  "schema": {
+    "type": "object",
+    "required": [
+      "schemaVersion",
+      "runId",
+      "kind",
+      "status",
+      "attempt",
+      "createdAt",
+      "updatedAt",
+      "metadata"
+    ],
+    "additionalProperties": true,
+    "properties": {
+      "schemaVersion": {
+        "type": "integer",
+        "enum": [1]
+      },
+      "runId": {
+        "type": "string",
+        "minLength": 1
+      },
+      "parentRunId": {
+        "type": "string"
+      },
+      "rootRunId": {
+        "type": "string"
+      },
+      "depth": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "role": {
+        "type": "string",
+        "enum": ["leaf", "orchestrator"]
+      },
+      "parentChildRelation": {
+        "type": "string"
+      },
+      "spawnedByToolCallId": {
+        "type": "string"
+      },
+      "topology": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "parentRunId": {
+            "type": "string"
+          },
+          "rootRunId": {
+            "type": "string"
+          },
+          "depth": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "role": {
+            "type": "string",
+            "enum": ["leaf", "orchestrator"]
+          },
+          "parentChildRelation": {
+            "type": "string"
+          },
+          "spawnedByToolCallId": {
+            "type": "string"
+          }
+        }
+      },
+      "policy": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "maxGlobalChildRuns": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "maxChildRunsPerParent": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "maxSpawnDepth": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "maxChildrenPerRun": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "allowChildSpawn": {
+            "type": "boolean"
+          },
+          "cancelPropagation": {
+            "type": "string",
+            "enum": ["none", "direct-children", "subtree"]
+          }
+        }
+      },
+      "activity": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "phase": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "starting",
+              "model_request",
+              "tool_execution",
+              "permission_wait",
+              "child_wait",
+              "scheduler_wait",
+              "external_wait",
+              "retry_sleep",
+              "completed",
+              "failed",
+              "cancelled",
+              "stalled"
+            ]
+          },
+          "lastHeartbeatAt": {
+            "type": "string"
+          },
+          "lastActivityAt": {
+            "type": "string"
+          },
+          "currentTarget": {
+            "type": "string"
+          },
+          "currentToolName": {
+            "type": "string"
+          },
+          "currentIteration": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "interruptible": {
+            "type": "boolean"
+          },
+          "stallReason": {
+            "type": "string"
+          }
+        }
+      },
+      "kind": {
+        "type": "string",
+        "enum": [
+          "agent.run",
+          "subagent.run",
+          "workflow.run",
+          "autonomous.run"
+        ]
+      },
+      "agent": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "displayName": {
+            "type": "string"
+          }
+        }
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "waiting",
+          "completed",
+          "failed",
+          "cancelled"
+        ]
+      },
+      "input": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "summary": {
+            "type": "string"
+          },
+          "outputText": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "array"
+          },
+          "resourceLedger": {
+            "type": "object"
+          },
+          "modifiedResources": {
+            "type": "array"
+          },
+          "openQuestions": {
+            "type": "array"
+          },
+          "nextActions": {
+            "type": "array"
+          }
+        }
+      },
+      "error": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "attempt": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "lease": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "ownerId": {
+            "type": "string"
+          },
+          "expiresAt": {
+            "type": "string"
+          },
+          "heartbeatAt": {
+            "type": "string"
+          }
+        }
+      },
+      "schedule": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "wakeupId": {
+            "type": "string"
+          },
+          "notBefore": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          }
+        }
+      },
+      "approval": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "approvalId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "approved", "denied", "expired", "cancelled"]
+          }
+        }
+      },
+      "waiting": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "reason": {
+            "type": "string",
+            "enum": ["approval", "input", "schedule", "external"]
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "checkpoint": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "latestCheckpointId": {
+            "type": "string"
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "transcript": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "latestEntryId": {
+            "type": "string"
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "createdAt": {
+        "type": "string",
+        "minLength": 1
+      },
+      "updatedAt": {
+        "type": "string",
+        "minLength": 1
+      },
+      "startedAt": {
+        "type": "string"
+      },
+      "completedAt": {
+        "type": "string"
+      },
+      "cancelledAt": {
+        "type": "string"
+      },
+      "resourceLedger": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "tokenUsage": {
+            "type": "object"
+          },
+          "toolCalls": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "filesRead": {
+            "type": "array"
+          },
+          "filesWritten": {
+            "type": "array"
+          },
+          "artifacts": {
+            "type": "array"
+          },
+          "networkRequests": {
+            "type": "array"
+          },
+          "approvalRequests": {
+            "type": "array"
+          },
+          "childRuns": {
+            "type": "array"
+          }
+        }
+      },
+      "metadata": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    }
+  },
+  "statusMachine": {
+    "initial": "queued",
+    "statuses": [
+      "queued",
+      "running",
+      "waiting",
+      "completed",
+      "failed",
+      "cancelled"
+    ],
+    "closedStatuses": ["completed", "cancelled"],
+    "resumableStatuses": [
+      "waiting",
+      "failed"
+    ],
+    "transitions": [
+      {
+        "from": "queued",
+        "to": ["running", "cancelled"]
+      },
+      {
+        "from": "running",
+        "to": [
+          "waiting",
+          "completed",
+          "failed",
+          "cancelled",
+          "queued"
+        ]
+      },
+      {
+        "from": "waiting",
+        "to": ["queued", "cancelled"]
+      },
+      {
+        "from": "failed",
+        "to": ["queued", "cancelled"]
+      },
+      {
+        "from": "completed",
+        "to": []
+      },
+      {
+        "from": "cancelled",
+        "to": []
+      }
+    ]
+  },
+  "eventTypes": [
+    "async_run.created",
+    "async_run.queued",
+    "async_run.started",
+    "async_run.heartbeat",
+    "async_run.activity",
+    "async_run.stream_event",
+    "async_run.checkpoint.created",
+    "async_run.transcript.appended",
+    "async_run.approval.requested",
+    "async_run.approval.resolved",
+    "async_run.waiting",
+    "async_run.resume.requested",
+    "async_run.resumed",
+    "async_run.cancel.requested",
+    "async_run.cancelled",
+    "async_run.completed",
+    "async_run.failed",
+    "async_run.interrupted",
+    "async_run.lease.expired",
+    "child.run.queued",
+    "child.run.started",
+    "child.run.heartbeat",
+    "child.run.activity",
+    "child.run.stalled",
+    "child.run.ledger.updated",
+    "child.run.completed",
+    "child.run.failed",
+    "child.run.cancelled"
+  ],
+  "operationTypes": [
+    "async_agent_run.start",
+    "async_agent_run.read",
+    "async_agent_run.cancel",
+    "async_agent_run.resume",
+    "async_agent_run.list_events",
+    "async_agent_run.list_checkpoints",
+    "async_agent_run.list_transcript",
+    "child_agent.start",
+    "child_agent.read",
+    "child_agent.cancel",
+    "child_agent.resume"
+  ],
+  "schedulerBoundary": {
+    "interface": "AsyncAgentRunScheduler",
+    "operations": [
+      {
+        "name": "createWakeup",
+        "input": {
+          "runId": "string",
+          "notBefore": "rfc3339-string",
+          "reason": "string",
+          "metadata": "object"
+        },
+        "output": {
+          "wakeupId": "string",
+          "provider": "string"
+        }
+      },
+      {
+        "name": "cancelWakeup",
+        "input": {
+          "runId": "string",
+          "wakeupId": "string",
+          "reason": "string"
+        },
+        "output": {
+          "cancelled": "boolean"
+        }
+      }
+    ],
+    "frameworkResponsibilities": [
+      "persist run status before calling host scheduler",
+      "record scheduler wakeup metadata on the run",
+      "resume a due run by transitioning waiting with reason=schedule to queued",
+      "emit async_run.waiting and async_run.resumed events"
+    ],
+    "hostResponsibilities": [
+      "provide durable timers or app lifecycle wakeups",
+      "call the framework resume entrypoint when a wakeup fires",
+      "surface scheduler failures as async_run.failed or async_run.interrupted",
+      "avoid platform APIs inside the framework core"
+    ]
+  },
+  "streamObservation": {
+    "interface": "AsyncAgentRunWorkerConfig.on_stream_event",
+    "delivery": "synchronous-in-worker",
+    "payloadSource": "AgentRunnerStreamEvent normalized to JSON",
+    "hostResponsibilities": [
+      "project events to UI, CLI, logs, sockets, or language bindings",
+      "catch best-effort transport failures when event projection must not fail the run",
+      "keep durable storage behind AsyncAgentRunStore, RunTranscript, or host adapters"
+    ],
+    "toolCallArgumentDeltaPayload": {
+      "type": "tool-call-argument-delta",
+      "iteration": 1,
+      "provider": "openai",
+      "model": "gpt-4.1",
+      "toolCallId": "call_001",
+      "toolName": "fs.writeText",
+      "argsDelta": "{\"path\"",
+      "argsAccumulated": "{\"path\""
+    }
+  },
+  "ffi": {
+    "encoding": "utf8-json",
+    "ids": "opaque strings",
+    "timestamps": "RFC3339 UTC strings",
+    "ownership": "caller owns returned JSON strings and releases them with the binding's string-free function",
+    "rule": "C, C#, Rust, Swift, Python, and other bindings exchange only JSON documents at this boundary; no language futures, promises, threads, or platform timer handles cross the ABI."
+  },
+  "validSamples": [
+    {
+      "schemaVersion": 1,
+      "runId": "run_async_001",
+      "parentRunId": "run_parent_001",
+      "rootRunId": "run_parent_001",
+      "depth": 1,
+      "role": "leaf",
+      "parentChildRelation": "delegated-task",
+      "spawnedByToolCallId": "tool_call_spawn_001",
+      "kind": "subagent.run",
+      "topology": {
+        "parentRunId": "run_parent_001",
+        "rootRunId": "run_parent_001",
+        "depth": 1,
+        "role": "leaf",
+        "parentChildRelation": "delegated-task",
+        "spawnedByToolCallId": "tool_call_spawn_001"
+      },
+      "policy": {
+        "maxGlobalChildRuns": 16,
+        "maxChildRunsPerParent": 4,
+        "maxSpawnDepth": 2,
+        "maxChildrenPerRun": 4,
+        "allowChildSpawn": false,
+        "cancelPropagation": "subtree"
+      },
+      "activity": {
+        "phase": "queued",
+        "lastHeartbeatAt": "",
+        "lastActivityAt": "2026-06-13T00:00:00Z",
+        "currentTarget": "",
+        "currentToolName": "",
+        "currentIteration": 0,
+        "interruptible": true,
+        "stallReason": ""
+      },
+      "agent": {
+        "id": "researcher",
+        "displayName": "Research SubAgent"
+      },
+      "status": "queued",
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "research the topic"
+          }
+        ],
+        "sessionId": "session-parent"
+      },
+      "attempt": 0,
+      "checkpoint": {
+        "latestCheckpointId": "",
+        "sequence": 0
+      },
+      "transcript": {
+        "latestEntryId": "",
+        "sequence": 0
+      },
+      "createdAt": "2026-06-13T00:00:00Z",
+      "updatedAt": "2026-06-13T00:00:00Z",
+      "startedAt": "",
+      "completedAt": "",
+      "cancelledAt": "",
+      "resourceLedger": {
+        "tokenUsage": {
+          "inputTokens": 0,
+          "outputTokens": 0,
+          "totalTokens": 0
+        },
+        "toolCalls": 0,
+        "filesRead": [],
+        "filesWritten": [],
+        "artifacts": [],
+        "networkRequests": [],
+        "approvalRequests": [],
+        "childRuns": []
+      },
+      "metadata": {
+        "correlationId": "corr-async-contract",
+        "tenantId": "tenant-contract"
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "runId": "run_async_approval",
+      "parentRunId": "run_parent_001",
+      "rootRunId": "run_parent_001",
+      "depth": 1,
+      "role": "orchestrator",
+      "parentChildRelation": "delegated-task",
+      "spawnedByToolCallId": "tool_call_spawn_002",
+      "kind": "subagent.run",
+      "topology": {
+        "parentRunId": "run_parent_001",
+        "rootRunId": "run_parent_001",
+        "depth": 1,
+        "role": "orchestrator",
+        "parentChildRelation": "delegated-task",
+        "spawnedByToolCallId": "tool_call_spawn_002"
+      },
+      "policy": {
+        "maxGlobalChildRuns": 16,
+        "maxChildRunsPerParent": 4,
+        "maxSpawnDepth": 2,
+        "maxChildrenPerRun": 4,
+        "allowChildSpawn": true,
+        "cancelPropagation": "subtree"
+      },
+      "activity": {
+        "phase": "permission_wait",
+        "lastHeartbeatAt": "2026-06-13T00:04:30Z",
+        "lastActivityAt": "2026-06-13T00:04:30Z",
+        "currentTarget": "approval_001",
+        "currentToolName": "shell.exec",
+        "currentIteration": 2,
+        "interruptible": true,
+        "stallReason": ""
+      },
+      "agent": {
+        "id": "developer"
+      },
+      "status": "waiting",
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "apply the patch"
+          }
+        ]
+      },
+      "attempt": 1,
+      "lease": {
+        "ownerId": "worker-1",
+        "expiresAt": "2026-06-13T00:05:00Z",
+        "heartbeatAt": "2026-06-13T00:04:30Z"
+      },
+      "approval": {
+        "approvalId": "approval_001",
+        "status": "pending",
+        "request": {
+          "toolName": "shell.exec",
+          "actions": ["process.execute"],
+          "resources": [
+            {
+              "kind": "process",
+              "id": "git",
+              "actions": ["execute"]
+            }
+          ]
+        }
+      },
+      "waiting": {
+        "reason": "approval",
+        "message": "Tool permission approval is pending."
+      },
+      "checkpoint": {
+        "latestCheckpointId": "ckpt_001",
+        "sequence": 3
+      },
+      "transcript": {
+        "latestEntryId": "entry_006",
+        "sequence": 6
+      },
+      "createdAt": "2026-06-13T00:00:00Z",
+      "updatedAt": "2026-06-13T00:04:30Z",
+      "startedAt": "2026-06-13T00:00:10Z",
+      "completedAt": "",
+      "cancelledAt": "",
+      "resourceLedger": {
+        "tokenUsage": {
+          "inputTokens": 1200,
+          "outputTokens": 280,
+          "totalTokens": 1480
+        },
+        "toolCalls": 1,
+        "filesRead": [],
+        "filesWritten": [],
+        "artifacts": [],
+        "networkRequests": [],
+        "approvalRequests": [
+          {
+            "approvalId": "approval_001",
+            "toolName": "shell.exec"
+          }
+        ],
+        "childRuns": []
+      },
+      "metadata": {
+        "correlationId": "corr-async-contract"
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "runId": "run_async_sleep",
+      "kind": "agent.run",
+      "topology": {
+        "parentRunId": "",
+        "rootRunId": "run_async_sleep",
+        "depth": 0,
+        "role": "orchestrator",
+        "parentChildRelation": "",
+        "spawnedByToolCallId": ""
+      },
+      "policy": {
+        "maxGlobalChildRuns": 16,
+        "maxChildRunsPerParent": 4,
+        "maxSpawnDepth": 2,
+        "maxChildrenPerRun": 4,
+        "allowChildSpawn": true,
+        "cancelPropagation": "subtree"
+      },
+      "activity": {
+        "phase": "scheduler_wait",
+        "lastHeartbeatAt": "2026-06-13T00:01:00Z",
+        "lastActivityAt": "2026-06-13T00:01:00Z",
+        "currentTarget": "wake_001",
+        "currentToolName": "",
+        "currentIteration": 0,
+        "interruptible": true,
+        "stallReason": ""
+      },
+      "agent": {
+        "id": "assistant"
+      },
+      "status": "waiting",
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "check later"
+          }
+        ]
+      },
+      "attempt": 1,
+      "schedule": {
+        "wakeupId": "wake_001",
+        "notBefore": "2026-06-13T01:00:00Z",
+        "reason": "user_requested_timer",
+        "provider": "host.scheduler"
+      },
+      "waiting": {
+        "reason": "schedule",
+        "message": "Waiting for host scheduler wakeup."
+      },
+      "createdAt": "2026-06-13T00:00:00Z",
+      "updatedAt": "2026-06-13T00:01:00Z",
+      "startedAt": "2026-06-13T00:00:02Z",
+      "completedAt": "",
+      "cancelledAt": "",
+      "resourceLedger": {
+        "tokenUsage": {
+          "inputTokens": 0,
+          "outputTokens": 0,
+          "totalTokens": 0
+        },
+        "toolCalls": 0,
+        "filesRead": [],
+        "filesWritten": [],
+        "artifacts": [],
+        "networkRequests": [],
+        "approvalRequests": [],
+        "childRuns": []
+      },
+      "metadata": {}
+    },
+    {
+      "schemaVersion": 1,
+      "runId": "run_async_done",
+      "kind": "subagent.run",
+      "parentRunId": "run_parent_001",
+      "rootRunId": "run_parent_001",
+      "depth": 1,
+      "role": "leaf",
+      "parentChildRelation": "delegated-task",
+      "spawnedByToolCallId": "tool_call_spawn_003",
+      "topology": {
+        "parentRunId": "run_parent_001",
+        "rootRunId": "run_parent_001",
+        "depth": 1,
+        "role": "leaf",
+        "parentChildRelation": "delegated-task",
+        "spawnedByToolCallId": "tool_call_spawn_003"
+      },
+      "policy": {
+        "maxGlobalChildRuns": 16,
+        "maxChildRunsPerParent": 4,
+        "maxSpawnDepth": 2,
+        "maxChildrenPerRun": 4,
+        "allowChildSpawn": false,
+        "cancelPropagation": "subtree"
+      },
+      "activity": {
+        "phase": "completed",
+        "lastHeartbeatAt": "2026-06-13T00:06:00Z",
+        "lastActivityAt": "2026-06-13T00:06:00Z",
+        "currentTarget": "",
+        "currentToolName": "",
+        "currentIteration": 3,
+        "interruptible": false,
+        "stallReason": ""
+      },
+      "agent": {
+        "id": "researcher"
+      },
+      "status": "completed",
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "research the topic"
+          }
+        ]
+      },
+      "result": {
+        "summary": "Research complete.",
+        "outputText": "summary complete",
+        "text": "summary complete",
+        "evidence": [],
+        "resourceLedger": {
+          "tokenUsage": {
+            "inputTokens": 1800,
+            "outputTokens": 600,
+            "totalTokens": 2400
+          },
+          "toolCalls": 2,
+          "filesRead": [],
+          "filesWritten": [],
+          "artifacts": [],
+          "networkRequests": [],
+          "approvalRequests": [],
+          "childRuns": []
+        },
+        "modifiedResources": [],
+        "openQuestions": [],
+        "nextActions": [],
+        "messages": [
+          {
+            "role": "assistant",
+            "content": "summary complete"
+          }
+        ]
+      },
+      "attempt": 1,
+      "checkpoint": {
+        "latestCheckpointId": "ckpt_done",
+        "sequence": 5
+      },
+      "transcript": {
+        "latestEntryId": "entry_done",
+        "sequence": 12
+      },
+      "createdAt": "2026-06-13T00:00:00Z",
+      "updatedAt": "2026-06-13T00:06:00Z",
+      "startedAt": "2026-06-13T00:00:10Z",
+      "completedAt": "2026-06-13T00:06:00Z",
+      "cancelledAt": "",
+      "resourceLedger": {
+        "tokenUsage": {
+          "inputTokens": 1800,
+          "outputTokens": 600,
+          "totalTokens": 2400
+        },
+        "toolCalls": 2,
+        "filesRead": [],
+        "filesWritten": [],
+        "artifacts": [],
+        "networkRequests": [],
+        "approvalRequests": [],
+        "childRuns": []
+      },
+      "metadata": {
+        "correlationId": "corr-async-contract"
+      }
+    }
+  ],
+  "invalidSamples": [
+    {
+      "schemaVersion": 1,
+      "kind": "subagent.run",
+      "status": "queued",
+      "attempt": 0,
+      "createdAt": "2026-06-13T00:00:00Z",
+      "updatedAt": "2026-06-13T00:00:00Z",
+      "metadata": {}
+    },
+    {
+      "schemaVersion": 1,
+      "runId": "run_bad_status",
+      "kind": "subagent.run",
+      "status": "paused",
+      "attempt": 0,
+      "createdAt": "2026-06-13T00:00:00Z",
+      "updatedAt": "2026-06-13T00:00:00Z",
+      "metadata": {}
+    }
+  ],
+  "events": [
+    {
+      "schemaVersion": 1,
+      "eventId": "evt_001",
+      "runId": "run_async_001",
+      "sequence": 1,
+      "type": "async_run.created",
+      "status": "queued",
+      "payload": {
+        "kind": "subagent.run",
+        "parentRunId": "run_parent_001"
+      },
+      "createdAt": "2026-06-13T00:00:00Z"
+    },
+    {
+      "schemaVersion": 1,
+      "eventId": "evt_002",
+      "runId": "run_async_001",
+      "sequence": 2,
+      "type": "async_run.started",
+      "status": "running",
+      "payload": {
+        "workerId": "worker-1",
+        "attempt": 1
+      },
+      "createdAt": "2026-06-13T00:00:10Z"
+    },
+    {
+      "schemaVersion": 1,
+      "eventId": "evt_002_stream",
+      "runId": "run_async_001",
+      "sequence": 3,
+      "type": "async_run.stream_event",
+      "status": "running",
+      "payload": {
+        "runId": "run_async_001",
+        "kind": "subagent.run",
+        "rootRunId": "run_parent_001",
+        "parentRunId": "run_parent_001",
+        "depth": 1,
+        "role": "leaf",
+        "attempt": 1,
+        "eventType": "tool-call-argument-delta",
+        "iteration": 1,
+        "provider": "fake",
+        "model": "fake-stream",
+        "toolCallId": "tool-call-delta-1",
+        "toolName": "fs_writeText",
+        "argsDelta": "{\"path\":\"a.txt\"}",
+        "argsAccumulated": "{\"path\":\"a.txt\"}",
+        "streamEvent": {
+          "type": "tool-call-argument-delta",
+          "iteration": 1,
+          "provider": "fake",
+          "model": "fake-stream",
+          "toolCallId": "tool-call-delta-1",
+          "toolCallName": "fs_writeText",
+          "toolCallArgsDelta": "{\"path\":\"a.txt\"}",
+          "toolCallArgsAccumulated": "{\"path\":\"a.txt\"}"
+        }
+      },
+      "createdAt": "2026-06-13T00:00:11Z"
+    },
+    {
+      "schemaVersion": 1,
+      "eventId": "evt_003",
+      "runId": "run_async_approval",
+      "sequence": 7,
+      "type": "async_run.approval.requested",
+      "status": "waiting",
+      "payload": {
+        "approvalId": "approval_001",
+        "toolName": "shell.exec"
+      },
+      "createdAt": "2026-06-13T00:04:30Z"
+    },
+    {
+      "schemaVersion": 1,
+      "eventId": "evt_004",
+      "runId": "run_async_approval",
+      "sequence": 8,
+      "type": "async_run.checkpoint.created",
+      "status": "waiting",
+      "payload": {
+        "checkpointId": "ckpt_001",
+        "checkpointSequence": 3,
+        "phase": "tool_approval_requested"
+      },
+      "createdAt": "2026-06-13T00:04:30Z"
+    },
+    {
+      "schemaVersion": 1,
+      "eventId": "evt_005",
+      "runId": "run_async_approval",
+      "sequence": 9,
+      "type": "async_run.transcript.appended",
+      "status": "waiting",
+      "payload": {
+        "entryId": "entry_006",
+        "entrySequence": 6,
+        "kind": "approval"
+      },
+      "createdAt": "2026-06-13T00:04:31Z"
+    },
+    {
+      "schemaVersion": 1,
+      "eventId": "evt_006",
+      "runId": "run_async_approval",
+      "sequence": 10,
+      "type": "async_run.resumed",
+      "status": "queued",
+      "payload": {
+        "reason": "approval_resolved",
+        "approvalId": "approval_001"
+      },
+      "createdAt": "2026-06-13T00:05:00Z"
+    },
+    {
+      "schemaVersion": 1,
+      "eventId": "evt_007",
+      "runId": "run_async_done",
+      "sequence": 13,
+      "type": "async_run.completed",
+      "status": "completed",
+      "payload": {
+        "result": {
+          "text": "summary complete"
+        }
+      },
+      "createdAt": "2026-06-13T00:06:00Z"
+    },
+    {
+      "schemaVersion": 1,
+      "eventId": "evt_008",
+      "runId": "run_parent_001",
+      "sequence": 14,
+      "type": "child.run.started",
+      "status": "running",
+      "payload": {
+        "childRunId": "run_async_done",
+        "topology": {
+          "parentRunId": "run_parent_001",
+          "rootRunId": "run_parent_001",
+          "depth": 1,
+          "role": "leaf"
+        }
+      },
+      "createdAt": "2026-06-13T00:00:10Z"
+    },
+    {
+      "schemaVersion": 1,
+      "eventId": "evt_009",
+      "runId": "run_parent_001",
+      "sequence": 15,
+      "type": "child.run.ledger.updated",
+      "status": "running",
+      "payload": {
+        "childRunId": "run_async_done",
+        "resourceLedger": {
+          "tokenUsage": {
+            "inputTokens": 1800,
+            "outputTokens": 600,
+            "totalTokens": 2400
+          },
+          "toolCalls": 2
+        }
+      },
+      "createdAt": "2026-06-13T00:06:00Z"
+    },
+    {
+      "schemaVersion": 1,
+      "eventId": "evt_010",
+      "runId": "run_parent_001",
+      "sequence": 16,
+      "type": "child.run.completed",
+      "status": "completed",
+      "payload": {
+        "childRunId": "run_async_done",
+        "result": {
+          "summary": "Research complete.",
+          "outputText": "summary complete"
+        }
+      },
+      "createdAt": "2026-06-13T00:06:00Z"
+    }
+  ],
+  "invalidTransitions": [
+    {
+      "from": "completed",
+      "to": "running"
+    },
+    {
+      "from": "cancelled",
+      "to": "queued"
+    },
+    {
+      "from": "waiting",
+      "to": "running"
+    }
+  ]
+}

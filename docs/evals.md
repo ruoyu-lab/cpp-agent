@@ -81,7 +81,7 @@ auto report = agent::run_eval_suite(agent::RunEvalSuiteOptions{
     .suite = suite,
     .create_runner = [](const agent::EvalCase& test_case) {
         agent::AgentRunnerConfig config;
-        config.adapter = model_for_case(test_case.id);
+        config.model_runtime.adapter = model_for_case(test_case.id);
         return std::make_shared<agent::AgentRunner>(std::move(config));
     },
 });
@@ -114,10 +114,11 @@ native eval runner keeps the resolved app alive for the duration of each case so
 runner-owned services such as knowledge, workflow, and tools remain valid.
 The same zero-dependency injected adapters accepted by `load_native_agent_app`
 are available on `RunEvalSuiteOptions`: `provider_transport`,
-`provider_stream_transport`, `mcp_transport_factory`, `web_adapters`,
-`developer_adapters`, `browser_adapters`, and `llama_adapters`.
-
-Existing positional overloads remain available for C++ callers.
+`provider_stream_transport`, `provider_streaming_transport`,
+`mcp_transport_factory`, `web_adapters`, `developer_adapters`,
+`browser_adapters`, and `llama_adapters`. Injected runtime dependencies use
+named option fields; the old long positional resolver/load overloads are no
+longer part of the public API.
 
 Use `load_eval_report` for reports and `load_eval_baseline` for baselines;
 baselines use the same JSON shape as eval reports.

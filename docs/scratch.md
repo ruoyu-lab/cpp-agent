@@ -60,22 +60,24 @@ Semantics:
 
 ```cpp
 auto scratch = std::make_shared<agent::FileScratchStore>("./var/scratch");
-agent::AgentRunnerConfig cfg = /* ... */;
-cfg.scratch_store = scratch;
-agent::AgentRunner runner(cfg);
+auto runner = agent::AgentRuntimeBuilder()
+                  .model(model)
+                  .scratch_store(scratch)
+                  .build();
 ```
 
 ## Injecting a custom backend (SQLite, Redis, …)
 
 Subclass `ScratchStore`, implement the five methods, and pass a
-`std::shared_ptr<ScratchStore>` through `AgentRunnerConfig::scratch_store`:
+`std::shared_ptr<ScratchStore>` through `AgentRuntimeBuilder::scratch_store`:
 
 ```cpp
 class SqliteScratchStore final : public agent::ScratchStore { /* ... */ };
 
-agent::AgentRunnerConfig cfg = /* ... */;
-cfg.scratch_store = std::make_shared<SqliteScratchStore>(db);
-agent::AgentRunner runner(cfg);
+auto runner = agent::AgentRuntimeBuilder()
+                  .model(model)
+                  .scratch_store(std::make_shared<SqliteScratchStore>(db))
+                  .build();
 ```
 
 When you bypass the runner and drive tools through a bare `ToolExecutor` (for
@@ -85,8 +87,8 @@ context:
 ```cpp
 agent::InMemoryScratchStore store;
 agent::ToolExecutionContext ctx;
-ctx.service_refs.session = &session;
-ctx.service_refs.scratch_store = &store;
+ctx.service_refs.service_container.set(agent::kToolServiceSessionMemory, &session);
+ctx.service_refs.service_container.set(agent::kToolServiceScratchStore, &store);
 executor.execute_tool_call(call, ctx);
 ```
 
@@ -95,13 +97,13 @@ tool raises a `ConfigurationError` whose message contains both `Scratch` and
 `scratch_store` so it is easy to grep in logs:
 
 > Scratch / todo tools require an injected ScratchStore. Set
-> AgentRunnerConfig::scratch_store or ToolExecutionServices::scratch_store
+> AgentRunnerConfig::memory_runtime.scratch_store or kToolServiceScratchStore
 > before invoking these tools.
 
 ## Lifecycle and threading
 
 - Hosts retain ownership of the backend instance (`shared_ptr` for the
-  runner; raw pointer when set on `ToolExecutionServices`). The framework
+  runner; raw pointer when registered in `ToolServiceContainer`). The framework
   never frees backends it did not allocate.
 - Both built-in backends are safe to share across threads. Custom backends
   MUST be thread-safe — tools may be invoked concurrently from parallel

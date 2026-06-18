@@ -26,7 +26,9 @@
           })},
       })},
   });
-  auto browser_app = agent::resolve_native_agent_app(config_with_browser, "main", {}, {}, {}, {}, browser_adapters);
+  auto browser_app = agent::resolve_native_agent_app(
+      config_with_browser,
+      native_resolve_options("main", {}, {}, {}, {}, browser_adapters));
   SMOKE_CHECK(browser_app.browser);
   SMOKE_CHECK(browser_app.browser->renderer == configured_browser_renderer);
   agent::ToolRegistry configured_browser_tools(browser_app.tools);
@@ -52,6 +54,122 @@
         std::string(error.what()).find("NativeBrowserAdapters.renderer") != std::string::npos;
   }
   SMOKE_CHECK(missing_config_browser_adapter);
+
+  auto custom_provider_factory_called = std::make_shared<bool>(false);
+  class CustomDescriptorReasoningMapper final : public agent::ProviderReasoningMapper {
+   public:
+    bool matches(const agent::ProviderRequestProfile& profile) const override {
+      return profile.provider == "custom-descriptor-smoke";
+    }
+
+    agent::ProviderReasoningApplyResult apply(
+        agent::NativeProviderRequest& request,
+        const agent::ProviderReasoningContext& context) const override {
+      request.metadata["customReasoningMapper"] = true;
+      return agent::ProviderReasoningApplyResult{
+          .requested = context.reasoning && context.reasoning->enabled.value_or(false),
+          .applied = true,
+          .mode = agent::ProviderReasoningMode::None,
+          .disable_strategy = agent::ProviderReasoningDisableStrategy::Unsupported,
+          .metadata = agent::Value::object({{"provider", context.provider}}),
+      };
+    }
+  };
+  auto custom_provider_reasoning_mapper =
+      std::make_shared<CustomDescriptorReasoningMapper>();
+  agent::register_native_chat_provider_descriptor(agent::NativeChatProviderDescriptor{
+      .provider = "custom-descriptor-smoke",
+      .create_adapter = [custom_provider_factory_called](
+                            const agent::Value& model,
+                            agent::NativeChatProviderBuildContext) -> std::shared_ptr<agent::ChatModelAdapter> {
+        *custom_provider_factory_called = true;
+        SMOKE_CHECK(model.at("model").as_string() == "custom-model");
+        return std::make_shared<agent::EchoChatModelAdapter>();
+      },
+      .resolve_protocol = [](const agent::Value&) {
+        return agent::ProviderRequestProtocol::OpenAIResponses;
+      },
+      .default_capabilities = {"input.text", "custom.capability", "reasoning"},
+      .resolve_reasoning_mapper = [custom_provider_reasoning_mapper](const agent::Value&) {
+        return custom_provider_reasoning_mapper;
+      },
+      .extract_usage = [](const agent::NativeProviderUsageExtractionContext& context) {
+        agent::ModelUsage usage;
+        usage.provider = context.provider;
+        usage.input_tokens = 13;
+        usage.output_tokens = 5;
+        usage.total_tokens = 18;
+        usage.input_tokens_source = agent::TokenUsageSource::Provider;
+        usage.output_tokens_source = agent::TokenUsageSource::Provider;
+        usage.total_tokens_source = agent::TokenUsageSource::Provider;
+        usage.quality = agent::TokenUsageQuality::Provider;
+        return usage;
+      },
+      .apply_extra = [](agent::NativeProviderRequest& request,
+                        const agent::Value&,
+                        const agent::ModelSettings&) {
+        request.body["customExtraApplied"] = true;
+      },
+      .media_input_marshaller = agent::NativeChatProviderMediaInputMarshaller{
+          .name = "custom-media",
+          .supported_parts = {agent::ContentPartType::Image},
+          .accepted_sources = {agent::MediaSourceKind::Inline, agent::MediaSourceKind::Path},
+          .requires_resolver_for_non_inline = true,
+      },
+      .resolve_stream_parser_metadata = [](const agent::Value&) {
+        return agent::NativeChatProviderStreamParserMetadata{
+            .parser = "custom-stream",
+            .frame_boundary = agent::ModelStreamFrameBoundary::SseEvent,
+            .events = {agent::ModelStreamEventType::ResponseStart,
+                       agent::ModelStreamEventType::TextDelta,
+                       agent::ModelStreamEventType::Response},
+            .includes_terminal_usage = true,
+            .reasoning_parser = agent::NativeProviderReasoningParser::None,
+        };
+      },
+  });
+  const auto custom_provider_model = agent::Value::object({
+      {"provider", "custom-descriptor-smoke"},
+      {"model", "custom-model"},
+  });
+  SMOKE_CHECK(agent::resolve_native_chat_provider_protocol(custom_provider_model) ==
+              agent::ProviderRequestProtocol::OpenAIResponses);
+  SMOKE_CHECK(agent::resolve_native_chat_provider_reasoning_mapper(custom_provider_model) ==
+              custom_provider_reasoning_mapper);
+  auto custom_usage_extractor = agent::resolve_native_chat_provider_usage_extractor(custom_provider_model);
+  SMOKE_CHECK(static_cast<bool>(custom_usage_extractor));
+  const auto custom_usage = custom_usage_extractor(agent::NativeProviderUsageExtractionContext{
+      .provider = "custom-descriptor-smoke",
+      .model = "custom-model",
+  });
+  SMOKE_CHECK(custom_usage.total_tokens == 18);
+  auto custom_extra_mapper = agent::resolve_native_chat_provider_extra_mapper(custom_provider_model);
+  SMOKE_CHECK(static_cast<bool>(custom_extra_mapper));
+  agent::NativeProviderRequest custom_provider_request;
+  custom_provider_request.body = agent::Value::object({});
+  custom_extra_mapper(custom_provider_request, custom_provider_model, agent::ModelSettings{});
+  SMOKE_CHECK(custom_provider_request.body.at("customExtraApplied").as_bool());
+  const auto custom_media_marshaller =
+      agent::resolve_native_chat_provider_media_input_marshaller(custom_provider_model);
+  SMOKE_CHECK(custom_media_marshaller.has_value());
+  SMOKE_CHECK(custom_media_marshaller->name == "custom-media");
+  const auto custom_stream_metadata =
+      agent::resolve_native_chat_provider_stream_parser_metadata(custom_provider_model);
+  SMOKE_CHECK(custom_stream_metadata.has_value());
+  SMOKE_CHECK(custom_stream_metadata->parser == "custom-stream");
+  auto custom_provider_app = agent::resolve_native_agent_app(
+      agent::Value::object({
+          {"agents", agent::Value::object({
+              {"main", agent::Value::object({
+                  {"model", custom_provider_model},
+              })},
+          })},
+      }),
+      "main");
+  SMOKE_CHECK(*custom_provider_factory_called);
+  const auto custom_provider_result =
+      custom_provider_app.runner->execution().run("custom descriptor run", "custom-provider-session");
+  SMOKE_CHECK(custom_provider_result.text.find("custom descriptor run") != std::string::npos);
 
   const auto config_knowledge_store = persistent_dir / "configured-knowledge.json";
   const auto config_knowledge_image = persistent_dir / "configured-knowledge-image.png";
@@ -357,8 +475,7 @@
   });
   auto provider_embedder_app = agent::resolve_native_agent_app(
       config_with_provider_embedder,
-      "main",
-      [&](const agent::NativeProviderRequest& request) {
+      native_resolve_options("main", [&](const agent::NativeProviderRequest& request) {
         ++configured_provider_embedding_calls;
         SMOKE_CHECK(request.provider == "openai");
         SMOKE_CHECK(request.endpoint == "/embeddings");
@@ -377,7 +494,7 @@
           }));
         }
         return agent::Value::object({{"data", agent::Value(std::move(data))}});
-      });
+      }));
   SMOKE_CHECK(provider_embedder_app.knowledge && provider_embedder_app.knowledge->base);
   SMOKE_CHECK(configured_provider_embedding_calls == 1);
   auto provider_embedding_hits = provider_embedder_app.knowledge->base->search(
@@ -451,8 +568,9 @@
         };
       });
   auto rendered_knowledge_app = agent::resolve_native_agent_app(
-      config_with_rendered_knowledge, "main", {}, {}, rendered_knowledge_web_adapters, {},
-      rendered_knowledge_browser_adapters);
+      config_with_rendered_knowledge,
+      native_resolve_options("main", {}, {}, rendered_knowledge_web_adapters, {},
+                             rendered_knowledge_browser_adapters));
   SMOKE_CHECK(config_knowledge_browser_called);
   SMOKE_CHECK(rendered_knowledge_app.knowledge && rendered_knowledge_app.knowledge->base);
   auto rendered_knowledge_hits = rendered_knowledge_app.knowledge->base->search(
@@ -644,7 +762,9 @@
     }
     throw agent::ConfigurationError("Unexpected fetch URL " + request.request.url);
   };
-  auto web_configured_app = agent::resolve_native_agent_app(config_with_web, "main", {}, {}, web_adapters);
+  auto web_configured_app = agent::resolve_native_agent_app(
+      config_with_web,
+      native_resolve_options("main", {}, {}, web_adapters));
   SMOKE_CHECK(web_configured_app.web);
   SMOKE_CHECK(web_configured_app.web->fetcher);
   SMOKE_CHECK(web_configured_app.web->crawler);
@@ -705,7 +825,8 @@
     });
   };
   auto default_env_web_app =
-      agent::resolve_native_agent_app(config_with_default_brave_env, "main", {}, {}, default_env_web_adapters);
+      agent::resolve_native_agent_app(config_with_default_brave_env,
+                                      native_resolve_options("main", {}, {}, default_env_web_adapters));
   agent::ToolRegistry default_env_web_tools(default_env_web_app.tools);
   agent::ToolExecutor default_env_web_executor(default_env_web_tools);
   auto default_env_web_search = default_env_web_executor.execute_tool_call(agent::ToolCall{
@@ -789,7 +910,8 @@
         };
       });
   auto web_fallback_app = agent::resolve_native_agent_app(
-      config_with_web_fallback, "main", {}, {}, web_fallback_adapters, {}, web_fallback_browser_adapters);
+      config_with_web_fallback,
+      native_resolve_options("main", {}, {}, web_fallback_adapters, {}, web_fallback_browser_adapters));
   agent::ToolRegistry web_fallback_tools(web_fallback_app.tools);
   agent::ToolExecutor web_fallback_executor(web_fallback_tools);
   auto web_fallback_fetch = web_fallback_executor.execute_tool_call(agent::ToolCall{
@@ -848,7 +970,8 @@
   });
   bool mcp_factory_called = false;
   auto mcp_configured_app = agent::resolve_native_agent_app(
-      config_with_mcp, "main", {},
+      config_with_mcp,
+      native_resolve_options("main", {},
       [&](const agent::AnthropicMcpServerConfig& server) -> std::shared_ptr<agent::MCPTransport> {
         mcp_factory_called = true;
         SMOKE_CHECK(server.name == "fixture");
@@ -893,7 +1016,7 @@
           }
           return agent::json_rpc_error_to_value(id, -32601, "Method not found");
         });
-      });
+      }));
   SMOKE_CHECK(mcp_factory_called);
   SMOKE_CHECK(mcp_configured_app.mcp_clients.size() == 1);
   bool found_config_mcp_tool = false;
@@ -1707,6 +1830,10 @@
       SMOKE_CHECK(usage.reasoning_tokens == 4800);
       SMOKE_CHECK(usage.reasoning_source == agent::ReasoningSource::Provider);
       SMOKE_CHECK(usage.output_tokens == 5200);
+      SMOKE_CHECK(usage.input_tokens_source == agent::TokenUsageSource::Provider);
+      SMOKE_CHECK(usage.output_tokens_source == agent::TokenUsageSource::Provider);
+      SMOKE_CHECK(usage.total_tokens_source == agent::TokenUsageSource::Derived);
+      SMOKE_CHECK(usage.quality == agent::TokenUsageQuality::Provider);
     }
 
     // (2) OpenAI stream: terminal chunk usage block propagates through stream parser.
@@ -1743,6 +1870,8 @@
       SMOKE_CHECK(usage.reasoning_tokens == 100);
       SMOKE_CHECK(usage.reasoning_source == agent::ReasoningSource::Provider);
       SMOKE_CHECK(usage.input_tokens == 12);
+      SMOKE_CHECK(usage.total_tokens_source == agent::TokenUsageSource::Derived);
+      SMOKE_CHECK(usage.quality == agent::TokenUsageQuality::Provider);
     }
 
     // (2b) OpenAI stream request opts into include_usage.
@@ -1754,9 +1883,165 @@
       SMOKE_CHECK(request.body.at("stream_options").at("include_usage").as_bool() == true);
     }
 
+    // (2c) Ollama JSON-line streaming can emit tool_calls before the final done chunk.
+    {
+      agent::JsonSchema read_schema;
+      read_schema.type = agent::JsonSchemaType::Object;
+      read_schema.required = {"path"};
+      read_schema.properties["path"].type = agent::JsonSchemaType::String;
+
+      agent::OllamaChatModelAdapter adapter(
+          "qwen-test",
+          [](const agent::NativeProviderRequest&) {
+            return agent::Value::object({});
+          },
+          "http://127.0.0.1:11434",
+          agent::NativeProviderStreamTransport{},
+          [](const agent::NativeProviderRequest& request,
+             agent::NativeProviderStreamingChunkHandler on_chunk) {
+            SMOKE_CHECK(request.body.at("stream").as_bool() == true);
+            const std::string tool_line = agent::Value::object({
+                {"model", "qwen-test"},
+                {"created_at", "2026-06-07T00:00:00Z"},
+                {"message", agent::Value::object({
+                    {"role", "assistant"},
+                    {"content", ""},
+                    {"tool_calls", agent::Value::array({
+                        agent::Value::object({
+                            {"id", "call_ollama_read"},
+                            {"function", agent::Value::object({
+                                {"index", 0},
+                                {"name", "fs.readText"},
+                                {"arguments", agent::Value::object({
+                                    {"path", "/private/tmp/agent_react_instability_input.txt"},
+                                })},
+                            })},
+                        }),
+                    })},
+                })},
+                {"done", false},
+            }).stringify() + "\n";
+            const std::string done_line = agent::Value::object({
+                {"model", "qwen-test"},
+                {"created_at", "2026-06-07T00:00:01Z"},
+                {"message", agent::Value::object({
+                    {"role", "assistant"},
+                    {"content", ""},
+                })},
+                {"done", true},
+                {"done_reason", "stop"},
+            }).stringify() + "\n";
+            on_chunk(std::string_view(tool_line).substr(0, 13));
+            on_chunk(std::string_view(tool_line).substr(13));
+            on_chunk(done_line);
+          });
+
+      agent::GenerateParams params;
+      params.messages.push_back(agent::create_message(agent::MessageRole::User, "read file"));
+      params.tools.push_back(agent::ChatToolDescriptor{
+          .name = "fs.readText",
+          .description = "Read a text file.",
+          .input_schema = read_schema,
+      });
+
+      std::vector<agent::ModelStreamEvent> events;
+      adapter.stream(params, [&](const agent::ModelStreamEvent& event) {
+        events.push_back(event);
+      });
+      bool saw_tool_delta = false;
+      const agent::ModelStreamEvent* response_event = nullptr;
+      for (const auto& event : events) {
+        if (event.type == agent::ModelStreamEventType::ToolCallDelta) {
+          saw_tool_delta = true;
+          SMOKE_CHECK(event.tool_call_name == "fs.readText");
+          SMOKE_CHECK(event.tool_call_args_accumulated.find("agent_react_instability_input.txt") != std::string::npos);
+        }
+        if (event.type == agent::ModelStreamEventType::Response) {
+          response_event = &event;
+        }
+      }
+      SMOKE_CHECK(saw_tool_delta);
+      SMOKE_CHECK(response_event != nullptr);
+      SMOKE_CHECK(response_event->response.finish_reason == "tool_calls");
+      SMOKE_CHECK(response_event->response.tool_calls.size() == 1);
+      SMOKE_CHECK(response_event->response.tool_calls.front().id == "fs.readText_1");
+      SMOKE_CHECK(response_event->response.tool_calls.front().name == "fs.readText");
+      SMOKE_CHECK(response_event->response.tool_calls.front().arguments.at("path").as_string() ==
+                  "/private/tmp/agent_react_instability_input.txt");
+      SMOKE_CHECK(response_event->response.raw.at("chunks").as_array().size() == 2);
+    }
+
+    // (2d) Local providers: Ollama native counters and LM Studio stats are real usage.
+    {
+      auto ollama_raw = agent::Value::object({
+          {"prompt_eval_count", 27},
+          {"eval_count", 9},
+      });
+      const auto usage = agent::extract_model_usage(ollama_raw, "ollama");
+      SMOKE_CHECK(usage.input_tokens == 27);
+      SMOKE_CHECK(usage.output_tokens == 9);
+      SMOKE_CHECK(usage.total_tokens == 36);
+      SMOKE_CHECK(usage.input_tokens_source == agent::TokenUsageSource::Provider);
+      SMOKE_CHECK(usage.output_tokens_source == agent::TokenUsageSource::Provider);
+      SMOKE_CHECK(usage.total_tokens_source == agent::TokenUsageSource::Derived);
+      SMOKE_CHECK(usage.quality == agent::TokenUsageQuality::Provider);
+    }
+
+    {
+      auto llama_native_raw = agent::Value::object({
+          {"prompt_eval_count", 19},
+          {"eval_count", 7},
+      });
+      const auto usage = agent::extract_model_usage(llama_native_raw, "llamacpp-native");
+      SMOKE_CHECK(usage.input_tokens == 19);
+      SMOKE_CHECK(usage.output_tokens == 7);
+      SMOKE_CHECK(usage.total_tokens == 26);
+    }
+
+    {
+      auto ollama_stream_raw = agent::Value::object({
+          {"chunks", agent::Value::array({
+              agent::Value::object({
+                  {"model", "qwen-test"},
+                  {"message", agent::Value::object({{"content", "hi"}})},
+                  {"done", false},
+              }),
+              agent::Value::object({
+                  {"model", "qwen-test"},
+                  {"message", agent::Value::object({{"content", ""}})},
+                  {"done", true},
+                  {"prompt_eval_count", 31},
+                  {"eval_count", 12},
+              }),
+          })},
+      });
+      const auto usage = agent::extract_model_usage(ollama_stream_raw, "ollama");
+      SMOKE_CHECK(usage.input_tokens == 31);
+      SMOKE_CHECK(usage.output_tokens == 12);
+      SMOKE_CHECK(usage.total_tokens == 43);
+    }
+
+    {
+      auto lmstudio_raw = agent::Value::object({
+          {"stats", agent::Value::object({
+              {"input_tokens", 646},
+              {"total_output_tokens", 586},
+              {"reasoning_output_tokens", 17},
+          })},
+      });
+      const auto usage = agent::extract_model_usage(lmstudio_raw, "lmstudio");
+      SMOKE_CHECK(usage.input_tokens == 646);
+      SMOKE_CHECK(usage.output_tokens == 586);
+      SMOKE_CHECK(usage.total_tokens == 1232);
+      SMOKE_CHECK(usage.total_tokens_source == agent::TokenUsageSource::Derived);
+      SMOKE_CHECK(usage.quality == agent::TokenUsageQuality::Provider);
+      SMOKE_CHECK(usage.reasoning_tokens == 17);
+      SMOKE_CHECK(usage.reasoning_source == agent::ReasoningSource::Provider);
+    }
+
     // (3) Anthropic with reasoning text → Estimated source, chars/4.
     {
-      agent::ModelResponse response;
+      agent::AgentOutput response;
       response.provider = "anthropic";
       response.reasoning = agent::build_model_reasoning(std::string(400, 'r'), "provider-visible");
       response.raw = agent::Value::object({
@@ -1803,7 +2088,7 @@
 
     // (5b) DeepSeek with only reasoning_content text → Estimated.
     {
-      agent::ModelResponse response;
+      agent::AgentOutput response;
       response.provider = "deepseek";
       response.reasoning = agent::build_model_reasoning(std::string(800, 'd'), "tagged");
       response.raw = agent::Value::object({
@@ -1855,6 +2140,12 @@
       SMOKE_CHECK(agent::to_string(agent::ReasoningSource::Provider) == "provider");
       SMOKE_CHECK(agent::to_string(agent::ReasoningSource::Estimated) == "estimated");
       SMOKE_CHECK(agent::to_string(agent::ReasoningSource::Unknown) == "unknown");
+      SMOKE_CHECK(agent::to_string(agent::TokenUsageSource::Provider) == "provider");
+      SMOKE_CHECK(agent::to_string(agent::TokenUsageSource::Derived) == "derived");
+      SMOKE_CHECK(agent::to_string(agent::TokenUsageQuality::Provider) == "provider");
+      SMOKE_CHECK(agent::merge_token_usage_source(agent::TokenUsageSource::Provider,
+                                                  agent::TokenUsageSource::Derived) ==
+                  agent::TokenUsageSource::Derived);
       SMOKE_CHECK(agent::reasoning_source_from_string("provider") == agent::ReasoningSource::Provider);
       SMOKE_CHECK(agent::reasoning_source_from_string("estimated") == agent::ReasoningSource::Estimated);
       SMOKE_CHECK(agent::reasoning_source_from_string("bogus", agent::ReasoningSource::Estimated) ==
@@ -1867,18 +2158,14 @@
        public:
         ReasoningAggregateModel()
             : ChatModelAdapter("openai", "reasoning-aggregate", 0.0, 256, {"input.text"}) {}
-        agent::ModelResponse generate(const agent::GenerateParams&) override {
+        agent::AgentOutput generate(const agent::GenerateParams&) override {
           ++call_;
-          agent::ModelResponse response;
-          if (call_ == 1) {
-            response.text = "thinking";
-            response.finish_reason = "tool_calls";
-            response.tool_calls.push_back(agent::ToolCall{
-                .id = "call_1",
-                .name = "noop",
-                .arguments = agent::Value::object({}),
-            });
-            response.raw = agent::Value::object({
+	          agent::AgentOutput response;
+	          if (call_ == 1) {
+            response.text = "Thought: call the noop tool.\nActions:\n"
+                            "[{\"tool\":\"noop\",\"input\":{}}]";
+	            response.finish_reason = "stop";
+	            response.raw = agent::Value::object({
                 {"usage", agent::Value::object({
                     {"prompt_tokens", 100},
                     {"completion_tokens", 800},
@@ -1886,10 +2173,10 @@
                         {"reasoning_tokens", 700},
                     })},
                 })},
-            });
-          } else {
-            response.text = "done";
-            response.finish_reason = "stop";
+	            });
+	          } else {
+	            response.text = "Thought: tool completed.\nFinal Answer: done";
+	            response.finish_reason = "stop";
             response.raw = agent::Value::object({
                 {"usage", agent::Value::object({
                     {"prompt_tokens", 120},
@@ -1897,7 +2184,7 @@
                 })},
             });
           }
-          return build_response(std::move(response));
+          return build_output(std::move(response));
         }
        private:
         int call_ = 0;
@@ -1911,11 +2198,17 @@
         return agent::Value(std::string("ok"));
       };
       agent::AgentRunner reasoning_runner(agent::AgentRunnerConfig{
-          .adapter = reasoning_model,
-          .tools = {noop_tool},
-          .max_iterations = 4,
+          .model_runtime = {
+              .adapter = reasoning_model,
+          },
+          .tool_runtime = {
+              .definitions = std::vector<agent::ToolDefinition>{noop_tool},
+          },
+          .context_runtime = {
+              .max_iterations = 4,
+          },
       });
-      const auto run_result = reasoning_runner.run("hello", "reasoning-session");
+      const auto run_result = reasoning_runner.execution().run("hello", "reasoning-session");
       SMOKE_CHECK(run_result.usage.input_tokens == 220);
       SMOKE_CHECK(run_result.usage.output_tokens == 840);
       SMOKE_CHECK(run_result.usage.reasoning_tokens == 700);
@@ -1924,51 +2217,442 @@
     }
   }
 
-  // OpenAI Chat Completions reasoning_effort opt-in (mirrors apply_openai_prompt_cache_key wiring).
+  // Provider/runtime reasoning mapping is centralized behind ProviderReasoningMapper.
   {
-    // (a) Helper applied to a chat-completions body: reasoning enabled + budget="high" → "high".
+    // (a) OpenAI Chat Completions: reasoning enabled + budget="high" → reasoning_effort="high".
     {
       auto chat_request = agent::build_openai_chat_request(
           agent::GenerateParams{
               .messages = {agent::create_message(agent::MessageRole::User, "hi")},
           },
           "gpt-5-mini");
-      agent::apply_openai_reasoning_effort(
+      const auto result = agent::apply_provider_reasoning(
           chat_request,
-          agent::ReasoningSettings{.enabled = true, .budget = std::string("high")});
+          agent::ProviderReasoningContext{
+              .provider = "openai",
+              .model = "gpt-5-mini",
+              .reasoning = agent::ReasoningSettings{.enabled = true, .budget = std::string("high")},
+              .profile = agent::make_provider_request_profile(
+                  "openai", "gpt-5-mini", agent::ProviderRequestProtocol::OpenAIChatCompletions),
+          });
+      SMOKE_CHECK(result.applied);
+      SMOKE_CHECK(result.mode == agent::ProviderReasoningMode::OpenAIReasoningEffort);
       SMOKE_CHECK(chat_request.body.contains("reasoning_effort"));
       SMOKE_CHECK(chat_request.body.at("reasoning_effort").as_string() == "high");
     }
 
-    // (b) Helper applied with numeric budget routes via normalize_reasoning_budget_to_effort.
+    // (b) Numeric budget routes via normalize_reasoning_budget_to_effort.
     {
       auto chat_request = agent::build_openai_chat_request(
           agent::GenerateParams{
               .messages = {agent::create_message(agent::MessageRole::User, "hi")},
           },
           "gpt-5-mini");
-      agent::apply_openai_reasoning_effort(
+      const auto result = agent::apply_provider_reasoning(
           chat_request,
-          agent::ReasoningSettings{.enabled = true, .budget = 1024.0});  // < 2560 → "low"
+          agent::ProviderReasoningContext{
+              .provider = "openai",
+              .model = "gpt-5-mini",
+              .reasoning = agent::ReasoningSettings{.enabled = true, .budget = 1024.0},
+              .profile = agent::make_provider_request_profile(
+                  "openai", "gpt-5-mini", agent::ProviderRequestProtocol::OpenAIChatCompletions),
+          });
+      SMOKE_CHECK(result.applied);
       SMOKE_CHECK(chat_request.body.at("reasoning_effort").as_string() == "low");
     }
 
-    // (c) Helper with reasoning disabled or absent → no field added.
+    // (c) Reasoning disabled or absent → no native OpenAI field added.
     {
       auto chat_request = agent::build_openai_chat_request(
           agent::GenerateParams{
               .messages = {agent::create_message(agent::MessageRole::User, "hi")},
           },
           "gpt-5-mini");
-      agent::apply_openai_reasoning_effort(chat_request, std::nullopt);
-      SMOKE_CHECK(!chat_request.body.contains("reasoning_effort"));
-      agent::apply_openai_reasoning_effort(
+      agent::apply_provider_reasoning(
           chat_request,
-          agent::ReasoningSettings{.enabled = false, .budget = std::string("high")});
+          agent::ProviderReasoningContext{
+              .provider = "openai",
+              .model = "gpt-5-mini",
+              .reasoning = std::nullopt,
+              .profile = agent::make_provider_request_profile(
+                  "openai", "gpt-5-mini", agent::ProviderRequestProtocol::OpenAIChatCompletions),
+          });
       SMOKE_CHECK(!chat_request.body.contains("reasoning_effort"));
+      const auto disabled_result = agent::apply_provider_reasoning(
+          chat_request,
+          agent::ProviderReasoningContext{
+              .provider = "openai",
+              .model = "gpt-5-mini",
+              .reasoning = agent::ReasoningSettings{.enabled = false, .budget = std::string("high")},
+              .profile = agent::make_provider_request_profile(
+                  "openai", "gpt-5-mini", agent::ProviderRequestProtocol::OpenAIChatCompletions),
+          });
+      SMOKE_CHECK(!chat_request.body.contains("reasoning_effort"));
+      SMOKE_CHECK(disabled_result.disabled);
+      SMOKE_CHECK(!disabled_result.applied);
+      SMOKE_CHECK(disabled_result.degraded);
+      SMOKE_CHECK(disabled_result.disable_strategy == agent::ProviderReasoningDisableStrategy::MinimizeOnly);
+      SMOKE_CHECK(disabled_result.metadata.at("disableStrategy").as_string() == "minimize-only");
+      SMOKE_CHECK(disabled_result.message.find("effort adjustment") != std::string::npos);
+      SMOKE_CHECK(chat_request.metadata.at("reasoningRequest").at("degraded").as_bool());
     }
 
-    // (d) OpenAI adapter (chat-completions path: no reasoning, no image content) → no reasoning_effort.
+    // (d) Qwen Chat Completions can explicitly disable thinking.
+    {
+      auto request = agent::build_qwen_chat_request(
+          agent::GenerateParams{
+              .messages = {agent::create_message(agent::MessageRole::User, "hi")},
+          },
+          "qwen-plus");
+      const auto result = agent::apply_provider_reasoning(
+          request,
+          agent::ProviderReasoningContext{
+              .provider = "qwen",
+              .model = "qwen-plus",
+              .reasoning = agent::ReasoningSettings{.enabled = false, .budget = std::string("high")},
+              .profile = agent::make_provider_request_profile(
+                  "qwen", "qwen-plus", agent::ProviderRequestProtocol::QwenChatCompletions),
+          });
+      SMOKE_CHECK(result.disabled);
+      SMOKE_CHECK(result.applied);
+      SMOKE_CHECK(!result.degraded);
+      SMOKE_CHECK(result.disable_strategy == agent::ProviderReasoningDisableStrategy::ExplicitParam);
+      SMOKE_CHECK(request.body.contains("enable_thinking"));
+      SMOKE_CHECK(!request.body.at("enable_thinking").as_bool(true));
+      SMOKE_CHECK(!request.body.contains("thinking_budget"));
+      SMOKE_CHECK(request.metadata.at("reasoningRequest").at("disableStrategy").as_string() == "explicit-param");
+      SMOKE_CHECK(request.metadata.at("reasoningRequest").at("metadata").at("reasoningDisableStrategy").as_string() == "explicit-param");
+    }
+
+    // (e) DeepSeek can explicitly disable thinking with its provider-native toggle.
+    {
+      auto request = agent::build_deepseek_messages_request(
+          agent::GenerateParams{
+              .messages = {agent::create_message(agent::MessageRole::User, "hi")},
+          },
+          "deepseek-reasoner",
+          "",
+          "");
+      const auto result = agent::apply_provider_reasoning(
+          request,
+          agent::ProviderReasoningContext{
+              .provider = "deepseek",
+              .model = "deepseek-reasoner",
+              .reasoning = agent::ReasoningSettings{.enabled = false},
+              .profile = agent::make_provider_request_profile(
+                  "deepseek", "deepseek-reasoner", agent::ProviderRequestProtocol::DeepSeekMessages),
+          });
+      SMOKE_CHECK(result.disabled);
+      SMOKE_CHECK(result.applied);
+      SMOKE_CHECK(!result.degraded);
+      SMOKE_CHECK(result.disable_strategy == agent::ProviderReasoningDisableStrategy::ExplicitParam);
+      SMOKE_CHECK(request.body.at("thinking").at("type").as_string() == "disabled");
+      SMOKE_CHECK(request.metadata.at("reasoningRequest").at("disableStrategy").as_string() == "explicit-param");
+    }
+
+    // (f) Gemini Flash can explicitly disable thinking with thinkingBudget=0.
+    {
+      auto request = agent::build_gemini_generate_content_request(
+          agent::GenerateParams{
+              .messages = {agent::create_message(agent::MessageRole::User, "hi")},
+          },
+          "gemini-2.5-flash",
+          "",
+          "");
+      const auto result = agent::apply_provider_reasoning(
+          request,
+          agent::ProviderReasoningContext{
+              .provider = "gemini",
+              .model = "gemini-2.5-flash",
+              .reasoning = agent::ReasoningSettings{.enabled = false},
+              .profile = agent::make_provider_request_profile(
+                  "gemini", "gemini-2.5-flash", agent::ProviderRequestProtocol::GeminiGenerateContent),
+          });
+      SMOKE_CHECK(result.disabled);
+      SMOKE_CHECK(result.applied);
+      SMOKE_CHECK(!result.degraded);
+      SMOKE_CHECK(result.disable_strategy == agent::ProviderReasoningDisableStrategy::ExplicitParam);
+      SMOKE_CHECK(request.body.at("generationConfig").at("thinkingConfig").at("thinkingBudget").as_number() == 0.0);
+      SMOKE_CHECK(request.metadata.at("reasoningRequest").at("metadata").at("reasoningDisableStrategy").as_string() == "explicit-param");
+    }
+
+    // (g) Gemini Pro/unknown disable support is not reported as applied.
+    {
+      auto request = agent::build_gemini_generate_content_request(
+          agent::GenerateParams{
+              .messages = {agent::create_message(agent::MessageRole::User, "hi")},
+          },
+          "gemini-2.5-pro",
+          "",
+          "");
+      const auto result = agent::apply_provider_reasoning(
+          request,
+          agent::ProviderReasoningContext{
+              .provider = "gemini",
+              .model = "gemini-2.5-pro",
+              .reasoning = agent::ReasoningSettings{.enabled = false},
+              .profile = agent::make_provider_request_profile(
+                  "gemini", "gemini-2.5-pro", agent::ProviderRequestProtocol::GeminiGenerateContent),
+          });
+      SMOKE_CHECK(result.disabled);
+      SMOKE_CHECK(!result.applied);
+      SMOKE_CHECK(result.degraded);
+      SMOKE_CHECK(result.unsupported);
+      SMOKE_CHECK(result.disable_strategy == agent::ProviderReasoningDisableStrategy::Unsupported);
+      SMOKE_CHECK(!request.body.at("generationConfig").contains("thinkingConfig"));
+      SMOKE_CHECK(request.metadata.at("reasoningRequest").at("disableStrategy").as_string() == "unsupported");
+    }
+
+    // (h0) Ollama image path inputs are resolved into messages[].images base64.
+    {
+      const std::vector<std::uint8_t> image_bytes{
+          0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0x00, 0x01, 0xff, 0xd9};
+      const auto image_path = tmp_dir / ("ollama-path-image-" + agent::generate_uuid() + ".jpg");
+      {
+        std::ofstream image_file(image_path, std::ios::binary);
+        image_file.write(reinterpret_cast<const char*>(image_bytes.data()),
+                         static_cast<std::streamsize>(image_bytes.size()));
+      }
+      agent::MediaSource source;
+      source.kind = agent::MediaSourceKind::Path;
+      source.path = image_path.string();
+      source.mime_type = "image/jpeg";
+      source.filename = "test.jpg";
+      auto request = agent::build_ollama_chat_request(
+          agent::GenerateParams{
+              .messages = {agent::create_message(
+                  agent::MessageRole::User,
+                  std::vector<agent::MessageContentPart>{
+                      agent::text_part("describe this image"),
+                      agent::image_part(source, "attached image", "auto"),
+                  })},
+          },
+          "llava");
+      const auto& messages = request.body.at("messages").as_array();
+      SMOKE_CHECK(messages.size() == 1);
+      SMOKE_CHECK(messages.front().at("content").as_string() == "describe this image");
+      const auto& images = messages.front().at("images").as_array();
+      SMOKE_CHECK(images.size() == 1);
+      SMOKE_CHECK(images.front().as_string() == agent::base64_encode(image_bytes));
+    }
+
+    // (h1) Ollama image inputs fail loudly when the media payload is empty.
+    {
+      bool empty_inline_image_failed = false;
+      try {
+        (void)agent::build_ollama_chat_request(
+            agent::GenerateParams{
+                .messages = {agent::create_message(
+                    agent::MessageRole::User,
+                    std::vector<agent::MessageContentPart>{
+                        agent::image_part(agent::MediaSource{
+                            .kind = agent::MediaSourceKind::Inline,
+                            .data = "",
+                            .mime_type = "image/jpeg",
+                        }),
+                    })},
+            },
+            "llava");
+      } catch (const agent::ConfigurationError& error) {
+        empty_inline_image_failed =
+            std::string(error.what()).find("Inline media input is empty") != std::string::npos;
+      }
+      SMOKE_CHECK(empty_inline_image_failed);
+    }
+
+    // (h) Ollama boolean thinking can explicitly disable thinking.
+    {
+      auto request = agent::build_ollama_chat_request(
+          agent::GenerateParams{
+              .messages = {agent::create_message(agent::MessageRole::User, "hi")},
+          },
+          "llama3.2");
+      const auto result = agent::apply_provider_reasoning(
+          request,
+          agent::ProviderReasoningContext{
+              .provider = "ollama",
+              .model = "llama3.2",
+              .reasoning = agent::ReasoningSettings{.enabled = false},
+              .profile = agent::make_provider_request_profile(
+                  "ollama",
+                  "llama3.2",
+                  agent::ProviderRequestProtocol::OllamaChat,
+                  {},
+                  agent::ProviderReasoningMode::OllamaThinkToggle),
+          });
+      SMOKE_CHECK(result.disabled);
+      SMOKE_CHECK(result.applied);
+      SMOKE_CHECK(!result.degraded);
+      SMOKE_CHECK(result.disable_strategy == agent::ProviderReasoningDisableStrategy::ExplicitParam);
+      SMOKE_CHECK(request.body.at("think").is_bool());
+      SMOKE_CHECK(!request.body.at("think").as_bool(true));
+      SMOKE_CHECK(request.metadata.at("reasoningRequest").at("applied").as_bool());
+    }
+
+    // (i) Ollama GPT-OSS effort mode cannot truly disable; it minimizes and reports degraded.
+    {
+      auto request = agent::build_ollama_chat_request(
+          agent::GenerateParams{
+              .messages = {agent::create_message(agent::MessageRole::User, "hi")},
+          },
+          "gpt-oss:20b");
+      const auto result = agent::apply_provider_reasoning(
+          request,
+          agent::ProviderReasoningContext{
+              .provider = "ollama",
+              .model = "gpt-oss:20b",
+              .reasoning = agent::ReasoningSettings{.enabled = false},
+              .profile = agent::make_provider_request_profile(
+                  "ollama",
+                  "gpt-oss:20b",
+                  agent::ProviderRequestProtocol::OllamaChat,
+                  {},
+                  agent::ProviderReasoningMode::OllamaThinkEffort),
+          });
+      SMOKE_CHECK(result.disabled);
+      SMOKE_CHECK(!result.applied);
+      SMOKE_CHECK(result.degraded);
+      SMOKE_CHECK(result.disable_strategy == agent::ProviderReasoningDisableStrategy::MinimizeOnly);
+      SMOKE_CHECK(request.body.at("think").as_string() == "low");
+      SMOKE_CHECK(request.metadata.at("reasoningRequest").at("message").as_string().find("minimized") != std::string::npos);
+    }
+
+    // (j) oMLX/GPT-OSS effort mode cannot truly disable; it minimizes and reports degraded.
+    {
+      auto chat_request = agent::build_openai_chat_request(
+          agent::GenerateParams{
+              .messages = {agent::create_message(agent::MessageRole::User, "hi")},
+          },
+          "gpt-oss-20b");
+      chat_request.provider = "omlx";
+      const auto result = agent::apply_provider_reasoning(
+          chat_request,
+          agent::ProviderReasoningContext{
+              .provider = "omlx",
+              .model = "gpt-oss-20b",
+              .reasoning = agent::ReasoningSettings{.enabled = false},
+              .profile = agent::make_provider_request_profile(
+                  "omlx",
+                  "gpt-oss-20b",
+                  agent::ProviderRequestProtocol::OpenAIChatCompletions,
+                  {},
+                  agent::ProviderReasoningMode::OmlxChatTemplateReasoningEffort),
+          });
+      SMOKE_CHECK(result.disabled);
+      SMOKE_CHECK(!result.applied);
+      SMOKE_CHECK(result.degraded);
+      SMOKE_CHECK(result.disable_strategy == agent::ProviderReasoningDisableStrategy::MinimizeOnly);
+      SMOKE_CHECK(chat_request.body.at("chat_template_kwargs").at("reasoning_effort").as_string() == "low");
+      SMOKE_CHECK(!chat_request.body.contains("reasoning_effort"));
+      SMOKE_CHECK(!chat_request.body.contains("think"));
+      SMOKE_CHECK(chat_request.metadata.at("reasoningRequest").at("degraded").as_bool());
+    }
+
+    // (k) Unsupported disabled requests are surfaced through neutral metadata and a clear message.
+    {
+      auto chat_request = agent::build_openai_chat_request(
+          agent::GenerateParams{
+              .messages = {agent::create_message(agent::MessageRole::User, "hi")},
+          },
+          "local-thinking-model");
+      chat_request.provider = "vllm";
+      const auto result = agent::apply_provider_reasoning(
+          chat_request,
+          agent::ProviderReasoningContext{
+              .provider = "vllm",
+              .model = "local-thinking-model",
+              .reasoning = agent::ReasoningSettings{.enabled = false},
+              .profile = agent::make_provider_request_profile(
+                  "vllm", "local-thinking-model", agent::ProviderRequestProtocol::OpenAIChatCompletions),
+          });
+      SMOKE_CHECK(result.disabled);
+      SMOKE_CHECK(!result.applied);
+      SMOKE_CHECK(result.degraded);
+      SMOKE_CHECK(result.disable_strategy == agent::ProviderReasoningDisableStrategy::Unsupported);
+      SMOKE_CHECK(result.message.find("no native reasoning disable parameter") != std::string::npos);
+      SMOKE_CHECK(chat_request.metadata.at("reasoningRequest").at("disableStrategy").as_string() == "unsupported");
+      SMOKE_CHECK(!chat_request.body.contains("reasoning_effort"));
+      SMOKE_CHECK(!chat_request.body.contains("chat_template_kwargs"));
+    }
+
+    // (l) oMLX GPT-OSS uses chat_template_kwargs, not OpenAI's reasoning_effort or Ollama's think.
+    {
+      auto chat_request = agent::build_openai_chat_request(
+          agent::GenerateParams{
+              .messages = {agent::create_message(agent::MessageRole::User, "hi")},
+          },
+          "gpt-oss-20b");
+      chat_request.provider = "omlx";
+      const auto result = agent::apply_provider_reasoning(
+          chat_request,
+          agent::ProviderReasoningContext{
+              .provider = "omlx",
+              .model = "gpt-oss-20b",
+              .reasoning = agent::ReasoningSettings{.enabled = true, .budget = std::string("high")},
+              .profile = agent::make_provider_request_profile(
+                  "omlx",
+                  "gpt-oss-20b",
+                  agent::ProviderRequestProtocol::OpenAIChatCompletions,
+                  {},
+                  agent::ProviderReasoningMode::OmlxChatTemplateReasoningEffort),
+          });
+      SMOKE_CHECK(result.applied);
+      SMOKE_CHECK(result.mode == agent::ProviderReasoningMode::OmlxChatTemplateReasoningEffort);
+      SMOKE_CHECK(chat_request.body.at("chat_template_kwargs").at("reasoning_effort").as_string() == "high");
+      SMOKE_CHECK(!chat_request.body.contains("reasoning_effort"));
+      SMOKE_CHECK(!chat_request.body.contains("think"));
+    }
+
+    // (m) Ollama GPT-OSS uses string-valued think effort.
+    {
+      auto request = agent::build_ollama_chat_request(
+          agent::GenerateParams{
+              .messages = {agent::create_message(agent::MessageRole::User, "hi")},
+              .settings = agent::ModelSettings{
+                  .reasoning = agent::ReasoningSettings{.enabled = true, .budget = std::string("low")},
+              },
+          },
+          "gpt-oss:20b");
+      agent::apply_provider_reasoning(
+          request,
+          agent::ProviderReasoningContext{
+              .provider = "ollama",
+              .model = "gpt-oss:20b",
+              .reasoning = agent::ReasoningSettings{.enabled = true, .budget = std::string("low")},
+              .profile = agent::make_provider_request_profile(
+                  "ollama",
+                  "gpt-oss:20b",
+                  agent::ProviderRequestProtocol::OllamaChat,
+                  {},
+                  agent::ProviderReasoningMode::OllamaThinkEffort),
+          });
+      SMOKE_CHECK(request.body.at("think").as_string() == "low");
+    }
+
+    // (n) Generic OpenAI-compatible runtimes do not receive guessed reasoning fields.
+    {
+      auto chat_request = agent::build_openai_chat_request(
+          agent::GenerateParams{
+              .messages = {agent::create_message(agent::MessageRole::User, "hi")},
+          },
+          "local-thinking-model");
+      chat_request.provider = "vllm";
+      const auto result = agent::apply_provider_reasoning(
+          chat_request,
+          agent::ProviderReasoningContext{
+              .provider = "vllm",
+              .model = "local-thinking-model",
+              .reasoning = agent::ReasoningSettings{.enabled = true},
+              .profile = agent::make_provider_request_profile(
+                  "vllm", "local-thinking-model", agent::ProviderRequestProtocol::OpenAIChatCompletions),
+          });
+      SMOKE_CHECK(!result.applied);
+      SMOKE_CHECK(result.degraded);
+      SMOKE_CHECK(!chat_request.body.contains("reasoning_effort"));
+      SMOKE_CHECK(!chat_request.body.contains("chat_template_kwargs"));
+    }
+
+    // (o) OpenAI adapter (chat-completions path: no reasoning, no image content) → no reasoning_effort.
     {
       agent::NativeProviderRequest captured;
       agent::OpenAICompatibleChatModelAdapter openai_no_reasoning(
@@ -1986,7 +2670,8 @@
                 {"usage", agent::Value::object({{"prompt_tokens", 3}, {"completion_tokens", 1}})},
             });
           },
-          "/v1/chat/completions", "https://api.openai.test", "openai-key");
+          "/v1/chat/completions", "https://api.openai.test", "openai-key",
+          {}, {}, {}, agent::ProviderReasoningMode::None, openai_smoke_runtime_options());
       (void)openai_no_reasoning.generate(agent::GenerateParams{
           .messages = {agent::create_message(agent::MessageRole::User, "hello")},
           .settings = agent::ModelSettings{},
@@ -1996,7 +2681,7 @@
       SMOKE_CHECK(!captured.body.contains("reasoning"));
     }
 
-    // (e) Qwen adapter (delegates to shared build_openai_chat_request) with reasoning enabled →
+    // (p) Qwen adapter (delegates to shared build_openai_chat_request) with reasoning enabled →
     //     body has enable_thinking + thinking_budget but NOT reasoning_effort (shared builder stayed clean).
     {
       agent::NativeProviderRequest captured;

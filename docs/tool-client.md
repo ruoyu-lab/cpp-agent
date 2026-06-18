@@ -64,6 +64,9 @@ auto echo = agent::define_tool(agent::ToolDefinition{
     .input_schema = schema,
     .capabilities = {"remote.exec"},
     .risk_level = agent::ToolRiskLevel::Low,
+    .read_only = true,
+    .batchable = true,
+    .side_effect_level = "read-only",
     .execute = [](const agent::Value& input,
                   agent::ToolExecutionContext&) -> agent::ToolInvokeResult {
       return agent::Value::object({{"text", input.at("text").as_string()}});
@@ -87,6 +90,11 @@ active calls, unsubscribes, and sends `disconnect`.
 The runtime honors the same tool permissions and execution policies as local
 tool execution. Active calls receive a `CancellationToken*`; incoming `cancel`
 messages cancel the matching token.
+
+Remote tools use the same governance fields as local tools. Leave unknown or
+mutating tools conservative; set `read_only` / `batchable` only when concurrent
+execution is safe, and use `concurrency_key` when a shared external resource
+must not be called in the same parallel wave.
 
 ## Broker
 

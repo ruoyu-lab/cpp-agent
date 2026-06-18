@@ -73,7 +73,7 @@ through the bridge.
 
 ## Prompt Cache Stats
 
-After every model call (run and stream paths alike) `AgentLoop` publishes a
+After every model call (run and stream paths alike) the runner publishes a
 `model.cache_stats` event on the event bus whenever the provider reported any
 prompt-side tokens. Emission is unconditional with respect to `cache_strategy`
 — even with the default `CacheStrategy::None`, providers that auto-cache

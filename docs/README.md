@@ -2,8 +2,9 @@
 
 This directory documents the public C++20 surface of `agent_native`. The native
 port tracks the TypeScript `@node-agent` workspace in `../NodeJS` but keeps the
-framework single-library, zero-dependency, synchronous, and friendly to
-embedding from other host languages.
+default runtime target zero-dependency, synchronous, and friendly to embedding
+from other host languages. Full app/server behavior is available through the
+explicit `agent_full` aggregate.
 
 Start here if you are new to the project:
 
@@ -12,8 +13,12 @@ Start here if you are new to the project:
    from the NodeJS workspace.
 2. [Build](build.md) — CMake targets, optional features
    (`AGENT_NATIVE_ENABLE_LLAMA_CPP`), tests, and zero-dependency verification.
-3. [Bindings](bindings.md) — guidance for exposing `agent_native` to Python,
+3. [Presets](presets.md) — standard app/server assembly helpers and the
+   boundary between default convenience and advanced embedding.
+4. [Bindings](bindings.md) — guidance for exposing `agent_native` to Python,
    Go, Rust, Java, or any other host language through a stable C ABI shim.
+5. [Release Governance](release-governance.md) — ABI, observable contracts,
+   implementation-size policy, and release checklist.
 
 ## Core Foundations
 
@@ -41,14 +46,15 @@ Start here if you are new to the project:
   and llama.cpp-native bindings, reasoning settings.
 - [Tools](tools.md) — tool definitions, registry, permission policies,
   executor, audit events.
-- [Builtins](builtins.md) — packaged tool bundles (core/data/local/HTTP/web/
-  browser/repository/agent/workflow/developer) and bundle metadata.
+- [Builtins](builtins.md) — packaged tool bundles (core/local/HTTP/web/
+  browser/agent/workflow/developer/state/media) and bundle metadata.
 - [Tool Client](tool-client.md) — tool-client protocol, broker, runtime,
   security policy, idempotency cache, paired/injected transports.
 - [MCP](mcp.md) — in-process MCP tools/resources/prompts, JSON-RPC client,
   stdio/HTTP/callback transports, `.mcp.json` loader.
 - [Media](media.md) — inline/path/URL/data-URL/artifact resolution, document
-  preprocessor pipeline, OCR/rasterizer provider registries.
+  preprocessor pipeline, OCR/rasterizer provider registries, and
+  image/video/audio generation providers.
 - [Browser](browser.md) — renderer interface, callback adapter, render/extract/
   screenshot builtin tools.
 
@@ -56,6 +62,10 @@ Start here if you are new to the project:
 
 - [Memory](memory.md) — session memory, in-memory/file session stores,
   long-term vector memory, writeback hooks.
+- Embeddable knowledge retrieval contracts live in `agent/knowledge_runtime.hpp`.
+  Full knowledge-base contracts live in `agent/knowledge_core.hpp` /
+  `agent/knowledge.hpp`; browser/web/repository/sitemap loaders are explicit
+  I/O opt-ins through `agent/knowledge_io.hpp`.
 - [Scratch](scratch.md) — injectable per-session scratchpad backing the
   `scratch.*` / `todo.*` builtins; in-memory and file backends, custom
   backend guidance.
@@ -68,7 +78,8 @@ Start here if you are new to the project:
   framework supports out of the box (skill subagent, workflow agent node,
   seven coordinators, tool-client remote, mailbox, autonomous). Decision
   tree, templates, and anti-patterns.
-- [Runtime](runtime.md) — overview of `AgentRunner` and `AgentLoop`. Pages
+- [Runtime](runtime.md) — overview of `AgentRunner` and the default ReAct
+  execution model. Pages
   below cover individual surfaces:
   - [Runtime Inputs](runtime-inputs.md) — string/content-part/`AgentMessage`
     entrypoints.
@@ -83,6 +94,10 @@ Start here if you are new to the project:
   hooks, child-agent bindings.
 - [Orchestration](orchestration.md) — artifacts, shared state, mailbox,
   plan/act/observe coordinator, supervisor/evaluator coordinators.
+- [Async Agent Run](async-agent-run.md) — language-neutral observable JSON
+  contract for async AgentRunner and async subagent runs, including state
+  machine, events, checkpoints, transcript, cancel/resume, approvals, scheduler
+  boundary, and FFI semantics.
 - [Autonomous](autonomous.md) — autonomous run/step/event model, planner and
   executor wiring, manager, persistence.
 - [Tasks](tasks.md) — task model, in-memory/file/Postgres stores, queues,

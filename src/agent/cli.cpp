@@ -1,4 +1,4 @@
-#include "agent/agent.hpp"
+#include "agent/app_api.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -465,7 +465,7 @@ AgentRunnerRunResult run_cli_prompt(AgentRunner& runner,
                                     bool debug,
                                     std::ostream& out) {
   if (!stream) {
-    auto result = runner.run(input, session_id);
+    auto result = runner.execution().run(input, session_id);
     out << result.text << "\n";
     if (debug) {
       render_cli_debug(result, out);
@@ -473,21 +473,19 @@ AgentRunnerRunResult run_cli_prompt(AgentRunner& runner,
     return result;
   }
 
-  auto stream_result = runner.stream(input, session_id);
   bool printed_debug = false;
-  for (const auto& event : stream_result.events) {
+  auto stream_result = runner.streaming().stream(input, [&](const AgentRunnerStreamEvent& event) {
     if ((event.type == AgentRunnerStreamEventType::MemoryRetrieval ||
          event.type == AgentRunnerStreamEventType::KnowledgeRetrieval) && debug) {
       render_cli_retrieval_debug(event.memory_hits, event.knowledge_hits, out);
       printed_debug = true;
-      continue;
+      return;
     }
-    if (event.type != AgentRunnerStreamEventType::Loop ||
-        event.loop_event.type != AgentLoopStreamEventType::ModelTextDelta) {
-      continue;
+    if (event.type != AgentRunnerStreamEventType::UserVisibleDelta) {
+      return;
     }
-    out << event.loop_event.delta;
-  }
+    out << event.delta;
+  }, session_id);
   out << "\n";
   if (debug && !printed_debug) {
     render_cli_debug(stream_result.result, out);
@@ -527,7 +525,7 @@ int run_repl_command(NativeResolvedAgentApp& app,
       break;
     }
     if (line == ":clear") {
-      if (auto* store = app.runner->session_store()) {
+      if (auto* store = app.runner->sessions().store()) {
         store->clear(options.session_id);
       }
       out << "Cleared session " << options.session_id << ".\n";

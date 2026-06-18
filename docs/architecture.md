@@ -14,17 +14,24 @@ decision logic and ~98.4% harness code. This project is structured the same
 way on purpose: when something goes wrong in a deployed agent, the cause is
 overwhelmingly in the harness, and the harness is what you can actually fix.
 
-The native port intentionally diverges from the NodeJS workspace's package
-split. Instead of dozens of npm packages, `agent_native` ships as **one static
-library with one public include root**. This page describes the design rules
-that the rest of the documentation assumes.
+The native port intentionally keeps the NodeJS workspace's package sprawl out
+of C++, but it is no longer a single implementation blob. `agent_native` is
+the default embeddable runtime aggregate; applications that intentionally want
+the complete app/server surface opt into `agent_full`. This page describes the
+design rules that the rest of the documentation assumes.
 
 ## Design Rules
 
-1. **Single library.** All capabilities live in `agent_native`. There is no
-   plugin loader, dynamic module system, or runtime package discovery. Calling
-   code links the static library and includes `agent/agent.hpp` (or any of the
-   focused headers).
+1. **Layered native targets.** Capabilities are split into `agent_core`,
+   `agent_platform`, `agent_model`, `agent_tools`, `agent_mcp`,
+   `agent_mcp_native`, `agent_runtime`, `agent_runtime_io`,
+   `agent_runtime_io_native`,
+   `agent_runtime_modules`, `agent_app`, and `agent_server`. `agent_native` links only the embeddable
+   runtime surface. `agent_full` links the complete app/server surface for explicit full-stack
+   opt-in. Calling code should include the smallest matching API header:
+   `agent/core_api.hpp`, `agent/model_api.hpp`, `agent/tools_api.hpp`,
+   `agent/runtime_api.hpp`, `agent/app_api.hpp`, `agent/server_api.hpp`, or
+   `agent/full.hpp`.
 2. **Zero external dependency.** The library compiles against only the C++20
    standard library. It does not pull in a JSON library, schema library, HTTP
    client, TLS stack, database driver, scripting engine, OpenTelemetry SDK,
@@ -33,29 +40,70 @@ that the rest of the documentation assumes.
    library is exposed as an abstract interface plus a default zero-dependency
    fallback when one is possible. Production bindings are supplied by the
    embedding host through dependency injection.
-4. **Synchronous public API.** Streaming, retries, cancellation, hooks, and
+4. **Descriptor-driven providers.** Configured chat providers are registered
+   through `NativeChatProviderDescriptor`; config validation, protocol
+   selection, and adapter creation read the descriptor registry instead of a
+   hard-coded provider switch. Built-in descriptor registration lives in
+   `src/agent/config_provider_registry.cpp`; `config.cpp` stays focused on
+   validation and app assembly.
+5. **Scoped tool services.** New tools declare `ToolServiceRequirement` entries
+   and access dependencies through `ToolServiceView`. Runtime service refs
+   remain available for existing built-ins, but custom tools should not depend
+   on the full service bag.
+6. **Synchronous public API.** Streaming, retries, cancellation, hooks, and
    tool execution are all synchronous from the caller's perspective. No
    coroutine runtime, no `std::async`, no thread pool is required to call any
    public function.
-5. **Stable behavior parity with NodeJS where it is observable.** Event names,
+7. **Stable behavior parity with NodeJS where it is observable.** Event names,
    message normalization, default policies, JSON shapes, and error wrapping
    follow the NodeJS framework so that traces, replays, and eval reports stay
    comparable across the two implementations.
 
 ## Module Map
 
-| Layer | Headers | Purpose |
+| Target | API header | Purpose |
 |---|---|---|
-| Foundations | `core`, `messages`, `common` | Errors, `Value`, JSON, schema, identifiers, message protocol. |
-| Plumbing | `http`, `execution`, `hooks`, `observability` | Transport contracts, cancellation/retry/timeout, event bus, hook merge, logs/metrics/traces. |
-| Domain | `model`, `tools`, `tool_client`, `mcp`, `media`, `browser` | Provider abstractions, tool registries, MCP client, document/media handling, browser renderer interface. |
-| Knowledge | `memory`, `skills` | Session/long-term memory, knowledge bases/managers, Anthropic-style skills. |
-| Runtime | `context`, `runtime`, `workflow`, `orchestration`, `autonomous`, `tasks`, `evals`, `replay` | Agent loop/runner, workflow engine, multi-agent coordinators, autonomous loop, background tasks, eval suites, replay artifacts. |
-| Surface | `server`, `cli`, `config`, `builtins` | Transport-independent server app (routes/governance/audit/replay), CLI binary, config loader, packaged tool bundles. |
+| `agent_core` | `agent/core_api.hpp` | Errors, `Value`, messages, HTTP contracts, hooks, observability, shared helpers. |
+| `agent_platform` | `agent/http_native.hpp`, `agent/process_hook.hpp` | Optional zero-dependency native platform helpers, currently the POSIX plain-HTTP transport and POSIX process hooks. |
+| `agent_model` | `agent/model_api.hpp` | Provider-neutral chat/embedding contracts, model capabilities, usage metadata, and adapter interfaces. |
+| `agent_model_providers` | `agent/model_providers.hpp` | Optional built-in provider adapters, request protocol marshalling, stream parsing, reasoning mappers, and native provider transports. |
+| `agent_tools` | `agent/tools_api.hpp` | Tool definitions, registry, executor, sandbox, scratch, tool-run services, security governance. |
+| `agent_mcp` | `agent/mcp.hpp` | MCP JSON-RPC protocol helpers, callback/line transports, in-process server/client, and tool/resource/prompt adapters. |
+| `agent_mcp_native` | `agent/mcp_native.hpp` | Optional native MCP stdio subprocess and plain-HTTP transports. |
+| `agent_runtime` | `agent/runtime_api.hpp` | Embeddable runner surface: model/tool wiring, memory, context, execution policies, streaming, and `AgentRunner`. |
+| `agent_runtime_io` | `agent/knowledge_io.hpp` and explicit I/O headers | Host I/O runtime modules: browser renderer adapter, web search/fetch/crawl helpers, media/document preprocessing, and web-enabled knowledge loaders. |
+| `agent_runtime_io_native` | `agent/web_native.hpp`, `agent/media_native.hpp` | Optional native plain-HTTP web/media helpers. |
+| `agent_runtime_modules` | explicit module headers | High-level runtime modules: async runs, tasks, autonomous execution, plan-and-execute, realtime, orchestration, workflow. |
+| `agent_app` | `agent/app_api.hpp` | Config resolution, built-in bundles, built-in provider descriptor registry, MCP integrations, CLI/eval/replay helpers, default app assembly. |
+| `agent_server` | `agent/server_api.hpp` | Transport-independent server app and route modules. |
+| `agent_native` | `agent/agent.hpp` | Embeddable runtime aggregate. Does not link app/server. |
+| `agent_full` | `agent/full.hpp` | Full aggregate umbrella for applications that intentionally want every layer. |
+| `agent_capi` | `agent_capi.h` | Embeddable C ABI over `agent_runtime`; no app/server/I/O by default. |
+| `agent_capi_full` | `agent_capi_full.h` | Full C ABI over `agent_app` for config-backed constructors and async-agent-run modules. |
 
-The umbrella header `agent/agent.hpp` pulls every public header. Headers are
-self-contained — including any single one transitively brings in `core` and the
-common standard-library set in `common.hpp`.
+The umbrella header `agent/agent.hpp` is intentionally limited to the
+embeddable runner surface. Higher-level runtime modules such as async runs,
+autonomous execution, plan-and-execute, realtime, tasks, workflow, orchestration,
+and ReAct expert APIs require explicit headers (`agent/async.hpp`,
+`agent/autonomous.hpp`, `agent/plan.hpp`, `agent/realtime.hpp`,
+`agent/tasks.hpp`, `agent/workflow.hpp`, `agent/orchestration.hpp`,
+`agent/react.hpp`, etc.) and explicit target opt-in. Browser, web, media,
+document preprocessing, and web-enabled knowledge loader implementations live
+in `agent_runtime_io`; hosts include `agent/knowledge_io.hpp` for web/repository
+knowledge loaders. The core-safe default knowledge loader only covers text,
+file, directory, markdown, and composite loader composition. New framework code
+should include a layer-specific API header or an individual header instead of
+depending on the aggregate. Use `agent/full.hpp` only when the full runtime and
+app/server surface is intentional.
+
+Memory and knowledge are also separated at the public-header level. The
+default embeddable runner sees `memory_retrieval.hpp`, `memory_session.hpp`,
+and `knowledge_runtime.hpp`: lightweight ports and value types only. Concrete
+vector memory, run transcript, layered memory, loaders, stores, indexes,
+rerankers, `KnowledgeBase`, and `KnowledgeBaseManager` live behind explicit
+`agent_memory`, `agent_knowledge`, or full/app target opt-in. Host I/O
+knowledge loaders stay behind `agent/knowledge_io.hpp` plus the
+`agent_runtime_io` target.
 
 ## Zero-Dependency Boundary
 
@@ -70,8 +118,8 @@ Anything that **must** touch the outside world is split in two:
 - A **fallback implementation** when a useful one exists with only the C++
   standard library and POSIX (e.g. native HTTP/1.1 plain-text client
   transport, in-memory pub/sub, in-memory/file-backed stores, native
-  plain-HTTP web search/page-fetch transports, POSIX stdio subprocess MCP
-  transport, PDF text extraction).
+  plain-HTTP web/media helpers through `agent_runtime_io_native`, POSIX stdio
+  subprocess MCP transport through `agent_mcp_native`, PDF text extraction).
 
 What is **not** included out of the box:
 
@@ -87,6 +135,22 @@ These are reached by **injection only**. This is intentional: every embedding
 host already brings its preferred TLS stack, ORM, browser binding, model
 runtime, or scripting engine. Forcing one would break the "easy to host from
 any language" goal.
+
+## Storage Ownership
+
+Built-in stores follow the repository-level vocabulary in
+`../../CONTRACT_MATRIX.md`: `runtime-owned`, `derived`, `small-deploy canonical`,
+and `business-owned`.
+
+- Session, workflow, task, autonomous, approval, replay, scratch, and audit
+  stores are runtime state used to execute, resume, govern, and inspect runs.
+- Knowledge stores, vector indexes, text indexes, rerankers, replay
+  materializations, and retrieval caches are derived substrate.
+- In small local deployments those stores may be the canonical application
+  state.
+- In host-owned deployments, users, tenants, long-term chat archives, product
+  entities, reporting sources, and authorization facts remain business-owned
+  and should be exposed through host tools, repositories, or injected adapters.
 
 ## Injection Model
 
@@ -125,13 +189,19 @@ rasterizers, MCP transports, autonomous/approval stores, …) are all
 synchronized at registration time and snapshot at execution time, so adapters
 can be added or rotated without races.
 
+Chat provider config uses the same rule. Embedders add provider support by
+calling `register_native_chat_provider_descriptor(...)` with a provider name,
+adapter factory, and request-protocol resolver. A custom provider can then be
+referenced from JSON config without modifying `config.cpp`; built-in provider
+descriptors are registered from the app layer's provider registry source.
+
 ## Concurrency and Thread Safety
 
 - Public mutating registries (provider/tool/bundle/search/loader/index/MCP
   registries, in-memory pub/sub, in-memory and file-backed stores) take an
   internal mutex and snapshot for read paths. Reads never block writes longer
   than the snapshot copy.
-- `AgentRunner` and `AgentLoop` execute synchronously on the calling thread.
+- `AgentRunner` executes synchronously on the calling thread.
   Streaming is implemented as ordered event collection during that synchronous
   run.
 - `CancellationToken` is cooperative. Long-running adapters poll the token and

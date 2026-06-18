@@ -1,0 +1,259 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "parse action batch with compact JSON input",
+      "kind": "parse",
+      "input": {
+        "text": "Thought: need arithmetic\nActions:\n[{\"tool\":\"math.eval\",\"input\":{\"expression\":\"2+3\"}}]",
+        "availableTools": ["math.eval"]
+      },
+      "expected": {
+        "type": "action-batch",
+        "thought": "need arithmetic",
+        "actions": [
+          {
+            "id": "react_1_0_math.eval",
+            "index": 0,
+            "tool": "math.eval",
+            "input": {
+              "expression": "2+3"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "parse multi action batch",
+      "kind": "parse",
+      "input": {
+        "text": "Thought: inspect independent inputs\nActions:\n[{\"tool\":\"fs.readText\",\"input\":{\"path\":\"a.txt\"}},{\"tool\":\"math.eval\",\"input\":{\"expression\":\"2+3\"}}]",
+        "availableTools": ["fs.readText", "math.eval"]
+      },
+      "expected": {
+        "type": "action-batch",
+        "thought": "inspect independent inputs",
+        "actions": [
+          {
+            "id": "react_1_0_fs.readText",
+            "index": 0,
+            "tool": "fs.readText",
+            "input": {
+              "path": "a.txt"
+            }
+          },
+          {
+            "id": "react_1_1_math.eval",
+            "index": 1,
+            "tool": "math.eval",
+            "input": {
+              "expression": "2+3"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "parse final answer",
+      "kind": "parse",
+      "input": {
+        "text": "Thought: enough evidence\nFinal Answer: The answer is 5.",
+        "availableTools": ["math.eval"]
+      },
+      "expected": {
+        "type": "final",
+        "thought": "enough evidence",
+        "finalAnswer": "The answer is 5."
+      }
+    },
+    {
+      "name": "leading meta analysis before thought is parse error",
+      "kind": "parse",
+      "input": {
+        "text": "User reply is only conversational, so I should answer directly.\nThought: respond briefly\nFinal Answer: Sure.",
+        "availableTools": ["math.eval"]
+      },
+      "expectedShape": {
+        "type": "parse-error",
+        "thought": "respond briefly",
+        "error": {
+          "$type": "string",
+          "nonEmpty": true
+        }
+      }
+    },
+    {
+      "name": "mixed final and actions is parse error",
+      "kind": "parse",
+      "input": {
+        "text": "Thought: maybe call a tool\nActions:\n[{\"tool\":\"math.eval\",\"input\":{\"expression\":\"1+1\"}}]\nFinal Answer: already known",
+        "availableTools": ["math.eval"]
+      },
+      "expectedShape": {
+        "type": "parse-error",
+        "thought": "maybe call a tool",
+        "error": {
+          "$type": "string",
+          "nonEmpty": true
+        }
+      }
+    },
+    {
+      "name": "invalid JSON actions is parse error",
+      "kind": "parse",
+      "input": {
+        "text": "Thought: call tool\nActions:\nnot-json",
+        "availableTools": ["math.eval"]
+      },
+      "expectedShape": {
+        "type": "parse-error",
+        "thought": "call tool",
+        "error": {
+          "$type": "string",
+          "nonEmpty": true
+        }
+      }
+    },
+    {
+      "name": "unknown tool is parse error",
+      "kind": "parse",
+      "input": {
+        "text": "Thought: call tool\nActions:\n[{\"tool\":\"missing.tool\",\"input\":{}}]",
+        "availableTools": ["math.eval"]
+      },
+      "expectedShape": {
+        "type": "parse-error",
+        "thought": "call tool",
+        "error": {
+          "$type": "string",
+          "nonEmpty": true
+        }
+      }
+    },
+    {
+      "name": "tool success observation",
+      "kind": "observation",
+      "input": {
+        "iteration": 0,
+        "toolCall": {
+          "id": "react_1_math.eval",
+          "name": "math.eval",
+          "arguments": {
+            "expression": "2+3"
+          }
+        },
+        "toolResult": {
+          "ok": true,
+          "output": "{\n  \"value\": 5\n}"
+        }
+      },
+      "expected": "Observation:\n{\n  \"results\": [\n    {\n      \"index\": 0,\n      \"ok\": true,\n      \"output\": \"{\\n  \\\"value\\\": 5\\n}\",\n      \"tool\": \"math.eval\",\n      \"toolCallId\": \"react_1_math.eval\"\n    }\n  ]\n}"
+    },
+    {
+      "name": "tool failure observation",
+      "kind": "observation",
+      "input": {
+        "iteration": 0,
+        "toolCall": {
+          "id": "react_1_math.eval",
+          "name": "math.eval",
+          "arguments": {
+            "expression": "2/0"
+          }
+        },
+        "toolResult": {
+          "ok": false,
+          "output": "{\n  \"ok\": false,\n  \"error\": \"division by zero\"\n}",
+          "error": "division by zero"
+        }
+      },
+      "expected": "Observation:\n{\n  \"results\": [\n    {\n      \"error\": \"division by zero\",\n      \"index\": 0,\n      \"ok\": false,\n      \"output\": \"{\\n  \\\"ok\\\": false,\\n  \\\"error\\\": \\\"division by zero\\\"\\n}\",\n      \"tool\": \"math.eval\",\n      \"toolCallId\": \"react_1_math.eval\"\n    }\n  ]\n}"
+    },
+    {
+      "name": "stream event shape",
+      "kind": "shape",
+      "expectedShape": [
+        {
+          "type": "react-message",
+          "iteration": 0,
+          "visibleMessage": "Checking the numbers."
+        },
+        {
+          "type": "react-action-batch",
+          "iteration": 0,
+          "toolCalls": [
+            {
+              "id": {
+                "$type": "string",
+                "nonEmpty": true
+              },
+              "name": "math.eval",
+              "arguments": {
+                "expression": "2+3"
+              }
+            }
+          ],
+          "thought": {
+            "$type": "string",
+            "nonEmpty": true
+          },
+          "visibleMessage": "Checking the numbers."
+        },
+        {
+          "type": "react-observation",
+          "iteration": 0,
+          "observation": {
+            "$type": "string",
+            "nonEmpty": true
+          }
+        },
+        {
+          "type": "react-final",
+          "iteration": 1,
+          "thought": {
+            "$type": "string",
+            "nonEmpty": true
+          },
+          "finalAnswer": "The answer is 5."
+        }
+      ]
+    },
+    {
+      "name": "durable state shape",
+      "kind": "shape",
+      "expectedShape": {
+        "version": 1,
+        "phase": "tool-batch-completed",
+        "sessionId": "contract-react",
+        "nextIteration": 1,
+        "reactTrace": [
+          {
+            "type": "action-batch",
+            "iteration": 0,
+            "thought": {
+              "$type": "string",
+              "nonEmpty": true
+            },
+            "visibleMessage": "Checking the numbers.",
+            "actions": [
+              {
+                "id": "react_1_0_math.eval",
+                "index": 0,
+                "tool": "math.eval",
+                "input": {
+                  "expression": "2+3"
+                }
+              }
+            ],
+            "observation": {
+              "$type": "string",
+              "nonEmpty": true
+            }
+          }
+        ],
+        "consecutiveParseErrors": 0,
+        "consecutiveReasoningProtocolLeaks": 0
+      }
+    }
+  ]
+}

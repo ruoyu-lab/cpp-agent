@@ -1,3 +1,256 @@
+  {
+    class SmokeRealtimeSession final : public agent::RealtimeSession {
+     public:
+      explicit SmokeRealtimeSession(std::string session_id) : id_(std::move(session_id)) {
+        push(agent::RealtimeSessionEventType::SessionOpened, agent::RealtimeSessionState::Open);
+      }
+
+      std::string id() const override { return id_; }
+      agent::RealtimeSessionState state() const override { return state_; }
+
+      void send_text(std::string text, agent::Value metadata = agent::Value::object({})) override {
+        auto event = base_event(agent::RealtimeSessionEventType::InputText, agent::RealtimeSessionState::Listening);
+        event.text = std::move(text);
+        event.metadata = std::move(metadata);
+        push(std::move(event));
+      }
+
+      void send_audio(agent::RealtimeAudioChunk chunk) override {
+        auto event = base_event(agent::RealtimeSessionEventType::InputAudioDelta,
+                                agent::RealtimeSessionState::Listening);
+        event.audio = std::move(chunk);
+        push(std::move(event));
+      }
+
+      void commit_input_audio(agent::Value metadata = agent::Value::object({})) override {
+        auto event = base_event(agent::RealtimeSessionEventType::InputAudioCommitted,
+                                agent::RealtimeSessionState::Listening);
+        event.metadata = std::move(metadata);
+        push(std::move(event));
+      }
+
+      void clear_input_audio(agent::Value metadata = agent::Value::object({})) override {
+        auto event = base_event(agent::RealtimeSessionEventType::SessionUpdated,
+                                agent::RealtimeSessionState::Listening);
+        event.metadata = std::move(metadata);
+        push(std::move(event));
+      }
+
+      void request_response(agent::Value metadata = agent::Value::object({})) override {
+        auto event = base_event(agent::RealtimeSessionEventType::ResponseStarted,
+                                agent::RealtimeSessionState::Responding);
+        event.metadata = std::move(metadata);
+        push(std::move(event));
+      }
+
+      void cancel_response(std::string reason = {}) override {
+        auto event = base_event(agent::RealtimeSessionEventType::ResponseInterrupted,
+                                agent::RealtimeSessionState::Interrupted);
+        event.metadata = reason.empty() ? agent::Value::object({}) : agent::Value::object({{"reason", reason}});
+        push(std::move(event));
+      }
+
+      void send_tool_result(agent::RealtimeToolResult result) override {
+        auto event = base_event(result.ok ? agent::RealtimeSessionEventType::ToolCallResult
+                                          : agent::RealtimeSessionEventType::ToolCallError,
+                                agent::RealtimeSessionState::Open);
+        event.tool_result = std::move(result);
+        push(std::move(event));
+      }
+
+      void update_settings(agent::Value settings) override {
+        auto event = base_event(agent::RealtimeSessionEventType::SessionUpdated,
+                                agent::RealtimeSessionState::Open);
+        event.metadata = agent::Value::object({{"settings", std::move(settings)}});
+        push(std::move(event));
+      }
+
+      void interrupt(std::string reason = {}) override { cancel_response(std::move(reason)); }
+
+      void close(std::string reason = {}) override {
+        auto event = base_event(agent::RealtimeSessionEventType::SessionClosed,
+                                agent::RealtimeSessionState::Closed);
+        event.metadata = reason.empty() ? agent::Value::object({}) : agent::Value::object({{"reason", reason}});
+        push(std::move(event));
+      }
+
+      bool next_event(agent::RealtimeSessionEvent& out_event) override {
+        if (cursor_ >= events_.size()) {
+          return false;
+        }
+        out_event = events_.at(cursor_++);
+        return true;
+      }
+
+     private:
+      agent::RealtimeSessionEvent base_event(agent::RealtimeSessionEventType type,
+                                             agent::RealtimeSessionState state) {
+        agent::RealtimeSessionEvent event;
+        event.id = agent::generate_uuid();
+        event.session_id = id_;
+        event.sequence = static_cast<std::uint64_t>(events_.size() + 1);
+        event.timestamp = agent::now_iso8601();
+        event.type = type;
+        event.state = state;
+        event.provider = "smoke";
+        event.model = "smoke-realtime";
+        return event;
+      }
+
+      void push(agent::RealtimeSessionEventType type, agent::RealtimeSessionState state) {
+        push(base_event(type, state));
+      }
+
+      void push(agent::RealtimeSessionEvent event) {
+        if (event.state) {
+          state_ = *event.state;
+        }
+        events_.push_back(std::move(event));
+      }
+
+      std::string id_;
+      agent::RealtimeSessionState state_ = agent::RealtimeSessionState::Connecting;
+      std::vector<agent::RealtimeSessionEvent> events_;
+      std::size_t cursor_ = 0;
+    };
+
+    SmokeRealtimeSession session("realtime-smoke");
+    session.send_text("hello", agent::Value::object({{"turnId", "turn-1"}}));
+    session.send_audio(agent::RealtimeAudioChunk{
+        .data = "base64-audio",
+        .encoding = "pcm16",
+        .sample_rate = 24000,
+        .channels = 1,
+    });
+    session.commit_input_audio(agent::Value::object({{"turnId", "turn-1"}}));
+    session.request_response(agent::Value::object({{"responseId", "response-1"}}));
+    session.cancel_response("barge-in");
+    session.close("done");
+
+    agent::RealtimeSessionEvent event;
+    SMOKE_CHECK(session.next_event(event));
+    SMOKE_CHECK(event.type == agent::RealtimeSessionEventType::SessionOpened);
+    SMOKE_CHECK(agent::realtime_session_event_to_value(event).at("type").as_string() == "session.opened");
+    SMOKE_CHECK(session.next_event(event));
+    SMOKE_CHECK(event.type == agent::RealtimeSessionEventType::InputText);
+    SMOKE_CHECK(agent::realtime_session_event_to_value(event).at("text").as_string() == "hello");
+    SMOKE_CHECK(session.next_event(event));
+    SMOKE_CHECK(event.type == agent::RealtimeSessionEventType::InputAudioDelta);
+    SMOKE_CHECK(agent::realtime_session_event_to_value(event).at("audio").at("encoding").as_string() == "pcm16");
+    SMOKE_CHECK(session.next_event(event));
+    SMOKE_CHECK(event.type == agent::RealtimeSessionEventType::InputAudioCommitted);
+    SMOKE_CHECK(session.next_event(event));
+    SMOKE_CHECK(event.type == agent::RealtimeSessionEventType::ResponseStarted);
+    SMOKE_CHECK(session.next_event(event));
+    SMOKE_CHECK(event.type == agent::RealtimeSessionEventType::ResponseInterrupted);
+    SMOKE_CHECK(event.metadata.at("reason").as_string() == "barge-in");
+    SMOKE_CHECK(session.next_event(event));
+    SMOKE_CHECK(event.type == agent::RealtimeSessionEventType::SessionClosed);
+    SMOKE_CHECK(!session.next_event(event));
+
+    auto capabilities = agent::realtime_provider_capabilities_to_value(agent::RealtimeProviderCapabilities{
+        .provider = "smoke",
+        .models = {"smoke-realtime"},
+        .modalities = {"text", "audio"},
+        .input_audio = true,
+        .output_audio = true,
+        .interruption = true,
+        .tool_calling = true,
+    });
+    SMOKE_CHECK(capabilities.at("provider").as_string() == "smoke");
+    SMOKE_CHECK(capabilities.at("inputAudio").as_bool());
+
+    auto tool = agent::define_tool(agent::ToolDefinition{
+        .name = "math.add",
+        .description = "Add two numbers.",
+        .execute = [](const agent::Value& input, agent::ToolExecutionContext&) -> agent::ToolInvokeResult {
+          return agent::Value::object({{"value", input.at("a").as_integer() + input.at("b").as_integer()}});
+        },
+    });
+    agent::ToolRegistry realtime_tool_registry({tool});
+    agent::ToolExecutor realtime_tool_executor(realtime_tool_registry);
+    agent::RealtimeToolBridge bridge(agent::RealtimeToolBridgeOptions{
+        .executor = &realtime_tool_executor,
+    });
+    agent::RealtimeToolResult bridge_result;
+    agent::RealtimeSessionEvent delta_event;
+    delta_event.type = agent::RealtimeSessionEventType::ToolCallArgumentsDelta;
+    delta_event.delta = "{\"a\":2,";
+    delta_event.tool_call = agent::RealtimeToolCall{.id = "tool-1", .name = "math.add"};
+    SMOKE_CHECK(!bridge.execute_event(delta_event, bridge_result));
+    agent::RealtimeSessionEvent ready_event;
+    ready_event.type = agent::RealtimeSessionEventType::ToolCallReady;
+    ready_event.delta = "\"b\":3}";
+    ready_event.tool_call = agent::RealtimeToolCall{.id = "tool-1", .name = "math.add"};
+    SMOKE_CHECK(bridge.execute_event(ready_event, bridge_result));
+    SMOKE_CHECK(bridge_result.ok);
+    SMOKE_CHECK(bridge_result.output.at("value").as_integer() == 5);
+    session.send_tool_result(bridge_result);
+    SMOKE_CHECK(session.next_event(event));
+    SMOKE_CHECK(event.type == agent::RealtimeSessionEventType::ToolCallResult);
+
+    agent::RealtimeSessionEvent snapshot_delta_event;
+    snapshot_delta_event.type = agent::RealtimeSessionEventType::ToolCallArgumentsDelta;
+    snapshot_delta_event.delta = "{\"a\":999,";
+    snapshot_delta_event.tool_call = agent::RealtimeToolCall{.id = "tool-2", .name = "math.add"};
+    SMOKE_CHECK(!bridge.execute_event(snapshot_delta_event, bridge_result));
+    agent::RealtimeSessionEvent snapshot_ready_event;
+    snapshot_ready_event.type = agent::RealtimeSessionEventType::ToolCallReady;
+    snapshot_ready_event.tool_call = agent::RealtimeToolCall{
+        .id = "tool-2",
+        .name = "math.add",
+        .arguments_text = "{\"a\":2,\"b\":3}",
+    };
+    SMOKE_CHECK(bridge.execute_event(snapshot_ready_event, bridge_result));
+    SMOKE_CHECK(bridge_result.ok);
+    SMOKE_CHECK(bridge_result.output.at("value").as_integer() == 5);
+
+    agent::InMemoryToolRunManager realtime_tool_runs;
+    auto background_tool = agent::define_tool(agent::ToolDefinition{
+        .name = "background.start",
+        .description = "Start background work.",
+        .service_requirements = {agent::tool_service_requirement(agent::kToolServiceToolRunManager)},
+        .execute = [](const agent::Value&, agent::ToolExecutionContext& context) -> agent::ToolInvokeResult {
+          auto* tool_runs = context.service_refs.service_view.get(agent::kToolServiceToolRunManager);
+          SMOKE_CHECK(tool_runs != nullptr);
+          auto run = tool_runs->start(agent::ToolRunStartOptions{
+              .run_id = "realtime-tool-run-1",
+              .tool_call_id = context.tool_call ? context.tool_call->id : std::string{},
+              .tool_name = context.tool_call ? context.tool_call->name : std::string{"background.start"},
+              .kind = "custom",
+              .label = "realtime background",
+          });
+          tool_runs->append_log(run.run_id, "log", "started");
+          tool_runs->update(run.run_id, agent::ToolRunUpdate{
+              .status = agent::ToolRunStatus::Completed,
+              .ready = true,
+              .metadata = agent::Value::object({{"done", true}}),
+          });
+          return agent::Value::object({{"run", agent::tool_run_snapshot_to_value(run)}});
+        },
+    });
+    agent::ToolRegistry background_registry({background_tool});
+    agent::ToolExecutor background_executor(background_registry);
+    agent::ToolExecutionContext background_context;
+    background_context.service_refs.service_container.set(agent::kToolServiceToolRunManager,
+                                                          &realtime_tool_runs);
+    agent::RealtimeToolBridge background_bridge(agent::RealtimeToolBridgeOptions{
+        .executor = &background_executor,
+        .context = background_context,
+    });
+    auto background_result = background_bridge.execute(agent::RealtimeToolCall{
+        .id = "background-call-1",
+        .name = "background.start",
+        .arguments = agent::Value::object({}),
+    });
+    SMOKE_CHECK(background_result.ok);
+    SMOKE_CHECK(background_result.output.at("run").at("runId").as_string() == "realtime-tool-run-1");
+    auto tool_run_snapshot = realtime_tool_runs.get("realtime-tool-run-1");
+    SMOKE_CHECK(tool_run_snapshot);
+    SMOKE_CHECK(tool_run_snapshot->tool_call_id == "background-call-1");
+    SMOKE_CHECK(tool_run_snapshot->tool_name == "background.start");
+  }
+
   SMOKE_CHECK(saw_absolute_allowed_link);
   SMOKE_CHECK(!saw_raw_allowed_link);
   const auto policy_crawl_value = agent::web_crawl_result_to_value(policy_crawl).stringify();
@@ -157,6 +410,50 @@
     SMOKE_CHECK(concurrent_tools.list().size() == static_cast<std::size_t>(thread_count * iterations));
     SMOKE_CHECK(concurrent_skills.list().size() == static_cast<std::size_t>(thread_count * iterations));
     SMOKE_CHECK(concurrent_contexts.resolve_blocks().size() == static_cast<std::size_t>(thread_count * iterations));
+  }
+  {
+    agent::SkillRegistry path_skills({
+        agent::SkillDefinition{
+            .manifest = agent::SkillManifest{
+                .name = "ts-review",
+                .description = "Review TypeScript changes",
+                .allowed_tools = {"repo.read"},
+                .paths = {"src/**/*.ts"},
+            },
+            .prompt = "Review TypeScript paths.",
+        },
+        agent::SkillDefinition{
+            .manifest = agent::SkillManifest{
+                .name = "docs-review",
+                .description = "Review docs",
+                .paths = {"docs/**"},
+            },
+            .prompt = "Review docs.",
+        },
+        agent::SkillDefinition{
+            .manifest = agent::SkillManifest{
+                .name = "disabled-review",
+                .description = "Disabled model invocation",
+                .disable_model_invocation = true,
+                .paths = {"src/**/*.ts"},
+            },
+            .prompt = "Should not auto activate.",
+        },
+    });
+    agent::SkillResolveOptions path_opts;
+    path_opts.paths = {"src/auth/login.ts"};
+    auto path_state = agent::resolve_skills_state(&path_skills, path_opts);
+    SMOKE_CHECK(path_state.auto_selected_skills.size() == 1);
+    SMOKE_CHECK(path_state.auto_selected_skills.front() == "ts-review");
+    SMOKE_CHECK(path_state.active_skills.size() == 1);
+    SMOKE_CHECK(path_state.active_skills.front().skill.manifest.name == "ts-review");
+    SMOKE_CHECK(contains_string(path_state.allowed_tools, "repo.read"));
+
+    agent::SkillResolveOptions non_matching_path_opts;
+    non_matching_path_opts.paths = {"src/index.cpp"};
+    auto non_matching_path_state = agent::resolve_skills_state(&path_skills, non_matching_path_opts);
+    SMOKE_CHECK(non_matching_path_state.auto_selected_skills.empty());
+    SMOKE_CHECK(non_matching_path_state.active_skills.empty());
   }
 
   auto usage = agent::extract_model_usage(agent::Value::object({
@@ -328,18 +625,26 @@
       .max_steps = 2,
   });
   auto planned_runner = agent::AgentRunner(agent::AgentRunnerConfig{
-      .adapter = runner_planner_model,
-      .tools = tools,
-      .max_iterations = 1,
-      .planner = runtime_planner,
+      .model_runtime = {
+          .adapter = runner_planner_model,
+      },
+      .tool_runtime = {
+          .definitions = tools,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+      .governance = {
+          .planner = runtime_planner,
+      },
   });
   std::vector<std::string> planning_events;
-  const auto planned_sink_id = planned_runner.register_event_sink([&](const agent::FrameworkEvent& event) {
+  const auto planned_sink_id = planned_runner.events().register_sink([&](const agent::FrameworkEvent& event) {
     if (event.category.find("planning.") == 0) {
       planning_events.push_back(event.category);
     }
   });
-  auto planned_run = planned_runner.run("Use planning before answering", "planned-run-session");
+  auto planned_run = planned_runner.execution().run("Use planning before answering", "planned-run-session");
   SMOKE_CHECK(planned_run.text == "planned response");
   SMOKE_CHECK(planned_run.plan);
   SMOKE_CHECK(planned_run.plan->steps.size() == 2);
@@ -347,7 +652,7 @@
   SMOKE_CHECK(contains_string(planning_events, "planning.started"));
   SMOKE_CHECK(contains_string(planning_events, "planning.completed"));
 
-  auto planned_stream = planned_runner.stream("Use planning in stream", "planned-stream-session");
+  auto planned_stream = capture_runner_stream(planned_runner, "Use planning in stream", "planned-stream-session");
   bool saw_planning_event = false;
   bool saw_planning_status_start = false;
   bool saw_planning_status_complete = false;
@@ -368,7 +673,7 @@
   SMOKE_CHECK(saw_planning_status_complete);
   SMOKE_CHECK(planned_stream.result.plan);
   SMOKE_CHECK(agent::to_string(agent::AgentRunnerStreamEventType::Planning) == "plan");
-  planned_runner.unregister_event_sink(planned_sink_id);
+  planned_runner.events().unregister_sink(planned_sink_id);
 
   int empty_planning_calls = 0;
   auto empty_static_planner = std::make_shared<agent::StaticPlanner>(
@@ -377,11 +682,17 @@
         return std::nullopt;
       }));
   agent::AgentRunner empty_planning_runner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<StreamingFixtureModel>(),
-      .max_iterations = 1,
-      .planner = empty_static_planner,
+      .model_runtime = {
+          .adapter = std::make_shared<StreamingFixtureModel>(),
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+      .governance = {
+          .planner = empty_static_planner,
+      },
   });
-  auto empty_planning_stream = empty_planning_runner.stream("Planner returns null",
+  auto empty_planning_stream = capture_runner_stream(empty_planning_runner, "Planner returns null",
                                                            "planning-empty-stream-session");
   bool saw_empty_planning_event = false;
   bool saw_empty_planning_status_start = false;
@@ -419,11 +730,17 @@
         };
       }));
   agent::AgentRunner disabled_planning_runner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<StreamingFixtureModel>(),
-      .max_iterations = 1,
-      .planner = disabled_static_planner,
+      .model_runtime = {
+          .adapter = std::make_shared<StreamingFixtureModel>(),
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+      .governance = {
+          .planner = disabled_static_planner,
+      },
   });
-  auto disabled_planning_run = disabled_planning_runner.run(
+  auto disabled_planning_run = disabled_planning_runner.execution().run(
       "Skip planning for run",
       "planning-disabled-run-session",
       agent::ModelSettings{},
@@ -439,13 +756,13 @@
   SMOKE_CHECK(!disabled_planning_run.plan);
   SMOKE_CHECK(disabled_planning_calls == 0);
 
-  auto disabled_planning_stream = disabled_planning_runner.stream(
+  auto disabled_planning_stream = capture_runner_stream(disabled_planning_runner,
       "Skip planning for stream",
       "planning-disabled-stream-session",
       agent::ModelSettings{},
       agent::RunnerRetrievalOptions{},
       agent::RunnerWritebackOptions{},
-      {},
+      std::vector<agent::SkillActivation>{},
       agent::Value::object({}),
       std::nullopt,
       nullptr,
@@ -477,29 +794,35 @@
   });
   auto knowledge_model = std::make_shared<KnowledgeRunnerModel>();
   agent::AgentRunner knowledge_runner(agent::AgentRunnerConfig{
-      .adapter = knowledge_model,
-      .max_iterations = 1,
-      .knowledge_base = runner_knowledge.get(),
-      .knowledge_retrieval_options = agent::RunnerKnowledgeRetrievalOptions{
+      .model_runtime = {
+          .adapter = knowledge_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+      .knowledge_runtime = {
+          .provider = runner_knowledge.get(),
+          .retrieval_options = agent::RunnerKnowledgeRetrievalOptions{
           .enabled = true,
           .top_k = 2,
           .min_score = 0.0,
       },
+      },
   });
   std::vector<std::string> knowledge_events;
-  const auto knowledge_sink_id = knowledge_runner.register_event_sink([&](const agent::FrameworkEvent& event) {
+  const auto knowledge_sink_id = knowledge_runner.events().register_sink([&](const agent::FrameworkEvent& event) {
     if (event.payload.at("source").as_string() == "knowledge-base") {
       knowledge_events.push_back(event.category);
     }
   });
-  auto knowledge_run = knowledge_runner.run("native runner knowledge", "knowledge-runner-session");
+  auto knowledge_run = knowledge_runner.execution().run("native runner knowledge", "knowledge-runner-session");
   SMOKE_CHECK(knowledge_run.text == "knowledge response");
   SMOKE_CHECK(!knowledge_run.knowledge_hits.empty());
   SMOKE_CHECK(knowledge_run.knowledge_hits.front().citation.title == "Runner Knowledge");
   SMOKE_CHECK(knowledge_model->saw_knowledge_context());
   SMOKE_CHECK(contains_string(knowledge_events, "retrieval.started"));
   SMOKE_CHECK(contains_string(knowledge_events, "retrieval.completed"));
-  auto knowledge_stream = knowledge_runner.stream("native runner knowledge", "knowledge-stream-session");
+  auto knowledge_stream = capture_runner_stream(knowledge_runner, "native runner knowledge", "knowledge-stream-session");
   bool saw_knowledge_stream_event = false;
   bool saw_knowledge_status_start = false;
   bool saw_knowledge_status_complete = false;
@@ -519,7 +842,7 @@
   SMOKE_CHECK(saw_knowledge_status_start);
   SMOKE_CHECK(saw_knowledge_status_complete);
   SMOKE_CHECK(!knowledge_stream.result.knowledge_hits.empty());
-  knowledge_runner.unregister_event_sink(knowledge_sink_id);
+  knowledge_runner.events().unregister_sink(knowledge_sink_id);
 
   agent::MediaSource runner_image_query_source;
   runner_image_query_source.kind = agent::MediaSourceKind::Inline;
@@ -547,17 +870,23 @@
   runner_image_query_manager.register_knowledge_base(runner_image_query_kb);
   auto runner_image_query_model = std::make_shared<KnowledgeRunnerModel>();
   agent::AgentRunner runner_image_query_runner(agent::AgentRunnerConfig{
-      .adapter = runner_image_query_model,
-      .max_iterations = 1,
-      .knowledge_base_manager = &runner_image_query_manager,
-      .knowledge_retrieval_options = agent::RunnerKnowledgeRetrievalOptions{
+      .model_runtime = {
+          .adapter = runner_image_query_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+      .knowledge_runtime = {
+          .provider = &runner_image_query_manager,
+          .retrieval_options = agent::RunnerKnowledgeRetrievalOptions{
           .enabled = true,
           .top_k = 1,
           .min_score = 0.0,
       },
+      },
   });
   std::vector<agent::FrameworkEvent> runner_image_query_events;
-  runner_image_query_runner.register_event_sink([&](const agent::FrameworkEvent& event) {
+  runner_image_query_runner.events().register_sink([&](const agent::FrameworkEvent& event) {
     if (event.payload.at("source").as_string() == "knowledge-base-manager") {
       runner_image_query_events.push_back(event);
     }
@@ -569,7 +898,7 @@
       },
       agent::Value::object({{"title", "Runner Knowledge Image Query"},
                             {"textHint", "sunset dashboard orange"}}));
-  auto runner_image_query_result = runner_image_query_runner.run(runner_image_only_input,
+  auto runner_image_query_result = runner_image_query_runner.execution().run(runner_image_only_input,
                                                                  "knowledge-image-query-session");
   SMOKE_CHECK(runner_image_query_result.text == "knowledge response");
   SMOKE_CHECK(!runner_image_query_result.knowledge_hits.empty());
@@ -582,7 +911,7 @@
              "sunset dashboard") != std::string::npos);
 
   StreamingFixtureModel streaming_model;
-  auto stream_events = streaming_model.stream(agent::GenerateParams{
+  auto stream_events = capture_model_stream(streaming_model, agent::GenerateParams{
       .messages = {agent::create_message(agent::MessageRole::User, "stream")},
   });
   SMOKE_CHECK(stream_events.size() == 5);
@@ -611,17 +940,21 @@
     stream_lifecycle_hook_calls.push_back("after-run");
   };
   agent::AgentRunner stream_event_runner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<StreamingFixtureModel>(),
-      .hooks = stream_lifecycle_hooks,
+      .model_runtime = {
+          .adapter = std::make_shared<StreamingFixtureModel>(),
+      },
+      .observability = {
+          .hooks = stream_lifecycle_hooks,
+      },
   });
   std::vector<agent::FrameworkEvent> stream_run_events;
-  const auto stream_event_sink_id = stream_event_runner.register_event_sink([&](const agent::FrameworkEvent& event) {
+  const auto stream_event_sink_id = stream_event_runner.events().register_sink([&](const agent::FrameworkEvent& event) {
     if (event.category.find("run.") == 0) {
       stream_run_events.push_back(event);
     }
   });
-  auto runner_stream = stream_event_runner.stream("runner stream", "runner-stream-session");
-  bool saw_runner_text_delta = false;
+  auto runner_stream = capture_runner_stream(stream_event_runner, "runner stream", "runner-stream-session");
+  bool saw_runner_visible_delta = false;
   bool saw_runner_done = false;
   bool saw_empty_knowledge_event = false;
   bool saw_empty_memory_event = false;
@@ -642,9 +975,8 @@
         event.status.stage == "memory-retrieval") {
       saw_noop_memory_status = true;
     }
-    if (event.type == agent::AgentRunnerStreamEventType::Loop &&
-        event.loop_event.type == agent::AgentLoopStreamEventType::ModelTextDelta) {
-      saw_runner_text_delta = saw_runner_text_delta || event.loop_event.delta == "stream text";
+    if (event.type == agent::AgentRunnerStreamEventType::UserVisibleDelta) {
+      saw_runner_visible_delta = saw_runner_visible_delta || event.delta == "stream text";
     }
     if (event.type == agent::AgentRunnerStreamEventType::Done) {
       saw_runner_done = true;
@@ -655,12 +987,21 @@
   SMOKE_CHECK(saw_empty_memory_event);
   SMOKE_CHECK(!saw_noop_knowledge_status);
   SMOKE_CHECK(!saw_noop_memory_status);
-  SMOKE_CHECK(saw_runner_text_delta);
+  SMOKE_CHECK(saw_runner_visible_delta);
   SMOKE_CHECK(saw_runner_done);
   SMOKE_CHECK(runner_stream.result.text == "stream text");
+  std::uint64_t expected_runner_sequence = 1;
+  for (const auto& event : runner_stream.events) {
+    SMOKE_CHECK(event.schema_version == agent::kAgentStreamEventSchemaVersion);
+    SMOKE_CHECK(event.sequence == expected_runner_sequence++);
+    if (event.type == agent::AgentRunnerStreamEventType::Loop) {
+      SMOKE_CHECK(event.loop_event.schema_version == agent::kAgentStreamEventSchemaVersion);
+      SMOKE_CHECK(event.loop_event.sequence > 0);
+    }
+  }
   SMOKE_CHECK(contains_string(stream_lifecycle_hook_calls, "before-run"));
   SMOKE_CHECK(contains_string(stream_lifecycle_hook_calls, "after-run"));
-  stream_event_runner.unregister_event_sink(stream_event_sink_id);
+  stream_event_runner.events().unregister_sink(stream_event_sink_id);
   SMOKE_CHECK(stream_run_events.size() == 2);
   SMOKE_CHECK(stream_run_events[0].category == "run.started");
   SMOKE_CHECK(stream_run_events[0].target == agent::ExecutionTarget::Run);
@@ -672,9 +1013,75 @@
   SMOKE_CHECK(stream_run_events[1].payload.at("iterationCount").as_integer() == 1);
   SMOKE_CHECK(stream_run_events[1].trace.trace_id == stream_run_events[0].trace.trace_id);
 
+  agent::AgentRunner pull_stream_runner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = std::make_shared<StreamingFixtureModel>(),
+      },
+  });
+  auto pull_stream = pull_stream_runner.streaming().events("pull stream",
+                                                      agent::StreamQueueOptions{.capacity = 1},
+                                                      "runner-pull-stream-session");
+  std::vector<agent::AgentRunnerStreamEvent> pulled_events;
+  agent::AgentRunnerStreamEvent pulled_event;
+  while (pull_stream.next(pulled_event)) {
+    pulled_events.push_back(pulled_event);
+  }
+  SMOKE_CHECK(!pulled_events.empty());
+  SMOKE_CHECK(pulled_events.back().type == agent::AgentRunnerStreamEventType::Done);
+  SMOKE_CHECK(pulled_events.back().result.text == "stream text");
+  std::uint64_t expected_pull_sequence = 1;
+  for (const auto& event : pulled_events) {
+    SMOKE_CHECK(event.schema_version == agent::kAgentStreamEventSchemaVersion);
+    SMOKE_CHECK(event.sequence == expected_pull_sequence++);
+  }
+  {
+    agent::AgentRunner close_stream_runner(agent::AgentRunnerConfig{
+        .model_runtime = {
+            .adapter = std::make_shared<StreamingFixtureModel>(),
+        },
+    });
+    auto close_stream = close_stream_runner.streaming().events("pull stream close race",
+                                                          agent::StreamQueueOptions{.capacity = 1},
+                                                          "runner-pull-stream-close-session");
+    agent::AgentRunnerStreamEvent first_close_event;
+    SMOKE_CHECK(close_stream.next(first_close_event));
+    SMOKE_CHECK(first_close_event.schema_version == agent::kAgentStreamEventSchemaVersion);
+    close_stream.close();
+  }
+  {
+    std::atomic<bool> pull_cancel_started{false};
+    std::atomic<bool> pull_cancel_seen{false};
+    auto pull_cancel_model =
+        std::make_shared<CancellableStreamingModel>(pull_cancel_started, pull_cancel_seen);
+    agent::AgentRunner pull_cancel_runner(agent::AgentRunnerConfig{
+        .model_runtime = {
+            .adapter = pull_cancel_model,
+        },
+        .context_runtime = {
+            .max_iterations = 1,
+        },
+    });
+    {
+      auto pull_cancel_stream = pull_cancel_runner.streaming().events(
+          "pull stream cancel propagation",
+          agent::StreamQueueOptions{.capacity = 16},
+          "runner-pull-stream-cancel-session");
+      agent::AgentRunnerStreamEvent first_cancel_event;
+      SMOKE_CHECK(pull_cancel_stream.next(first_cancel_event));
+      for (int attempt = 0; attempt < 100 && !pull_cancel_started.load(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+      SMOKE_CHECK(pull_cancel_started.load());
+      pull_cancel_stream.cancel("pull iterator cancelled");
+    }
+    SMOKE_CHECK(pull_cancel_seen.load());
+  }
+
   auto multimodal_capture_model = std::make_shared<CapturingMultimodalModel>();
   agent::AgentRunner multimodal_runner(agent::AgentRunnerConfig{
-      .adapter = multimodal_capture_model,
+      .model_runtime = {
+          .adapter = multimodal_capture_model,
+      },
   });
   agent::MediaSource multimodal_image_source;
   multimodal_image_source.kind = agent::MediaSourceKind::Inline;
@@ -685,7 +1092,7 @@
       agent::text_part("describe this image"),
       agent::image_part(multimodal_image_source, "screenshot", "high"),
   };
-  auto multimodal_stream = multimodal_runner.stream(std::move(multimodal_input_parts),
+  auto multimodal_stream = capture_runner_stream(multimodal_runner, std::move(multimodal_input_parts),
                                                     "runner-multimodal-stream-session");
   SMOKE_CHECK(multimodal_stream.result.text == "captured stream");
   SMOKE_CHECK(!multimodal_capture_model->messages().empty());
@@ -711,15 +1118,19 @@
       .prompt = "Use the provided image.",
   });
   agent::AgentRunner multimodal_skill_runner(agent::AgentRunnerConfig{
-      .adapter = multimodal_skill_capture_model,
-      .skills = multimodal_skill_registry,
-      .advertise_skills = false,
+      .model_runtime = {
+          .adapter = multimodal_skill_capture_model,
+      },
+      .context_runtime = {
+          .skills = multimodal_skill_registry,
+          .advertise_skills = false,
+      },
   });
   std::vector<agent::MessageContentPart> multimodal_skill_input_parts{
       agent::text_part("/vision describe this image"),
       agent::image_part(multimodal_image_source, "screenshot", "high"),
   };
-  auto multimodal_skill_stream = multimodal_skill_runner.stream(
+  auto multimodal_skill_stream = capture_runner_stream(multimodal_skill_runner,
       std::move(multimodal_skill_input_parts), "runner-multimodal-skill-session");
   SMOKE_CHECK(multimodal_skill_stream.result.text == "captured stream");
   SMOKE_CHECK(!multimodal_skill_capture_model->messages().empty());
@@ -738,8 +1149,12 @@
     agent_message_hook_inputs.push_back(hook_context.input);
   };
   agent::AgentRunner agent_message_runner(agent::AgentRunnerConfig{
-      .adapter = agent_message_capture_model,
-      .hooks = agent_message_hooks,
+      .model_runtime = {
+          .adapter = agent_message_capture_model,
+      },
+      .observability = {
+          .hooks = agent_message_hooks,
+      },
   });
   auto agent_message_input = agent::create_message(
       agent::MessageRole::Assistant,
@@ -749,7 +1164,7 @@
           agent::image_part(multimodal_image_source, "assistant screenshot", "low"),
       },
       agent::Value::object({{"source", "agent-message-input"}}));
-  auto agent_message_result = agent_message_runner.run(agent_message_input,
+  auto agent_message_result = agent_message_runner.execution().run(agent_message_input,
                                                        "runner-agent-message-session");
   SMOKE_CHECK(agent_message_result.text == "captured");
   SMOKE_CHECK(!agent_message_hook_inputs.empty());
@@ -757,8 +1172,15 @@
   SMOKE_CHECK(agent_message_hook_inputs.front().at("metadata").at("source").as_string() ==
          "agent-message-input");
   SMOKE_CHECK(!agent_message_capture_model->messages().empty());
-  const auto& captured_agent_message = agent_message_capture_model->messages().back();
-  SMOKE_CHECK(captured_agent_message.role == agent::MessageRole::Assistant);
+  const auto captured_agent_message_it = std::find_if(
+      agent_message_capture_model->messages().begin(),
+      agent_message_capture_model->messages().end(),
+      [](const agent::AgentMessage& message) {
+        return message.metadata.at("source").as_string() == "agent-message-input";
+      });
+  SMOKE_CHECK(captured_agent_message_it != agent_message_capture_model->messages().end());
+  const auto& captured_agent_message = *captured_agent_message_it;
+  SMOKE_CHECK(captured_agent_message.role == agent::MessageRole::User);
   SMOKE_CHECK(captured_agent_message.metadata.at("source").as_string() == "agent-message-input");
   SMOKE_CHECK(captured_agent_message.content.size() == 2);
   SMOKE_CHECK(captured_agent_message.content[0].text == "preserve assistant message");
@@ -767,9 +1189,13 @@
 
   auto agent_message_skill_capture_model = std::make_shared<CapturingMultimodalModel>();
   agent::AgentRunner agent_message_skill_runner(agent::AgentRunnerConfig{
-      .adapter = agent_message_skill_capture_model,
-      .skills = multimodal_skill_registry,
-      .advertise_skills = false,
+      .model_runtime = {
+          .adapter = agent_message_skill_capture_model,
+      },
+      .context_runtime = {
+          .skills = multimodal_skill_registry,
+          .advertise_skills = false,
+      },
   });
   auto agent_message_skill_input = agent::create_message(
       agent::MessageRole::User,
@@ -778,7 +1204,7 @@
           agent::image_part(multimodal_image_source, "screenshot", "high"),
       },
       agent::Value::object({{"source", "message-input-skill"}}));
-  auto agent_message_skill_stream = agent_message_skill_runner.stream(
+  auto agent_message_skill_stream = capture_runner_stream(agent_message_skill_runner,
       agent_message_skill_input, "runner-agent-message-skill-session");
   SMOKE_CHECK(agent_message_skill_stream.result.text == "captured stream");
   SMOKE_CHECK(!agent_message_skill_capture_model->messages().empty());
@@ -812,18 +1238,24 @@
   stream_retry_policies.retry[agent::ExecutionTarget::Model] = stream_retry_policy;
   auto flaky_stream_model = std::make_shared<FlakyBeforeStartStreamingModel>();
   agent::AgentRunner flaky_stream_runner(agent::AgentRunnerConfig{
-      .adapter = flaky_stream_model,
-      .max_iterations = 1,
-      .execution_policies = stream_retry_policies,
+      .model_runtime = {
+          .adapter = flaky_stream_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+      .governance = {
+          .execution_policies = stream_retry_policies,
+      },
   });
   std::vector<agent::FrameworkEvent> stream_retry_events;
-  const auto flaky_stream_sink_id = flaky_stream_runner.register_event_sink([&](const agent::FrameworkEvent& event) {
+  const auto flaky_stream_sink_id = flaky_stream_runner.events().register_sink([&](const agent::FrameworkEvent& event) {
     if (event.category == "retry.scheduled") {
       stream_retry_events.push_back(event);
     }
   });
-  auto flaky_stream_result = flaky_stream_runner.stream("retry stream", "runner-flaky-stream-session");
-  flaky_stream_runner.unregister_event_sink(flaky_stream_sink_id);
+  auto flaky_stream_result = capture_runner_stream(flaky_stream_runner, "retry stream", "runner-flaky-stream-session");
+  flaky_stream_runner.events().unregister_sink(flaky_stream_sink_id);
   SMOKE_CHECK(flaky_stream_model->stream_calls() == 2);
   SMOKE_CHECK(flaky_stream_result.result.text == "retried stream");
   SMOKE_CHECK(stream_retry_events.size() == 1);
@@ -841,40 +1273,52 @@
   no_replay_policies.retry[agent::ExecutionTarget::Model] = no_replay_policy;
   auto after_delta_stream_model = std::make_shared<FailingAfterDeltaStreamingModel>();
   agent::AgentRunner after_delta_stream_runner(agent::AgentRunnerConfig{
-      .adapter = after_delta_stream_model,
-      .max_iterations = 1,
-      .execution_policies = no_replay_policies,
+      .model_runtime = {
+          .adapter = after_delta_stream_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+      .governance = {
+          .execution_policies = no_replay_policies,
+      },
   });
   std::vector<agent::FrameworkEvent> no_replay_retry_events;
-  const auto after_delta_sink_id = after_delta_stream_runner.register_event_sink([&](const agent::FrameworkEvent& event) {
+  const auto after_delta_sink_id = after_delta_stream_runner.events().register_sink([&](const agent::FrameworkEvent& event) {
     if (event.category == "retry.scheduled") {
       no_replay_retry_events.push_back(event);
     }
   });
   bool after_delta_stream_threw = false;
   try {
-    (void)after_delta_stream_runner.stream("no replay stream", "runner-after-delta-stream-session");
+    (void)capture_runner_stream(after_delta_stream_runner, "no replay stream", "runner-after-delta-stream-session");
     SMOKE_CHECK(false);
   } catch (const std::runtime_error& error) {
     after_delta_stream_threw = std::string(error.what()).find("stream failed after output") != std::string::npos;
   }
-  after_delta_stream_runner.unregister_event_sink(after_delta_sink_id);
+  after_delta_stream_runner.events().unregister_sink(after_delta_sink_id);
   SMOKE_CHECK(after_delta_stream_threw);
   SMOKE_CHECK(after_delta_stream_model->stream_calls() == 1);
   SMOKE_CHECK(after_delta_stream_model->emitted_delta());
   SMOKE_CHECK(no_replay_retry_events.empty());
 
-  auto tool_stream = agent::AgentRunner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<ToolCallingModel>(),
-      .tools = tools,
-      .max_iterations = 4,
-  }).stream("stream tool", "runner-tool-stream-session");
+  auto tool_stream = capture_runner_stream(agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = std::make_shared<ToolCallingModel>(),
+      },
+      .tool_runtime = {
+          .definitions = tools,
+      },
+      .context_runtime = {
+          .max_iterations = 4,
+      },
+  }), "stream tool", "runner-tool-stream-session");
   bool saw_tool_start = false;
   bool saw_tool_complete = false;
   bool saw_tools_aggregate = false;
   bool saw_tool_status_start = false;
   bool saw_model_status_complete = false;
-  bool saw_final_tool_text_delta = false;
+  bool saw_final_tool_visible_delta = false;
   for (const auto& event : tool_stream.events) {
     if (event.type == agent::AgentRunnerStreamEventType::Status) {
       if (event.status.stage == "tool" && event.status.state == "start") {
@@ -884,17 +1328,18 @@
         saw_model_status_complete = true;
       }
     }
+    if (event.type == agent::AgentRunnerStreamEventType::UserVisibleDelta) {
+      saw_final_tool_visible_delta =
+          saw_final_tool_visible_delta || event.delta.find("tool result") != std::string::npos;
+      continue;
+    }
     if (event.type != agent::AgentRunnerStreamEventType::Loop) {
       continue;
     }
     saw_tool_start = saw_tool_start || event.loop_event.type == agent::AgentLoopStreamEventType::ToolStart;
     saw_tool_complete = saw_tool_complete || event.loop_event.type == agent::AgentLoopStreamEventType::ToolComplete;
-    if (event.loop_event.type == agent::AgentLoopStreamEventType::Tools) {
+    if (event.loop_event.type == agent::AgentLoopStreamEventType::ToolBatchComplete) {
       saw_tools_aggregate = saw_tools_aggregate || event.loop_event.tool_results.size() == 1;
-    }
-    if (event.loop_event.type == agent::AgentLoopStreamEventType::ModelTextDelta) {
-      saw_final_tool_text_delta =
-          saw_final_tool_text_delta || event.loop_event.delta.find("tool result") != std::string::npos;
     }
   }
   SMOKE_CHECK(saw_tool_start);
@@ -902,8 +1347,579 @@
   SMOKE_CHECK(saw_tools_aggregate);
   SMOKE_CHECK(saw_tool_status_start);
   SMOKE_CHECK(saw_model_status_complete);
-  SMOKE_CHECK(saw_final_tool_text_delta);
+  SMOKE_CHECK(saw_final_tool_visible_delta);
   SMOKE_CHECK(tool_stream.result.text.find("tool result") != std::string::npos);
+
+  auto native_tool_model = std::make_shared<NativeToolCallingRunnerModel>();
+  auto native_tool_stream = capture_runner_stream(agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = native_tool_model,
+      },
+      .tool_runtime = {
+          .definitions = tools,
+          .calling_strategy = agent::AgentToolCallingStrategy::NativeToolCalling,
+      },
+      .context_runtime = {
+          .max_iterations = 4,
+      },
+  }), "native stream tool", "runner-native-tool-stream-session");
+  bool saw_native_tool_start = false;
+  bool saw_native_tool_complete = false;
+  bool saw_native_react_action = false;
+  std::string native_visible_text;
+  for (const auto& event : native_tool_stream.events) {
+    if (event.type == agent::AgentRunnerStreamEventType::UserVisibleDelta) {
+      native_visible_text += event.delta;
+      continue;
+    }
+    if (event.type != agent::AgentRunnerStreamEventType::Loop) {
+      continue;
+    }
+    saw_native_tool_start =
+        saw_native_tool_start || event.loop_event.type == agent::AgentLoopStreamEventType::ToolStart;
+    saw_native_tool_complete =
+        saw_native_tool_complete || event.loop_event.type == agent::AgentLoopStreamEventType::ToolComplete;
+    saw_native_react_action =
+        saw_native_react_action || event.loop_event.type == agent::AgentLoopStreamEventType::ReActActionBatch;
+  }
+  SMOKE_CHECK(native_tool_model->generate_calls() == 2);
+  SMOKE_CHECK(native_tool_model->saw_native_tool_descriptors());
+  SMOKE_CHECK(saw_native_tool_start);
+  SMOKE_CHECK(saw_native_tool_complete);
+  SMOKE_CHECK(!saw_native_react_action);
+  SMOKE_CHECK(native_tool_stream.result.text.find("native tool result") != std::string::npos);
+  SMOKE_CHECK(native_visible_text == native_tool_stream.result.text);
+
+  {
+    const auto final_gate_target =
+        std::filesystem::temp_directory_path() / "agent_native_smoke_final_gate.txt";
+    std::filesystem::remove(final_gate_target);
+    class FinalGateFixtureModel final : public agent::ChatModelAdapter {
+     public:
+      explicit FinalGateFixtureModel(std::filesystem::path path)
+          : ChatModelAdapter("fixture", "final-gate", 0.0, 256, {"input.text"}),
+            path_(std::move(path)) {}
+
+      agent::AgentOutput generate(const agent::GenerateParams& params) override {
+        ++calls_;
+        for (auto message = params.messages.rbegin(); message != params.messages.rend(); ++message) {
+          const auto text = agent::extract_text_content(message->content);
+          if (message->metadata.at("observation").as_bool(false) &&
+              text.find("fs.writeText") != std::string::npos) {
+            return build_output(agent::AgentOutput{
+                .text = "Thought: the write completed.\nFinal Answer: file created",
+            });
+          }
+          if (message->metadata.at("finalRejected").as_bool(false)) {
+            saw_rejection_observation_ = text.find("Final Answer rejected") != std::string::npos;
+            return build_output(agent::AgentOutput{
+                .text = "Thought: complete the requested write.\nActions:\n[" +
+                        agent::safe_json_stringify(agent::Value::object({
+                            {"tool", "fs.writeText"},
+                            {"input", agent::Value::object({
+                                {"path", path_.string()},
+                                {"content", "created by gate"},
+                            })},
+                        })) + "]",
+            });
+          }
+        }
+        return build_output(agent::AgentOutput{
+            .text = "Thought: answer too early.\nFinal Answer: I will create the file now.",
+        });
+      }
+
+      [[nodiscard]] int calls() const noexcept { return calls_; }
+      [[nodiscard]] bool saw_rejection_observation() const noexcept {
+        return saw_rejection_observation_;
+      }
+
+     private:
+      std::filesystem::path path_;
+      int calls_ = 0;
+      bool saw_rejection_observation_ = false;
+    };
+
+    auto final_gate_model = std::make_shared<FinalGateFixtureModel>(final_gate_target);
+    bool saw_final_rejected_loop_event = false;
+    bool saw_final_rejected_status = false;
+    bool saw_final_rejected_bus_event = false;
+    std::string final_gate_visible_text;
+    auto final_gate_tool = agent::define_tool(agent::ToolDefinition{
+        .name = "fs.writeText",
+        .description = "Write text to a file.",
+        .input_schema = agent::JsonSchema{
+            .type = agent::JsonSchemaType::Object,
+            .properties = {{"path", agent::JsonSchema{.type = agent::JsonSchemaType::String}},
+                           {"content", agent::JsonSchema{.type = agent::JsonSchemaType::String}}},
+            .required = {"path", "content"},
+        },
+        .mutates_files = true,
+        .side_effect_level = "filesystem-write",
+        .execute = [](const agent::Value& input, agent::ToolExecutionContext&) -> agent::ToolInvokeResult {
+          std::ofstream out(input.at("path").as_string());
+          out << input.at("content").as_string();
+          return agent::Value::object({{"path", input.at("path").as_string()}, {"written", true}});
+        },
+    });
+    agent::AgentRunner final_gate_runner(agent::AgentRunnerConfig{
+        .model_runtime = {
+            .adapter = final_gate_model,
+        },
+        .tool_runtime = {
+            .definitions = std::vector<agent::ToolDefinition>{final_gate_tool},
+        },
+        .context_runtime = {
+            .max_iterations = 4,
+        },
+    });
+    const auto final_gate_sink_id = final_gate_runner.events().register_sink(
+        [&](const agent::FrameworkEvent& event) {
+          if (event.category == "react.final_rejected") {
+            saw_final_rejected_bus_event = true;
+            SMOKE_CHECK(event.payload.at("reason").as_string().find("requested work") != std::string::npos);
+          }
+        });
+    auto final_gate_stream = final_gate_runner.streaming().stream(
+        "Create the requested file",
+        [&](const agent::AgentRunnerStreamEvent& event) {
+          if (event.type == agent::AgentRunnerStreamEventType::UserVisibleDelta) {
+            final_gate_visible_text += event.delta;
+          }
+          if (event.type == agent::AgentRunnerStreamEventType::Loop &&
+              event.loop_event.type == agent::AgentLoopStreamEventType::ReActFinalRejected) {
+            saw_final_rejected_loop_event = true;
+            SMOKE_CHECK(event.loop_event.react_step.type == agent::ReActStepType::FinalRejected);
+          }
+          if (event.type == agent::AgentRunnerStreamEventType::Status &&
+              event.status.stage == "react" &&
+              event.status.state == "final-rejected") {
+            saw_final_rejected_status = true;
+          }
+        },
+        "runner-final-gate-session");
+    final_gate_runner.events().unregister_sink(final_gate_sink_id);
+    SMOKE_CHECK(final_gate_stream.result.text == "file created");
+    SMOKE_CHECK(final_gate_model->calls() == 3);
+    SMOKE_CHECK(final_gate_model->saw_rejection_observation());
+    SMOKE_CHECK(saw_final_rejected_loop_event);
+    SMOKE_CHECK(saw_final_rejected_status);
+    SMOKE_CHECK(saw_final_rejected_bus_event);
+    SMOKE_CHECK(final_gate_visible_text.find("I will create the file now.") == std::string::npos);
+    SMOKE_CHECK(final_gate_visible_text.find("file created") != std::string::npos);
+    SMOKE_CHECK(final_gate_stream.result.react_trace.size() == 3);
+    SMOKE_CHECK(final_gate_stream.result.react_trace.front().type == agent::ReActStepType::FinalRejected);
+    SMOKE_CHECK(std::filesystem::exists(final_gate_target));
+    std::filesystem::remove(final_gate_target);
+  }
+
+  auto react_status_model = std::make_shared<SequentialTextModel>(std::vector<std::string>{
+      "Thought: inspect the expression.\nActions:\n"
+      "[{\"tool\":\"math.eval\",\"input\":{\"expression\":\"2+3\"}}]",
+      "Thought: the observation has the answer.\nFinal Answer: 5",
+  });
+  auto react_status_stream = capture_runner_stream(agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = react_status_model,
+      },
+      .tool_runtime = {
+          .definitions = tools,
+      },
+      .context_runtime = {
+          .max_iterations = 3,
+      },
+  }), "react status", "runner-react-status-session");
+  bool saw_react_action_status = false;
+  bool saw_react_observation_status = false;
+  bool saw_react_final_status = false;
+  for (const auto& event : react_status_stream.events) {
+    if (event.type != agent::AgentRunnerStreamEventType::Status) {
+      continue;
+    }
+    if (event.status.stage != "react") {
+      continue;
+    }
+    saw_react_action_status =
+        saw_react_action_status || event.status.state == "action-batch";
+    saw_react_observation_status = saw_react_observation_status || event.status.state == "observation";
+    saw_react_final_status = saw_react_final_status || event.status.state == "final";
+  }
+  SMOKE_CHECK(saw_react_action_status);
+  SMOKE_CHECK(saw_react_observation_status);
+  SMOKE_CHECK(saw_react_final_status);
+  SMOKE_CHECK(react_status_stream.result.text == "5");
+  SMOKE_CHECK(react_status_stream.result.react_trace.size() == 2);
+
+  agent::ToolRegistry plain_parser_registry(tools);
+  const auto strict_plain_parse =
+      agent::DefaultReActParser{}.parse(StreamingPlainFinalModel::plain_answer(),
+                                        plain_parser_registry, 0);
+  SMOKE_CHECK(!strict_plain_parse.ok);
+
+  auto react_final_stream_model = std::make_shared<StreamingReActFinalModel>();
+  auto react_final_stream = capture_runner_stream(agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = react_final_stream_model,
+      },
+      .tool_runtime = {
+          .definitions = tools,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+  }), "react final stream", "runner-react-final-stream-session");
+  std::string visible_react_delta_text;
+  bool saw_react_final_model_response = false;
+  bool saw_react_final_event = false;
+  std::size_t first_react_delta_index = react_final_stream.events.size();
+  std::size_t react_model_response_index = react_final_stream.events.size();
+  std::size_t react_final_event_index = react_final_stream.events.size();
+  for (std::size_t index = 0; index < react_final_stream.events.size(); ++index) {
+    const auto& event = react_final_stream.events[index];
+    if (event.type == agent::AgentRunnerStreamEventType::UserVisibleDelta) {
+      if (first_react_delta_index == react_final_stream.events.size()) {
+        first_react_delta_index = index;
+      }
+      SMOKE_CHECK(event.delta.find("Thought") == std::string::npos);
+      SMOKE_CHECK(event.delta.find("hidden") == std::string::npos);
+      SMOKE_CHECK(event.delta.find("Final Answer") == std::string::npos);
+      visible_react_delta_text += event.delta;
+      continue;
+    }
+    if (event.type != agent::AgentRunnerStreamEventType::Loop) {
+      continue;
+    }
+    if (event.loop_event.type == agent::AgentLoopStreamEventType::AgentOutput) {
+      saw_react_final_model_response = true;
+      react_model_response_index = index;
+      SMOKE_CHECK(event.loop_event.response.text == "实时答案");
+    }
+    if (event.loop_event.type == agent::AgentLoopStreamEventType::ReActFinal) {
+      saw_react_final_event = true;
+      react_final_event_index = index;
+    }
+  }
+  SMOKE_CHECK(react_final_stream_model->stream_calls() == 1);
+  SMOKE_CHECK(react_final_stream_model->generate_calls() == 0);
+  SMOKE_CHECK(visible_react_delta_text == "实时答案");
+  SMOKE_CHECK(react_final_stream.result.text == "实时答案");
+  SMOKE_CHECK(saw_react_final_model_response);
+  SMOKE_CHECK(saw_react_final_event);
+  SMOKE_CHECK(react_model_response_index < first_react_delta_index);
+  SMOKE_CHECK(first_react_delta_index < react_final_event_index);
+
+  auto react_reasoning_stream_model = std::make_shared<StreamingReActReasoningModel>();
+  bool react_reasoning_stream_returned = false;
+  bool saw_react_reasoning_before_return = false;
+  std::string react_reasoning_delta_text;
+  auto react_reasoning_stream = agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = react_reasoning_stream_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+  }).streaming().stream("react reasoning stream",
+            [&](const agent::AgentRunnerStreamEvent& event) {
+              if (event.type == agent::AgentRunnerStreamEventType::Loop &&
+                  event.loop_event.type == agent::AgentLoopStreamEventType::ModelReasoningDelta) {
+                saw_react_reasoning_before_return = saw_react_reasoning_before_return || !react_reasoning_stream_returned;
+                react_reasoning_delta_text += event.loop_event.delta;
+                SMOKE_CHECK(event.loop_event.reasoning == react_reasoning_delta_text);
+              }
+            },
+            "runner-react-reasoning-stream-session");
+  react_reasoning_stream_returned = true;
+  SMOKE_CHECK(react_reasoning_stream_model->stream_calls() == 1);
+  SMOKE_CHECK(react_reasoning_stream_model->generate_calls() == 0);
+  SMOKE_CHECK(saw_react_reasoning_before_return);
+  SMOKE_CHECK(react_reasoning_delta_text == "reasoning plan");
+  SMOKE_CHECK(react_reasoning_stream.result.text == "reasoning visible");
+
+  {
+    auto leak_model = std::make_shared<ReActReasoningProtocolLeakRecoveryModel>();
+    bool saw_protocol_leak_loop_event = false;
+    bool saw_protocol_leak_status = false;
+    bool saw_protocol_leak_bus_event = false;
+    agent::AgentRunner leak_runner(agent::AgentRunnerConfig{
+        .model_runtime = {
+            .adapter = leak_model,
+        },
+        .context_runtime = {
+            .max_iterations = 3,
+        },
+    });
+    const auto leak_sink_id = leak_runner.events().register_sink(
+        [&](const agent::FrameworkEvent& event) {
+          if (event.category == "react.reasoning_protocol_leak") {
+            saw_protocol_leak_bus_event = true;
+            SMOKE_CHECK(event.payload.at("error").as_string().find(
+                            "ReAct protocol was emitted in reasoning channel") != std::string::npos);
+          }
+        });
+    auto leak_stream = leak_runner.streaming().stream(
+        "reasoning protocol leak recovery",
+        [&](const agent::AgentRunnerStreamEvent& event) {
+          if (event.type == agent::AgentRunnerStreamEventType::Loop &&
+              event.loop_event.type == agent::AgentLoopStreamEventType::ReActReasoningProtocolLeak) {
+            saw_protocol_leak_loop_event = true;
+            SMOKE_CHECK(event.loop_event.react_step.type == agent::ReActStepType::ReasoningProtocolLeak);
+          }
+          if (event.type == agent::AgentRunnerStreamEventType::Status &&
+              event.status.stage == "react" &&
+              event.status.state == "reasoning-protocol-leak") {
+            saw_protocol_leak_status = true;
+          }
+        },
+        "runner-react-reasoning-protocol-leak-session");
+    leak_runner.events().unregister_sink(leak_sink_id);
+    SMOKE_CHECK(leak_stream.result.text == "content answer");
+    SMOKE_CHECK(leak_model->generate_calls() == 2);
+    SMOKE_CHECK(leak_model->saw_protocol_leak_observation());
+    SMOKE_CHECK(saw_protocol_leak_loop_event);
+    SMOKE_CHECK(saw_protocol_leak_status);
+    SMOKE_CHECK(saw_protocol_leak_bus_event);
+    SMOKE_CHECK(leak_stream.result.react_trace.size() == 2);
+    SMOKE_CHECK(leak_stream.result.react_trace.front().type == agent::ReActStepType::ReasoningProtocolLeak);
+    SMOKE_CHECK(leak_stream.result.react_trace.back().type == agent::ReActStepType::Final);
+  }
+
+  {
+    auto leak_repeat_model = std::make_shared<ReActReasoningProtocolLeakRepeatModel>();
+    bool saw_protocol_error = false;
+    try {
+      agent::AgentRunner(agent::AgentRunnerConfig{
+          .model_runtime = {
+              .adapter = leak_repeat_model,
+          },
+          .context_runtime = {
+              .max_iterations = 3,
+          },
+      }).execution().run("reasoning protocol leak repeat", "runner-react-reasoning-protocol-leak-repeat-session");
+    } catch (const std::exception& error) {
+      saw_protocol_error =
+          std::string(error.what()).find("provider emitted ReAct protocol in reasoning channel") != std::string::npos;
+    }
+    SMOKE_CHECK(saw_protocol_error);
+    SMOKE_CHECK(leak_repeat_model->generate_calls() == 2);
+  }
+
+  auto react_utf8_boundary_model = std::make_shared<StreamingReActUtf8BoundaryModel>();
+  auto react_utf8_boundary_stream = capture_runner_stream(agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = react_utf8_boundary_model,
+      },
+      .tool_runtime = {
+          .definitions = tools,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+  }), "react utf8 boundary stream", "runner-react-utf8-boundary-stream-session");
+  const auto react_utf8_expected = utf8_stream_acceptance_text();
+  const std::string replacement{
+      static_cast<char>(0xEF), static_cast<char>(0xBF), static_cast<char>(0xBD)};
+  std::string react_utf8_delta_text;
+  std::string react_utf8_previous_visible;
+  std::size_t react_utf8_delta_count = 0;
+  bool saw_react_utf8_model_response = false;
+  for (const auto& event : react_utf8_boundary_stream.events) {
+    if (event.type == agent::AgentRunnerStreamEventType::UserVisibleDelta) {
+      ++react_utf8_delta_count;
+      SMOKE_CHECK(event.delta.find(replacement) == std::string::npos);
+      SMOKE_CHECK(event.text.find(replacement) == std::string::npos);
+      SMOKE_CHECK(event.delta.find("Thought") == std::string::npos);
+      SMOKE_CHECK(event.delta.find("Action") == std::string::npos);
+      SMOKE_CHECK(event.delta.find("Final Answer") == std::string::npos);
+      SMOKE_CHECK(event.text.size() >= react_utf8_previous_visible.size());
+      SMOKE_CHECK(event.text.compare(0,
+                                     react_utf8_previous_visible.size(),
+                                     react_utf8_previous_visible) == 0);
+      SMOKE_CHECK(event.delta == event.text.substr(react_utf8_previous_visible.size()));
+      react_utf8_previous_visible = event.text;
+      react_utf8_delta_text += event.delta;
+      continue;
+    }
+    if (event.type != agent::AgentRunnerStreamEventType::Loop) {
+      continue;
+    }
+    if (event.loop_event.type == agent::AgentLoopStreamEventType::AgentOutput) {
+      saw_react_utf8_model_response = true;
+      SMOKE_CHECK(event.loop_event.response.text == react_utf8_expected);
+    }
+  }
+  SMOKE_CHECK(react_utf8_boundary_model->stream_calls() == 1);
+  SMOKE_CHECK(react_utf8_boundary_model->generate_calls() == 0);
+  SMOKE_CHECK(react_utf8_delta_count >= 1);
+  SMOKE_CHECK(react_utf8_delta_text == react_utf8_expected);
+  SMOKE_CHECK(react_utf8_previous_visible == react_utf8_expected);
+  SMOKE_CHECK(react_utf8_boundary_stream.result.text == react_utf8_expected);
+  SMOKE_CHECK(saw_react_utf8_model_response);
+
+  int streaming_react_tool_calls = 0;
+  std::vector<int> tool_counts_during_action_stream;
+  auto streaming_react_math_tool = agent::define_tool(agent::ToolDefinition{
+      .name = "math.eval",
+      .description = "Evaluate a simple arithmetic expression.",
+      .input_schema = agent::JsonSchema{
+          .type = agent::JsonSchemaType::Object,
+          .properties = {{"expression", agent::JsonSchema{.type = agent::JsonSchemaType::String}}},
+          .required = {"expression"},
+      },
+      .execute = [&](const agent::Value& input, agent::ToolExecutionContext&) -> agent::ToolInvokeResult {
+        ++streaming_react_tool_calls;
+        SMOKE_CHECK(input.at("expression").as_string() == "2+2");
+        return agent::Value("4");
+      },
+  });
+  auto react_action_stream_model = std::make_shared<StreamingReActActionModel>(
+      [&]() { return streaming_react_tool_calls; }, &tool_counts_during_action_stream);
+  auto react_action_stream = capture_runner_stream(agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = react_action_stream_model,
+      },
+      .tool_runtime = {
+          .definitions = std::vector<agent::ToolDefinition>{streaming_react_math_tool},
+      },
+      .context_runtime = {
+          .max_iterations = 3,
+      },
+  }), "react action stream", "runner-react-action-stream-session");
+  std::string visible_react_action_delta_text;
+  bool saw_streamed_react_action = false;
+  bool saw_streamed_react_tool_complete = false;
+  std::size_t streamed_react_tool_complete_index = react_action_stream.events.size();
+  std::size_t streamed_react_first_delta_index = react_action_stream.events.size();
+  for (std::size_t index = 0; index < react_action_stream.events.size(); ++index) {
+    const auto& event = react_action_stream.events[index];
+    if (event.type == agent::AgentRunnerStreamEventType::UserVisibleDelta) {
+      if (streamed_react_first_delta_index == react_action_stream.events.size()) {
+        streamed_react_first_delta_index = index;
+      }
+      SMOKE_CHECK(event.delta.find("Thought") == std::string::npos);
+      SMOKE_CHECK(event.delta.find("Action") == std::string::npos);
+      visible_react_action_delta_text += event.delta;
+      continue;
+    }
+    if (event.type != agent::AgentRunnerStreamEventType::Loop) {
+      continue;
+    }
+    if (event.loop_event.type == agent::AgentLoopStreamEventType::ReActActionBatch) {
+      saw_streamed_react_action = true;
+      SMOKE_CHECK(event.loop_event.tool_calls.size() == 1);
+      SMOKE_CHECK(event.loop_event.tool_calls.front().name == "math.eval");
+    }
+    if (event.loop_event.type == agent::AgentLoopStreamEventType::ToolComplete) {
+      saw_streamed_react_tool_complete = true;
+      streamed_react_tool_complete_index = index;
+      SMOKE_CHECK(event.loop_event.tool_result.ok);
+    }
+  }
+  SMOKE_CHECK(!tool_counts_during_action_stream.empty());
+  SMOKE_CHECK(std::all_of(tool_counts_during_action_stream.begin(), tool_counts_during_action_stream.end(),
+                     [](int count) { return count == 0; }));
+  SMOKE_CHECK(streaming_react_tool_calls == 1);
+  SMOKE_CHECK(react_action_stream_model->stream_calls() == 2);
+  SMOKE_CHECK(saw_streamed_react_action);
+  SMOKE_CHECK(saw_streamed_react_tool_complete);
+  SMOKE_CHECK(streamed_react_tool_complete_index < streamed_react_first_delta_index);
+  SMOKE_CHECK(visible_react_action_delta_text == "4");
+  SMOKE_CHECK(react_action_stream.result.text == "4");
+
+  auto visible_react_stream_model = std::make_shared<StreamingReActVisibleActionModel>();
+  auto visible_react_tool = agent::define_tool(agent::ToolDefinition{
+      .name = "math.eval",
+      .description = "Evaluate a simple arithmetic expression.",
+      .input_schema = agent::JsonSchema{
+          .type = agent::JsonSchemaType::Object,
+          .properties = {{"expression", agent::JsonSchema{.type = agent::JsonSchemaType::String}}},
+          .required = {"expression"},
+      },
+      .execute = [](const agent::Value& input, agent::ToolExecutionContext&) -> agent::ToolInvokeResult {
+        SMOKE_CHECK(input.at("expression").as_string() == "2+2");
+        return agent::Value("4");
+      },
+  });
+  std::vector<agent::FrameworkEvent> visible_react_events;
+  auto visible_react_runner = agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = visible_react_stream_model,
+      },
+      .tool_runtime = {
+          .definitions = std::vector<agent::ToolDefinition>{visible_react_tool},
+      },
+      .context_runtime = {
+          .max_iterations = 3,
+      },
+      .react_runtime = {
+          .persist_visible_messages = true,
+      },
+  });
+  const auto visible_react_sink_id = visible_react_runner.events().register_sink(
+      [&](const agent::FrameworkEvent& event) { visible_react_events.push_back(event); });
+  auto visible_react_stream =
+      capture_runner_stream(visible_react_runner, "react visible message stream", "runner-react-visible-stream-session");
+  visible_react_runner.events().unregister_sink(visible_react_sink_id);
+  std::string pre_action_visible_text;
+  std::string final_visible_text;
+  bool saw_visible_react_message_event = false;
+  bool saw_visible_react_action = false;
+  std::size_t first_visible_delta_index = visible_react_stream.events.size();
+  std::size_t visible_react_message_index = visible_react_stream.events.size();
+  std::size_t visible_react_action_index = visible_react_stream.events.size();
+  for (std::size_t index = 0; index < visible_react_stream.events.size(); ++index) {
+    const auto& event = visible_react_stream.events[index];
+    if (event.type == agent::AgentRunnerStreamEventType::UserVisibleDelta) {
+      if (first_visible_delta_index == visible_react_stream.events.size()) {
+        first_visible_delta_index = index;
+      }
+      if (!saw_visible_react_action) {
+        pre_action_visible_text += event.delta;
+      } else {
+        final_visible_text += event.delta;
+      }
+      SMOKE_CHECK(event.delta.find("Thought") == std::string::npos);
+      SMOKE_CHECK(event.delta.find("Action") == std::string::npos);
+      SMOKE_CHECK(event.delta.find("Final Answer") == std::string::npos);
+      continue;
+    }
+    if (event.type != agent::AgentRunnerStreamEventType::Loop) {
+      continue;
+    }
+    if (event.loop_event.type == agent::AgentLoopStreamEventType::ReActMessage) {
+      saw_visible_react_message_event = true;
+      visible_react_message_index = index;
+      SMOKE_CHECK(event.loop_event.react_step.visible_message == "Let me check that for you.");
+    }
+    if (event.loop_event.type == agent::AgentLoopStreamEventType::ReActActionBatch) {
+      saw_visible_react_action = true;
+      visible_react_action_index = index;
+      SMOKE_CHECK(event.loop_event.tool_calls.size() == 1);
+      SMOKE_CHECK(event.loop_event.tool_calls.front().name == "math.eval");
+    }
+  }
+  SMOKE_CHECK(visible_react_stream_model->stream_calls() == 2);
+  SMOKE_CHECK(saw_visible_react_message_event);
+  SMOKE_CHECK(saw_visible_react_action);
+  SMOKE_CHECK(first_visible_delta_index < visible_react_message_index);
+  SMOKE_CHECK(visible_react_message_index < visible_react_action_index);
+  SMOKE_CHECK(pre_action_visible_text.find("Let me check that for you.") != std::string::npos);
+  SMOKE_CHECK(final_visible_text == "4");
+  SMOKE_CHECK(visible_react_stream.result.text == "4");
+  SMOKE_CHECK(std::any_of(
+      visible_react_events.begin(), visible_react_events.end(),
+      [](const agent::FrameworkEvent& event) {
+        return event.category == "react.message"
+               && event.payload.at("message").as_string() == "Let me check that for you.";
+      }));
+  const auto visible_session_messages =
+      visible_react_runner.sessions().get("runner-react-visible-stream-session")->get_messages();
+  SMOKE_CHECK(std::any_of(
+      visible_session_messages.begin(), visible_session_messages.end(),
+      [](const agent::AgentMessage& message) {
+        return message.role == agent::MessageRole::Assistant
+               && agent::extract_text_content(message.content) == "Let me check that for you.";
+      }));
 
   auto throwing_tool_model = std::make_shared<ThrowingToolRecoveryModel>();
   auto throwing_tool = agent::define_tool(agent::ToolDefinition{
@@ -913,11 +1929,17 @@
         throw std::runtime_error("boom");
       },
   });
-  auto throwing_tool_stream = agent::AgentRunner(agent::AgentRunnerConfig{
-      .adapter = throwing_tool_model,
-      .tools = {throwing_tool},
-      .max_iterations = 3,
-  }).stream("stream tool failure", "runner-tool-failure-stream-session");
+  auto throwing_tool_stream = capture_runner_stream(agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = throwing_tool_model,
+      },
+      .tool_runtime = {
+          .definitions = std::vector<agent::ToolDefinition>{throwing_tool},
+      },
+      .context_runtime = {
+          .max_iterations = 3,
+      },
+  }), "stream tool failure", "runner-tool-failure-stream-session");
   std::vector<agent::ToolExecutionResult> failed_tool_stream_results;
   std::vector<agent::ToolExecutionResult> failed_tool_aggregate_results;
   bool saw_tool_failure_done = false;
@@ -927,7 +1949,7 @@
       failed_tool_stream_results.push_back(event.loop_event.tool_result);
     }
     if (event.type == agent::AgentRunnerStreamEventType::Loop &&
-        event.loop_event.type == agent::AgentLoopStreamEventType::Tools) {
+        event.loop_event.type == agent::AgentLoopStreamEventType::ToolBatchComplete) {
       failed_tool_aggregate_results = event.loop_event.tool_results;
     }
     if (event.type == agent::AgentRunnerStreamEventType::Done) {
@@ -959,15 +1981,23 @@
   executor_failure_hooks.before_permission_check = [](const agent::PermissionHookContext&) {
     throw std::runtime_error("permission hook crashed");
   };
-  auto executor_failure_stream = agent::AgentRunner(agent::AgentRunnerConfig{
-      .adapter = executor_failure_model,
-      .tools = {permission_gated_tool},
-      .max_iterations = 3,
-      .hooks = executor_failure_hooks,
-      .permission_policy = [](const agent::PermissionRequest&) {
+  auto executor_failure_stream = capture_runner_stream(agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = executor_failure_model,
+      },
+      .tool_runtime = {
+          .definitions = std::vector<agent::ToolDefinition>{permission_gated_tool},
+          .permission_policy = [](const agent::PermissionRequest&) {
         return agent::PermissionDecision{agent::PermissionDecisionKind::Allow, {}};
       },
-  }).stream("stream executor failure", "runner-executor-failure-stream-session");
+      },
+      .context_runtime = {
+          .max_iterations = 3,
+      },
+      .observability = {
+          .hooks = executor_failure_hooks,
+      },
+  }), "stream executor failure", "runner-executor-failure-stream-session");
   std::vector<agent::ToolExecutionResult> synthetic_tool_stream_results;
   for (const auto& event : executor_failure_stream.events) {
     if (event.type == agent::AgentRunnerStreamEventType::Loop &&
@@ -984,10 +2014,14 @@
   SMOKE_CHECK(executor_failure_model->generate_calls() == 2);
   SMOKE_CHECK(executor_failure_model->saw_synthetic_tool_message());
 
-  auto incomplete_stream = agent::AgentRunner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<IncompleteFinishStreamingModel>(),
-      .max_iterations = 1,
-  }).stream("long stream", "runner-incomplete-stream-session");
+  auto incomplete_stream = capture_runner_stream(agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = std::make_shared<IncompleteFinishStreamingModel>(),
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+  }), "long stream", "runner-incomplete-stream-session");
   bool saw_incomplete_done = false;
   for (const auto& event : incomplete_stream.events) {
     if (event.type == agent::AgentRunnerStreamEventType::Done) {
@@ -1008,11 +2042,17 @@
         return agent::Value("ok");
       },
   });
-  auto max_iteration_stream = agent::AgentRunner(agent::AgentRunnerConfig{
-      .adapter = counting_tool_loop_model,
-      .tools = {noop_tool},
-      .max_iterations = 3,
-  }).stream("loop forever", "runner-max-iteration-stream-session");
+  auto max_iteration_stream = capture_runner_stream(agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = counting_tool_loop_model,
+      },
+      .tool_runtime = {
+          .definitions = std::vector<agent::ToolDefinition>{noop_tool},
+      },
+      .context_runtime = {
+          .max_iterations = 3,
+      },
+  }), "loop forever", "runner-max-iteration-stream-session");
   bool saw_max_iteration_done = false;
   for (const auto& event : max_iteration_stream.events) {
     if (event.type == agent::AgentRunnerStreamEventType::Done) {
@@ -1024,7 +2064,9 @@
   SMOKE_CHECK(saw_max_iteration_done);
   SMOKE_CHECK(max_iteration_stream.result.termination_reason == agent::AgentLoopTerminationReason::MaxIterations);
   SMOKE_CHECK(max_iteration_stream.result.iteration_count == 3);
-  SMOKE_CHECK(max_iteration_stream.result.text == "progress 3");
+  SMOKE_CHECK(max_iteration_stream.result.react_trace.size() == 3);
+  SMOKE_CHECK(max_iteration_stream.result.react_trace.back().actions.size() == 1);
+  SMOKE_CHECK(max_iteration_stream.result.react_trace.back().actions.front().tool == "noop");
   SMOKE_CHECK(counting_tool_loop_model->generate_calls() == 3);
 
   std::vector<std::string> crashing_stream_hook_calls;
@@ -1041,37 +2083,48 @@
     crashing_stream_hook_calls.push_back("on-run-error");
   };
   agent::AgentRunner crashing_stream_runner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<CrashingStreamModel>(),
-      .max_iterations = 1,
-      .hooks = crashing_stream_hooks,
+      .model_runtime = {
+          .adapter = std::make_shared<CrashingStreamModel>(),
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+      .observability = {
+          .hooks = crashing_stream_hooks,
+      },
   });
   std::vector<agent::FrameworkEvent> crashing_stream_events;
-  const auto crashing_stream_sink_id = crashing_stream_runner.register_event_sink(
+  const auto crashing_stream_sink_id = crashing_stream_runner.events().register_sink(
       [&](const agent::FrameworkEvent& event) {
         if (event.category == "model.failed" || event.category == "run.failed") {
           crashing_stream_events.push_back(event);
         }
       });
   bool crashing_stream_threw = false;
+  std::vector<agent::AgentRunnerStreamEvent> crashing_stream_callback_events;
   try {
-    (void)crashing_stream_runner.stream("crash stream", "runner-crashing-stream-session");
+    (void)crashing_stream_runner.streaming().stream(
+        "crash stream",
+        [&](const agent::AgentRunnerStreamEvent& event) {
+          crashing_stream_callback_events.push_back(event);
+        },
+        "runner-crashing-stream-session");
     SMOKE_CHECK(false);
   } catch (const std::runtime_error& error) {
     crashing_stream_threw = std::string(error.what()).find("model adapter crashed mid-stream") != std::string::npos;
   }
-  crashing_stream_runner.unregister_event_sink(crashing_stream_sink_id);
+  crashing_stream_runner.events().unregister_sink(crashing_stream_sink_id);
   SMOKE_CHECK(crashing_stream_threw);
   SMOKE_CHECK(contains_string(crashing_stream_hook_calls, "before-run"));
   SMOKE_CHECK(contains_string(crashing_stream_hook_calls, "on-run-error"));
-  const auto crashing_stream_snapshot = crashing_stream_runner.last_stream_events();
-  SMOKE_CHECK(std::find_if(crashing_stream_snapshot.begin(), crashing_stream_snapshot.end(),
+  SMOKE_CHECK(std::find_if(crashing_stream_callback_events.begin(), crashing_stream_callback_events.end(),
                       [](const agent::AgentRunnerStreamEvent& event) {
                         return event.type == agent::AgentRunnerStreamEventType::Error
                                && event.error.at("message").as_string().find("model adapter crashed mid-stream")
                                       != std::string::npos
                                && event.error.at("name").as_string() == "Error";
                       })
-         != crashing_stream_snapshot.end());
+         != crashing_stream_callback_events.end());
   SMOKE_CHECK(std::find_if(crashing_stream_events.begin(), crashing_stream_events.end(),
                       [](const agent::FrameworkEvent& event) {
                         return event.category == "model.failed"
@@ -1087,23 +2140,84 @@
                       })
          != crashing_stream_events.end());
 
+  {
+    agent::ProtocolError protocol_error("bad frame", "bad-frame");
+    SMOKE_CHECK(protocol_error.error_name() == "ProtocolError");
+    SMOKE_CHECK(protocol_error.error_category() == "protocol");
+    SMOKE_CHECK(protocol_error.error_code() == "bad-frame");
+    agent::ConfigurationError configuration_error("missing provider");
+    SMOKE_CHECK(configuration_error.error_name() == "ConfigurationError");
+    SMOKE_CHECK(configuration_error.error_category() == "configuration");
+    SMOKE_CHECK(configuration_error.error_code() == "configuration");
+    agent::ToolExecutionError tool_error("tool failed", "math.eval", "call-1");
+    SMOKE_CHECK(tool_error.error_name() == "ToolExecutionError");
+    SMOKE_CHECK(tool_error.error_category() == "tool");
+    SMOKE_CHECK(tool_error.error_code() == "tool-execution");
+  }
+
+  agent::AgentRunner framework_error_stream_runner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = std::make_shared<FrameworkErrorStreamModel>(),
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+  });
+  bool framework_error_stream_threw = false;
+  std::vector<agent::AgentRunnerStreamEvent> framework_error_stream_events;
+  try {
+    (void)framework_error_stream_runner.streaming().stream(
+        "protocol error stream",
+        [&](const agent::AgentRunnerStreamEvent& event) {
+          framework_error_stream_events.push_back(event);
+        },
+        "runner-framework-error-stream-session");
+    SMOKE_CHECK(false);
+  } catch (const agent::ProtocolError& error) {
+    framework_error_stream_threw =
+        std::string(error.what()).find("provider sent malformed stream frame") != std::string::npos;
+  }
+  SMOKE_CHECK(framework_error_stream_threw);
+  SMOKE_CHECK(std::find_if(framework_error_stream_events.begin(), framework_error_stream_events.end(),
+                      [](const agent::AgentRunnerStreamEvent& event) {
+                        return event.type == agent::AgentRunnerStreamEventType::Error
+                               && event.error.at("message").as_string()
+                                      .find("provider sent malformed stream frame") != std::string::npos
+                               && event.error.at("name").as_string() == "ProtocolError"
+                               && event.error.at("category").as_string() == "protocol"
+                               && event.error.at("code").as_string() == "malformed-stream-frame";
+                      })
+         != framework_error_stream_events.end());
+
   std::atomic<bool> cancellable_stream_started{false};
   auto cancellable_stream_model = std::make_shared<CancellableStreamingModel>(cancellable_stream_started);
   agent::AgentRunner cancellable_stream_runner(agent::AgentRunnerConfig{
-      .adapter = cancellable_stream_model,
-      .max_iterations = 1,
+      .model_runtime = {
+          .adapter = cancellable_stream_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
   });
   agent::CancellationToken stream_cancellation;
   bool cancellable_stream_threw = false;
   std::string cancellable_stream_error;
+  std::vector<agent::AgentRunnerStreamEvent> cancellable_stream_callback_events;
   std::thread cancellable_stream_thread([&]() {
     try {
-      (void)cancellable_stream_runner.stream("abort stream", "runner-cancellable-stream-session",
-                                             {}, {}, {}, {}, agent::Value::object({}), std::nullopt,
-                                             &stream_cancellation);
-    } catch (const std::exception& error) {
+      (void)cancellable_stream_runner.streaming().stream(
+          "abort stream",
+          [&](const agent::AgentRunnerStreamEvent& event) {
+            cancellable_stream_callback_events.push_back(event);
+          },
+          "runner-cancellable-stream-session",
+          {}, {}, {}, std::vector<agent::SkillActivation>{}, agent::Value::object({}), std::nullopt,
+          &stream_cancellation);
+    } catch (const agent::CancellationError& error) {
       cancellable_stream_threw = true;
       cancellable_stream_error = error.what();
+      SMOKE_CHECK(error.target() == "model");
+      SMOKE_CHECK(error.reason() == "caller aborted");
     }
   });
   for (int attempt = 0; attempt < 100 && !cancellable_stream_started.load(); ++attempt) {
@@ -1114,19 +2228,22 @@
   cancellable_stream_thread.join();
   SMOKE_CHECK(cancellable_stream_threw);
   SMOKE_CHECK(cancellable_stream_error.find("caller aborted") != std::string::npos);
-  const auto cancellable_stream_snapshot = cancellable_stream_runner.last_stream_events();
-  SMOKE_CHECK(std::find_if(cancellable_stream_snapshot.begin(), cancellable_stream_snapshot.end(),
+  SMOKE_CHECK(std::find_if(cancellable_stream_callback_events.begin(), cancellable_stream_callback_events.end(),
                       [](const agent::AgentRunnerStreamEvent& event) {
-                        return event.type == agent::AgentRunnerStreamEventType::Error
-                               && event.error.at("message").as_string().find("caller aborted") != std::string::npos;
+                        return event.type == agent::AgentRunnerStreamEventType::Cancelled
+                               && event.cancellation.at("message").as_string().find("caller aborted") != std::string::npos
+                               && event.cancellation.at("name").as_string() == "CancellationError"
+                               && event.cancellation.at("category").as_string() == "cancelled"
+                               && event.cancellation.at("code").as_string() == "cancelled"
+                               && event.cancellation.at("reason").as_string() == "caller aborted";
                       })
-         != cancellable_stream_snapshot.end());
+         != cancellable_stream_callback_events.end());
 
   agent::ToolRegistry durable_tool_registry(tools);
   agent::ToolExecutor durable_tool_executor(durable_tool_registry);
   agent::EmbeddedContextManager durable_context_manager;
   auto durable_model = std::make_shared<ToolCallingModel>();
-  agent::AgentLoop durable_loop(agent::AgentLoopConfig{
+  agent::ReActLoop durable_loop(agent::ReActLoopConfig{
       .model = durable_model,
       .tool_registry = &durable_tool_registry,
       .tool_executor = &durable_tool_executor,
@@ -1149,22 +2266,35 @@
       });
   SMOKE_CHECK(durable_result.text.find("tool result") != std::string::npos);
   SMOKE_CHECK(durable_model->generate_calls() == 2);
-  SMOKE_CHECK(durable_checkpoints.size() >= 6);
+  SMOKE_CHECK(durable_checkpoints.size() >= 7);
   SMOKE_CHECK(durable_checkpoints.front().phase == agent::AgentLoopDurablePhase::BeforeModel);
   const auto model_completed = std::find_if(
       durable_checkpoints.begin(), durable_checkpoints.end(), [](const agent::AgentLoopDurableState& state) {
         return state.phase == agent::AgentLoopDurablePhase::ModelCompleted
                && state.next_iteration == 0
                && state.last_response
-               && !state.last_response->tool_calls.empty();
+               && state.last_response->text.find("Actions:") != std::string::npos
+               && state.last_response->text.find("math.eval") != std::string::npos;
       });
   SMOKE_CHECK(model_completed != durable_checkpoints.end());
-  SMOKE_CHECK(std::find_if(durable_checkpoints.begin(), durable_checkpoints.end(),
-                      [](const agent::AgentLoopDurableState& state) {
-                        return state.phase == agent::AgentLoopDurablePhase::ToolsCompleted
-                               && state.next_iteration == 1;
-                      })
-         != durable_checkpoints.end());
+  const auto action_parsed = std::find_if(
+      durable_checkpoints.begin(), durable_checkpoints.end(), [](const agent::AgentLoopDurableState& state) {
+        return state.phase == agent::AgentLoopDurablePhase::ActionBatchParsed
+               && state.next_iteration == 0
+               && state.last_response
+               && state.last_response->text.find("Actions:") != std::string::npos
+               && state.last_response->text.find("math.eval") != std::string::npos;
+      });
+  SMOKE_CHECK(action_parsed != durable_checkpoints.end());
+  const auto tool_completed = std::find_if(
+      durable_checkpoints.begin(), durable_checkpoints.end(), [](const agent::AgentLoopDurableState& state) {
+        return state.phase == agent::AgentLoopDurablePhase::ToolBatchCompleted
+               && state.next_iteration == 1
+               && state.react_trace.size() == 1
+               && state.react_trace.front().actions.size() == 1
+               && state.react_trace.front().actions.front().tool == "math.eval";
+      });
+  SMOKE_CHECK(tool_completed != durable_checkpoints.end());
   SMOKE_CHECK(durable_checkpoints.back().phase == agent::AgentLoopDurablePhase::Completed);
   SMOKE_CHECK(durable_checkpoints.back().termination_reason == agent::AgentLoopTerminationReason::Completed);
   auto durable_state_value = agent::agent_loop_durable_state_to_value(durable_checkpoints.back());
@@ -1176,7 +2306,7 @@
   auto resumed_model = std::make_shared<ToolCallingModel>();
   agent::ToolExecutor resumed_tool_executor(durable_tool_registry);
   agent::EmbeddedContextManager resumed_context_manager;
-  agent::AgentLoop resumed_loop(agent::AgentLoopConfig{
+  agent::ReActLoop resumed_loop(agent::ReActLoopConfig{
       .model = resumed_model,
       .tool_registry = &durable_tool_registry,
       .tool_executor = &resumed_tool_executor,
@@ -1193,7 +2323,7 @@
       {},
       agent::Value::object({{"durable", true}}),
       agent::AgentLoopDurableOptions{
-          .resume_state = *model_completed,
+          .resume_state = *action_parsed,
           .on_checkpoint = [&](const agent::AgentLoopDurableState& state) {
             resumed_checkpoints.push_back(state);
           },
@@ -1201,17 +2331,23 @@
   SMOKE_CHECK(resumed_result.text.find("tool result") != std::string::npos);
   SMOKE_CHECK(resumed_model->generate_calls() == 1);
   SMOKE_CHECK(!resumed_checkpoints.empty());
-  SMOKE_CHECK(resumed_checkpoints.front().phase == agent::AgentLoopDurablePhase::BeforeModel);
+  SMOKE_CHECK(resumed_checkpoints.front().phase == agent::AgentLoopDurablePhase::ToolBatchCompleted);
   SMOKE_CHECK(resumed_checkpoints.back().phase == agent::AgentLoopDurablePhase::Completed);
 
   auto runner_durable_model = std::make_shared<ToolCallingModel>();
   agent::AgentRunner durable_runner(agent::AgentRunnerConfig{
-      .adapter = runner_durable_model,
-      .tools = tools,
-      .max_iterations = 4,
+      .model_runtime = {
+          .adapter = runner_durable_model,
+      },
+      .tool_runtime = {
+          .definitions = tools,
+      },
+      .context_runtime = {
+          .max_iterations = 4,
+      },
   });
   std::vector<agent::AgentRunnerDurableState> runner_checkpoints;
-  auto runner_durable_result = durable_runner.run(
+  auto runner_durable_result = durable_runner.execution().run(
       "runner checkpoint runtime",
       "runner-durable-session",
       {},
@@ -1233,15 +2369,16 @@
   SMOKE_CHECK(runner_checkpoints.back().status == agent::AgentRunnerDurableStatus::Completed);
   SMOKE_CHECK(runner_checkpoints.back().loop);
   SMOKE_CHECK(runner_checkpoints.back().loop->phase == agent::AgentLoopDurablePhase::Completed);
-  const auto runner_model_completed = std::find_if(
+  const auto runner_action_parsed = std::find_if(
       runner_checkpoints.begin(), runner_checkpoints.end(), [](const agent::AgentRunnerDurableState& state) {
         return state.status == agent::AgentRunnerDurableStatus::Running
                && state.loop
-               && state.loop->phase == agent::AgentLoopDurablePhase::ModelCompleted
+               && state.loop->phase == agent::AgentLoopDurablePhase::ActionBatchParsed
                && state.loop->last_response
-               && !state.loop->last_response->tool_calls.empty();
+               && state.loop->last_response->text.find("Actions:") != std::string::npos
+               && state.loop->last_response->text.find("math.eval") != std::string::npos;
       });
-  SMOKE_CHECK(runner_model_completed != runner_checkpoints.end());
+  SMOKE_CHECK(runner_action_parsed != runner_checkpoints.end());
   auto runner_durable_value = agent::agent_runner_durable_state_to_value(runner_checkpoints.back());
   SMOKE_CHECK(runner_durable_value.at("version").as_integer() == 1);
   SMOKE_CHECK(runner_durable_value.at("status").as_string() == "completed");
@@ -1261,12 +2398,18 @@
 
   auto resumed_runner_model = std::make_shared<ToolCallingModel>();
   agent::AgentRunner resumed_runner(agent::AgentRunnerConfig{
-      .adapter = resumed_runner_model,
-      .tools = tools,
-      .max_iterations = 4,
+      .model_runtime = {
+          .adapter = resumed_runner_model,
+      },
+      .tool_runtime = {
+          .definitions = tools,
+      },
+      .context_runtime = {
+          .max_iterations = 4,
+      },
   });
   std::vector<agent::AgentRunnerDurableState> resumed_runner_checkpoints;
-  auto resumed_runner_result = resumed_runner.run(
+  auto resumed_runner_result = resumed_runner.execution().run(
       "runner checkpoint runtime",
       "ignored-session-on-resume",
       {},
@@ -1276,7 +2419,7 @@
       agent::Value::object({{"durable", "runner"}}),
       std::nullopt,
       agent::AgentRunnerDurableOptions{
-          .resume_state = *runner_model_completed,
+          .resume_state = *runner_action_parsed,
           .on_checkpoint = [&](const agent::AgentRunnerDurableState& state) {
             resumed_runner_checkpoints.push_back(state);
           },
@@ -1285,12 +2428,12 @@
   SMOKE_CHECK(resumed_runner_result.text.find("tool result") != std::string::npos);
   SMOKE_CHECK(resumed_runner_model->generate_calls() == 1);
   SMOKE_CHECK(!resumed_runner_checkpoints.empty());
-  SMOKE_CHECK(resumed_runner_checkpoints.front().run_id == runner_model_completed->run_id);
+  SMOKE_CHECK(resumed_runner_checkpoints.front().run_id == runner_action_parsed->run_id);
   SMOKE_CHECK(resumed_runner_checkpoints.back().status == agent::AgentRunnerDurableStatus::Completed);
 
   agent::WebSearchProviderRegistry service_web_registry({agent::StaticWebSearchProvider("svc")});
   agent::ToolExecutionServices configured_services;
-  configured_services.web_search_registry = &service_web_registry;
+  configured_services.service_container.set(agent::kToolServiceWebSearchRegistry, &service_web_registry);
   configured_services.values = agent::Value::object({
       {"web", agent::Value::object({{"configuredLayer", "runner"}})},
       {"custom", agent::Value::object({{"fromConfigured", true}})},
@@ -1299,18 +2442,27 @@
   auto context_inspect_tool = agent::define_tool(agent::ToolDefinition{
       .name = "context.inspect",
       .description = "Inspect the injected tool execution context.",
+      .service_requirements = {
+          agent::ToolServiceRequirement{.name = "web.search.registry"},
+          agent::ToolServiceRequirement{.name = "memory.long_term"},
+          agent::ToolServiceRequirement{.name = "browser.renderer", .optional = true},
+      },
       .risk_level = agent::ToolRiskLevel::Low,
       .execute = [&](const agent::Value&, agent::ToolExecutionContext& context) -> agent::ToolInvokeResult {
-        SMOKE_CHECK(context.service_refs.session != nullptr);
-        SMOKE_CHECK(context.service_refs.long_term_memory == memory.get());
-        SMOKE_CHECK(context.service_refs.knowledge_base == runner_knowledge.get());
-        SMOKE_CHECK(context.service_refs.web_search_registry == &service_web_registry);
+        SMOKE_CHECK(context.service_refs.service_view.has("web.search.registry"));
+        SMOKE_CHECK(context.service_refs.service_view.get(agent::kToolServiceWebSearchRegistry) ==
+                    &service_web_registry);
+        SMOKE_CHECK(context.service_refs.service_view.get(agent::kToolServiceLongTermMemory) == memory.get());
+        SMOKE_CHECK(context.service_refs.service_view.get(agent::kToolServiceBrowserRenderer) == nullptr);
+        SMOKE_CHECK(!context.service_refs.service_view.has("knowledge.provider"));
+        SMOKE_CHECK(context.service_refs.service_view.get(agent::kToolServiceSessionMemory) == nullptr);
+        SMOKE_CHECK(context.service_refs.service_container.get(agent::kToolServiceKnowledgeProvider) == nullptr);
         SMOKE_CHECK(context.services.at("sessionId").as_string() == "context-service-session");
         SMOKE_CHECK(context.services.at("session").at("sessionId").as_string() == "context-service-session");
         SMOKE_CHECK(context.services.at("session").at("configuredKey").as_string() == "cfg");
         SMOKE_CHECK(context.services.at("session").at("contextKey").as_string() == "ctx");
         SMOKE_CHECK(context.services.at("knowledge").at("longTermMemoryAvailable").as_bool());
-        SMOKE_CHECK(context.services.at("knowledge").at("knowledgeBaseAvailable").as_bool());
+        SMOKE_CHECK(context.services.at("knowledge").at("knowledgeProviderAvailable").as_bool());
         SMOKE_CHECK(context.services.at("web").at("configuredLayer").as_string() == "runner");
         SMOKE_CHECK(context.services.at("web").at("contextLayer").as_string() == "request");
         SMOKE_CHECK(context.services.at("custom").at("fromConfigured").as_bool());
@@ -1322,15 +2474,25 @@
       },
   });
   auto context_runner = agent::AgentRunner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<ContextServiceModel>(),
-      .tools = {context_inspect_tool},
-      .max_iterations = 3,
-      .long_term_memory = memory,
-      .knowledge_base = runner_knowledge.get(),
-      .knowledge_retrieval_options = agent::RunnerKnowledgeRetrievalOptions{.enabled = false},
-      .tool_services = configured_services,
+      .model_runtime = {
+          .adapter = std::make_shared<ContextServiceModel>(),
+      },
+      .tool_runtime = {
+          .definitions = std::vector<agent::ToolDefinition>{context_inspect_tool},
+          .services = configured_services,
+      },
+      .context_runtime = {
+          .max_iterations = 3,
+      },
+      .memory_runtime = {
+          .long_term_memory = memory,
+      },
+      .knowledge_runtime = {
+          .provider = runner_knowledge.get(),
+          .retrieval_options = agent::RunnerKnowledgeRetrievalOptions{.enabled = false},
+      },
   });
-  auto context_result = context_runner.run(
+  auto context_result = context_runner.execution().run(
       "inspect context",
       "context-service-session",
       {},
@@ -1384,24 +2546,49 @@
     runtime_hook_calls.push_back("after-tool");
   };
   auto runtime_hook_runner = agent::AgentRunner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<ToolCallingModel>(),
-      .tools = tools,
-      .max_iterations = 4,
-      .hooks = runtime_hooks,
-      .permission_policy = [](const agent::PermissionRequest&) {
+      .model_runtime = {
+          .adapter = std::make_shared<ToolCallingModel>(),
+      },
+      .tool_runtime = {
+          .definitions = tools,
+          .permission_policy = [](const agent::PermissionRequest&) {
         return agent::PermissionDecision{agent::PermissionDecisionKind::Allow, "hook allow"};
       },
+      },
+      .context_runtime = {
+          .max_iterations = 4,
+      },
+      .observability = {
+          .hooks = runtime_hooks,
+      },
   });
+  SMOKE_CHECK(!runtime_hook_runner.context_stats().last().has_value());
+  const auto estimated_runtime_stats =
+      runtime_hook_runner.context_stats().estimate("hooked runtime", "runtime-hook-estimate");
+  SMOKE_CHECK(estimated_runtime_stats.session_id == "runtime-hook-estimate");
+  SMOKE_CHECK(estimated_runtime_stats.estimator == "char_div_4");
+  SMOKE_CHECK(!estimated_runtime_stats.accurate);
+  SMOKE_CHECK(std::any_of(
+      estimated_runtime_stats.buckets.begin(), estimated_runtime_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.kind == agent::ContextStatsBucketKind::Conversation && bucket.messages >= 1
+               && bucket.tokens > 0;
+      }));
+  SMOKE_CHECK(std::any_of(
+      estimated_runtime_stats.buckets.begin(), estimated_runtime_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.kind == agent::ContextStatsBucketKind::ToolDefinitions && bucket.tokens > 0;
+      }));
   std::vector<agent::FrameworkEvent> runtime_events;
   std::vector<agent::FrameworkEvent> runtime_run_events;
-  const auto runtime_event_sink_id = runtime_hook_runner.register_event_sink([&](const agent::FrameworkEvent& event) {
+  const auto runtime_event_sink_id = runtime_hook_runner.events().register_sink([&](const agent::FrameworkEvent& event) {
     runtime_events.push_back(event);
     if (event.category.find("run.") == 0) {
       runtime_run_events.push_back(event);
     }
   });
-  auto runtime_hook_result = runtime_hook_runner.run("hooked runtime", "runtime-hook-session");
-  runtime_hook_runner.unregister_event_sink(runtime_event_sink_id);
+  auto runtime_hook_result = runtime_hook_runner.execution().run("hooked runtime", "runtime-hook-session");
+  runtime_hook_runner.events().unregister_sink(runtime_event_sink_id);
   SMOKE_CHECK(runtime_hook_result.text.find("tool result") != std::string::npos);
   SMOKE_CHECK(contains_string(runtime_hook_calls, "before-run"));
   SMOKE_CHECK(contains_string(runtime_hook_calls, "after-run"));
@@ -1431,6 +2618,23 @@
   SMOKE_CHECK(runtime_model_started->trace.trace_id == runtime_run_events[0].trace.trace_id);
   SMOKE_CHECK(runtime_model_started->trace.parent_span_id == runtime_run_events[0].trace.span_id);
   SMOKE_CHECK(!runtime_model_started->trace.span_id.empty());
+  const auto runtime_context_stats = std::find_if(
+      runtime_events.begin(), runtime_events.end(),
+      [](const agent::FrameworkEvent& event) { return event.category == "context.stats"; });
+  SMOKE_CHECK(runtime_context_stats != runtime_events.end());
+  SMOKE_CHECK(runtime_context_stats->payload.at("sessionId").as_string() == runtime_hook_result.session_id);
+  SMOKE_CHECK(runtime_context_stats->payload.at("estimator").as_string() == "char_div_4");
+  SMOKE_CHECK(runtime_context_stats->payload.at("accurate").as_bool() == false);
+  SMOKE_CHECK(runtime_context_stats->payload.at("iteration").as_integer() >= 0);
+  const auto runtime_last_context_stats = runtime_hook_runner.context_stats().last();
+  SMOKE_CHECK(runtime_last_context_stats.has_value());
+  SMOKE_CHECK(runtime_last_context_stats->session_id == runtime_hook_result.session_id);
+  SMOKE_CHECK(runtime_last_context_stats->total_tokens > 0);
+  SMOKE_CHECK(std::any_of(
+      runtime_last_context_stats->buckets.begin(), runtime_last_context_stats->buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.kind == agent::ContextStatsBucketKind::Conversation && bucket.messages >= 1;
+      }));
   const auto runtime_tool_completed = std::find_if(
       runtime_events.begin(), runtime_events.end(),
       [](const agent::FrameworkEvent& event) { return event.category == "tool.completed"; });
@@ -1439,22 +2643,310 @@
   SMOKE_CHECK(runtime_tool_completed->trace.parent_span_id == runtime_run_events[0].trace.span_id);
   SMOKE_CHECK(!runtime_tool_completed->trace.span_id.empty());
 
+  agent::ToolDefinition normal_stats_tool = agent::define_tool({
+      .name = "stats.echo",
+      .description = "Echo a string.",
+      .input_schema = [] {
+        agent::JsonSchema schema;
+        schema.type = agent::JsonSchemaType::Object;
+        schema.required = {"text"};
+        schema.properties["text"].type = agent::JsonSchemaType::String;
+        return schema;
+      }(),
+      .bundle = "core",
+      .execute = [](const agent::Value&, agent::ToolExecutionContext&) {
+        return agent::Value::object({{"ok", true}});
+      },
+  });
+  agent::ToolDefinition mcp_stats_tool = normal_stats_tool;
+  mcp_stats_tool.name = "mcp.lookup";
+  mcp_stats_tool.bundle = "mcp";
+  mcp_stats_tool.tags = {"mcp", "server:test"};
+  auto context_stats_runner = agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = std::make_shared<agent::EchoChatModelAdapter>(),
+      },
+      .tool_runtime = {
+          .definitions = std::vector<agent::ToolDefinition>{normal_stats_tool, mcp_stats_tool},
+      },
+      .context_runtime = {
+          .system_prompt = "Context stats smoke",
+      },
+      .governance = {
+          .enable_planning = false,
+      },
+  });
+  const auto split_tool_stats = context_stats_runner.context_stats().estimate("hello", "context-stats-tools");
+  SMOKE_CHECK(std::any_of(
+      split_tool_stats.buckets.begin(), split_tool_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.kind == agent::ContextStatsBucketKind::ToolDefinitions && bucket.tokens > 0;
+      }));
+  SMOKE_CHECK(std::any_of(
+      split_tool_stats.buckets.begin(), split_tool_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.kind == agent::ContextStatsBucketKind::Mcp && bucket.tokens > 0;
+      }));
+
+  auto native_context_stats_runner = agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = std::make_shared<agent::EchoChatModelAdapter>(),
+      },
+      .tool_runtime = {
+          .definitions = std::vector<agent::ToolDefinition>{normal_stats_tool, mcp_stats_tool},
+          .calling_strategy = agent::AgentToolCallingStrategy::NativeToolCalling,
+      },
+      .context_runtime = {
+          .system_prompt = "Native context stats smoke",
+      },
+      .governance = {
+          .enable_planning = false,
+      },
+  });
+  const auto native_estimated_stats =
+      native_context_stats_runner.context_stats().estimate("hello", "native-context-stats-estimate");
+  SMOKE_CHECK(std::none_of(
+      native_estimated_stats.buckets.begin(), native_estimated_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.kind == agent::ContextStatsBucketKind::Rules || bucket.id == "rules";
+      }));
+  SMOKE_CHECK(std::any_of(
+      native_estimated_stats.buckets.begin(), native_estimated_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.id == "tool_definitions"
+               && bucket.kind == agent::ContextStatsBucketKind::ToolDefinitions
+               && bucket.metadata.at("source").as_string() == "native-tool-calling"
+               && bucket.tokens > 0;
+      }));
+  SMOKE_CHECK(std::any_of(
+      native_estimated_stats.buckets.begin(), native_estimated_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.id == "mcp_tools"
+               && bucket.kind == agent::ContextStatsBucketKind::Mcp
+               && bucket.metadata.at("source").as_string() == "native-tool-calling"
+               && bucket.tokens > 0;
+      }));
+  std::vector<agent::FrameworkEvent> native_context_stats_events;
+  const auto native_context_stats_sink_id =
+      native_context_stats_runner.events().register_sink([&](const agent::FrameworkEvent& event) {
+        if (event.category == "context.stats") {
+          native_context_stats_events.push_back(event);
+        }
+      });
+  const auto native_context_stats_result =
+      native_context_stats_runner.execution().run("hello", "native-context-stats-run");
+  native_context_stats_runner.events().unregister_sink(native_context_stats_sink_id);
+  SMOKE_CHECK(native_context_stats_result.text == "hello");
+  SMOKE_CHECK(!native_context_stats_events.empty());
+  const auto native_last_context_stats = native_context_stats_runner.context_stats().last();
+  SMOKE_CHECK(native_last_context_stats.has_value());
+  SMOKE_CHECK(std::none_of(
+      native_last_context_stats->buckets.begin(), native_last_context_stats->buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.kind == agent::ContextStatsBucketKind::Rules || bucket.id == "rules";
+      }));
+  SMOKE_CHECK(std::any_of(
+      native_last_context_stats->buckets.begin(), native_last_context_stats->buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.id == "tool_definitions"
+               && bucket.metadata.at("source").as_string() == "native-tool-calling"
+               && bucket.tokens > 0;
+      }));
+
+  auto embedded_block_stats_runner = agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = std::make_shared<agent::EchoChatModelAdapter>(),
+      },
+      .context_runtime = {
+          .sources = std::vector<agent::ContextSource>{
+          agent::ContextSource{
+              .id = "workspace",
+              .title = "Workspace",
+              .resolve = [](const agent::Value&) {
+                return std::vector<agent::EmbeddedContextBlock>{
+                    agent::EmbeddedContextBlock{
+                        .title = "Working Directory",
+                        .content = "cwd=/tmp/project",
+                        .priority = 10,
+                        .stats_kind = agent::ContextStatsBucketKind::Context,
+                        .stats_id = "workspace.cwd",
+                        .stats_label = "Working Directory",
+                        .stats_metadata = agent::Value::object({{"scope", "workspace"}}),
+                    },
+                    agent::EmbeddedContextBlock{
+                        .title = "Pinned Memory",
+                        .content = "remember=stable preference",
+                        .priority = 5,
+                        .stats_kind = agent::ContextStatsBucketKind::Memory,
+                        .stats_id = "memory.pinned",
+                        .stats_label = "Pinned Memory",
+                        .stats_metadata = agent::Value::object({{"scope", "user"}}),
+                    },
+                };
+              },
+          },
+      },
+      },
+      .governance = {
+          .enable_planning = false,
+      },
+  });
+  const auto embedded_block_stats =
+      embedded_block_stats_runner.context_stats().estimate("hello", "embedded-block-stats");
+  SMOKE_CHECK(std::any_of(
+      embedded_block_stats.buckets.begin(), embedded_block_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.id == "workspace.cwd"
+               && bucket.label == "Working Directory"
+               && bucket.kind == agent::ContextStatsBucketKind::Context
+               && bucket.metadata.at("scope").as_string() == "workspace"
+               && bucket.tokens > 0;
+      }));
+  SMOKE_CHECK(std::any_of(
+      embedded_block_stats.buckets.begin(), embedded_block_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.id == "memory.pinned"
+               && bucket.label == "Pinned Memory"
+               && bucket.kind == agent::ContextStatsBucketKind::Memory
+               && bucket.metadata.at("scope").as_string() == "user"
+               && bucket.tokens > 0;
+      }));
+  SMOKE_CHECK(std::none_of(
+      embedded_block_stats.buckets.begin(), embedded_block_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.id == "context" && bucket.label == "Runtime Context";
+      }));
+
+  auto external_prompt_stats_runner = agent::AgentRunner(agent::AgentRunnerConfig{
+      .model_runtime = {
+          .adapter = std::make_shared<agent::EchoChatModelAdapter>(),
+      },
+      .context_runtime = {
+          .system_prompt = "Business prompt\n\nReAct rules\n\nTool definitions",
+      },
+      .governance = {
+          .enable_planning = false,
+      },
+      .observability = {
+          .prompt_stats_buckets = {
+          agent::ContextStatsBucketInput{
+              .id = "external.system",
+              .label = "External System",
+              .kind = agent::ContextStatsBucketKind::SystemPrompt,
+              .text = "Business prompt",
+              .metadata = agent::Value::object({{"source", "external-prompt"}}),
+          },
+          agent::ContextStatsBucketInput{
+              .id = "external.rules",
+              .label = "External Rules",
+              .kind = agent::ContextStatsBucketKind::Rules,
+              .text = "ReAct rules",
+              .metadata = agent::Value::object({{"source", "external-prompt"}}),
+          },
+          agent::ContextStatsBucketInput{
+              .id = "external.tools",
+              .label = "External Tools",
+              .kind = agent::ContextStatsBucketKind::ToolDefinitions,
+              .text = "Tool definitions",
+              .metadata = agent::Value::object({{"source", "external-prompt"}}),
+          },
+      },
+      },
+      .react_runtime = {
+          .prompt_mode = agent::ReActPromptMode::External,
+      },
+  });
+  const auto external_prompt_stats =
+      external_prompt_stats_runner.context_stats().estimate("hello", "external-prompt-stats");
+  SMOKE_CHECK(std::any_of(
+      external_prompt_stats.buckets.begin(), external_prompt_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.id == "external.system"
+               && bucket.kind == agent::ContextStatsBucketKind::SystemPrompt
+               && bucket.tokens > 0;
+      }));
+  SMOKE_CHECK(std::any_of(
+      external_prompt_stats.buckets.begin(), external_prompt_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.id == "external.rules"
+               && bucket.kind == agent::ContextStatsBucketKind::Rules
+               && bucket.tokens > 0;
+      }));
+  SMOKE_CHECK(std::any_of(
+      external_prompt_stats.buckets.begin(), external_prompt_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.id == "external.tools"
+               && bucket.kind == agent::ContextStatsBucketKind::ToolDefinitions
+               && bucket.tokens > 0;
+      }));
+  SMOKE_CHECK(std::none_of(
+      external_prompt_stats.buckets.begin(), external_prompt_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.id == "system_prompt" && bucket.metadata.at("source").as_string() == "runner";
+      }));
+
+  auto configured_prompt_stats_app = agent::resolve_native_agent_app(agent::Value::object({
+      {"agents", agent::Value::object({
+          {"main", agent::Value::object({
+              {"model", agent::Value::object({{"provider", "echo"}, {"model", "echo"}})},
+              {"systemPrompt", "External prompt from config"},
+              {"runtime", agent::Value::object({
+                  {"reactPromptMode", "external"},
+                  {"promptStatsBuckets", agent::Value::array({
+                      agent::Value::object({
+                          {"id", "config.rules"},
+                          {"label", "Config Rules"},
+                          {"kind", "rules"},
+                          {"text", "Configured external rules"},
+                          {"metadata", agent::Value::object({{"source", "config"}})},
+                      }),
+                      agent::Value::object({
+                          {"id", "config.tools"},
+                          {"label", "Config Tools"},
+                          {"kind", "tool_definitions"},
+                          {"text", "Configured tool definitions"},
+                          {"metadata", agent::Value::object({{"source", "config"}})},
+                      }),
+                  })},
+              })},
+          })},
+      })},
+  }), "main");
+  const auto configured_prompt_stats =
+      configured_prompt_stats_app.runner->context_stats().estimate("hello", "config-prompt-stats");
+  SMOKE_CHECK(std::any_of(
+      configured_prompt_stats.buckets.begin(), configured_prompt_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.id == "config.rules"
+               && bucket.kind == agent::ContextStatsBucketKind::Rules
+               && bucket.metadata.at("source").as_string() == "config";
+      }));
+  SMOKE_CHECK(std::any_of(
+      configured_prompt_stats.buckets.begin(), configured_prompt_stats.buckets.end(),
+      [](const agent::ContextStatsBucket& bucket) {
+        return bucket.id == "config.tools"
+               && bucket.kind == agent::ContextStatsBucketKind::ToolDefinitions
+               && bucket.metadata.at("source").as_string() == "config";
+      }));
+
   agent::AgentRunner failing_runner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<FailingRuntimeModel>(),
+      .model_runtime = {
+          .adapter = std::make_shared<FailingRuntimeModel>(),
+      },
   });
   std::vector<agent::FrameworkEvent> failed_run_events;
-  const auto failed_event_sink_id = failing_runner.register_event_sink([&](const agent::FrameworkEvent& event) {
+  const auto failed_event_sink_id = failing_runner.events().register_sink([&](const agent::FrameworkEvent& event) {
     if (event.category.find("run.") == 0) {
       failed_run_events.push_back(event);
     }
   });
   try {
-    (void)failing_runner.run("fail runtime", "runtime-failed-session");
+    (void)failing_runner.execution().run("fail runtime", "runtime-failed-session");
     SMOKE_CHECK(false);
   } catch (const std::runtime_error& error) {
     SMOKE_CHECK(std::string(error.what()).find("runtime model failed") != std::string::npos);
   }
-  failing_runner.unregister_event_sink(failed_event_sink_id);
+  failing_runner.events().unregister_sink(failed_event_sink_id);
   SMOKE_CHECK(failed_run_events.size() == 2);
   SMOKE_CHECK(failed_run_events[0].category == "run.started");
   SMOKE_CHECK(failed_run_events[1].category == "run.failed");
@@ -1505,18 +2997,24 @@
   retry_policies.retry[agent::ExecutionTarget::Model] = model_retry_policy;
   auto retry_model = std::make_shared<RetryingRuntimeModel>();
   agent::AgentRunner retry_runner(agent::AgentRunnerConfig{
-      .adapter = retry_model,
-      .max_iterations = 1,
-      .execution_policies = retry_policies,
+      .model_runtime = {
+          .adapter = retry_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+      .governance = {
+          .execution_policies = retry_policies,
+      },
   });
   std::vector<agent::FrameworkEvent> retry_events;
-  const auto retry_sink_id = retry_runner.register_event_sink([&](const agent::FrameworkEvent& event) {
+  const auto retry_sink_id = retry_runner.events().register_sink([&](const agent::FrameworkEvent& event) {
     if (event.category == "retry.scheduled") {
       retry_events.push_back(event);
     }
   });
-  auto retry_result = retry_runner.run("retry runtime", "runtime-retry-session");
-  retry_runner.unregister_event_sink(retry_sink_id);
+  auto retry_result = retry_runner.execution().run("retry runtime", "runtime-retry-session");
+  retry_runner.events().unregister_sink(retry_sink_id);
   SMOKE_CHECK(retry_result.text == "retried response");
   SMOKE_CHECK(retry_model->generate_calls() == 2);
   SMOKE_CHECK(retry_events.size() == 1);
@@ -1530,24 +3028,30 @@
   timeout_policies.timeout.timeout_ms[agent::ExecutionTarget::Model] = 1;
   auto slow_model = std::make_shared<SlowRuntimeModel>();
   agent::AgentRunner timeout_runner(agent::AgentRunnerConfig{
-      .adapter = slow_model,
-      .max_iterations = 1,
-      .execution_policies = timeout_policies,
+      .model_runtime = {
+          .adapter = slow_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
+      .governance = {
+          .execution_policies = timeout_policies,
+      },
   });
   std::vector<agent::FrameworkEvent> timeout_events;
-  const auto timeout_sink_id = timeout_runner.register_event_sink([&](const agent::FrameworkEvent& event) {
+  const auto timeout_sink_id = timeout_runner.events().register_sink([&](const agent::FrameworkEvent& event) {
     if (event.category.find("run.") == 0) {
       timeout_events.push_back(event);
     }
   });
   try {
-    (void)timeout_runner.run("timeout runtime", "runtime-timeout-session");
+    (void)timeout_runner.execution().run("timeout runtime", "runtime-timeout-session");
     SMOKE_CHECK(false);
   } catch (const agent::TimeoutError& error) {
     SMOKE_CHECK(error.target() == "model");
     SMOKE_CHECK(error.timeout_ms() == 1);
   }
-  timeout_runner.unregister_event_sink(timeout_sink_id);
+  timeout_runner.events().unregister_sink(timeout_sink_id);
   SMOKE_CHECK(slow_model->generate_calls() == 1);
   SMOKE_CHECK(timeout_events.size() == 2);
   SMOKE_CHECK(timeout_events.back().category == "run.failed");
@@ -1565,41 +3069,59 @@
       },
   });
   agent::AgentRunner cancelling_runner(agent::AgentRunnerConfig{
-      .adapter = cancelling_model,
-      .tools = {cancelling_tool},
-      .max_iterations = 3,
+      .model_runtime = {
+          .adapter = cancelling_model,
+      },
+      .tool_runtime = {
+          .definitions = std::vector<agent::ToolDefinition>{cancelling_tool},
+      },
+      .context_runtime = {
+          .max_iterations = 3,
+      },
   });
   agent::CancellationToken runtime_cancellation;
   std::vector<agent::FrameworkEvent> cancellation_events;
-  const auto cancellation_sink_id = cancelling_runner.register_event_sink([&](const agent::FrameworkEvent& event) {
+  const auto cancellation_sink_id = cancelling_runner.events().register_sink([&](const agent::FrameworkEvent& event) {
     if (event.category.find("run.") == 0 || event.category == "tool.failed") {
       cancellation_events.push_back(event);
     }
   });
   try {
-    (void)cancelling_runner.run("cancel runtime", "runtime-cancel-session",
+    (void)cancelling_runner.execution().run("cancel runtime", "runtime-cancel-session",
                                 {}, {}, {}, {}, agent::Value::object({}), std::nullopt, {}, &runtime_cancellation);
     SMOKE_CHECK(false);
-  } catch (const agent::AgentFrameworkError& error) {
+  } catch (const agent::CancellationError& error) {
     SMOKE_CHECK(std::string(error.what()).find("tool requested cancellation") != std::string::npos);
+    SMOKE_CHECK(error.target() == "tool");
+    SMOKE_CHECK(error.reason() == "tool requested cancellation");
   }
-  cancelling_runner.unregister_event_sink(cancellation_sink_id);
+  cancelling_runner.events().unregister_sink(cancellation_sink_id);
   SMOKE_CHECK(runtime_cancellation.cancelled());
   SMOKE_CHECK(cancelling_model->generate_calls() == 1);
   SMOKE_CHECK(std::find_if(cancellation_events.begin(), cancellation_events.end(),
-                      [](const agent::FrameworkEvent& event) { return event.category == "run.failed"; })
+                      [](const agent::FrameworkEvent& event) {
+                        return event.category == "run.cancelled"
+                               && event.payload.at("reason").as_string() == "tool requested cancellation";
+                      })
          != cancellation_events.end());
+  SMOKE_CHECK(std::find_if(cancellation_events.begin(), cancellation_events.end(),
+                      [](const agent::FrameworkEvent& event) { return event.category == "run.failed"; })
+         == cancellation_events.end());
   SMOKE_CHECK(std::find_if(cancellation_events.begin(), cancellation_events.end(),
                       [](const agent::FrameworkEvent& event) { return event.category == "tool.failed"; })
          == cancellation_events.end());
 
   auto cancellation_aware_model = std::make_shared<CancellationAwareModel>();
   agent::AgentRunner cancellation_aware_runner(agent::AgentRunnerConfig{
-      .adapter = cancellation_aware_model,
-      .max_iterations = 1,
+      .model_runtime = {
+          .adapter = cancellation_aware_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
   });
   agent::CancellationToken model_cancellation;
-  auto cancellation_aware_result = cancellation_aware_runner.run(
+  auto cancellation_aware_result = cancellation_aware_runner.execution().run(
       "model cancellation propagation",
       "model-cancellation-session",
       {},
@@ -1640,15 +3162,28 @@
           agent::LlamaCppNativeBinding::ChatDeltaHandler on_delta) {
         seen_llama_config = config;
         seen_llama_request = request;
+        bool wants_react = false;
+        for (const auto& message : request.messages) {
+          wants_react = wants_react || message.content.find("internal tool-use format") != std::string::npos;
+        }
+        const auto output = wants_react
+                                ? std::string("<think>plan</think>Thought: Use llama native response.\nFinal Answer: final")
+                                : std::string("<think>plan</think>final");
         if (on_delta) {
-          on_delta(agent::LlamaCppNativeChatDelta{.type = "text", .delta = "<think>pla"});
-          on_delta(agent::LlamaCppNativeChatDelta{.type = "text", .delta = "n</think>fi"});
-          on_delta(agent::LlamaCppNativeChatDelta{.type = "text", .delta = "nal"});
+          if (wants_react) {
+            on_delta(agent::LlamaCppNativeChatDelta{.type = "text", .delta = "<think>plan</think>Thought: "});
+            on_delta(agent::LlamaCppNativeChatDelta{.type = "text", .delta = "Use llama native response.\n"});
+            on_delta(agent::LlamaCppNativeChatDelta{.type = "text", .delta = "Final Answer: final"});
+          } else {
+            on_delta(agent::LlamaCppNativeChatDelta{.type = "text", .delta = "<think>pla"});
+            on_delta(agent::LlamaCppNativeChatDelta{.type = "text", .delta = "n</think>fi"});
+            on_delta(agent::LlamaCppNativeChatDelta{.type = "text", .delta = "nal"});
+          }
         }
         return agent::LlamaCppNativeChatResult{
             .id = request.request_id,
             .model = request.model,
-            .text = "<think>plan</think>final",
+            .text = output,
             .finish_reason = "stop",
         };
       };
@@ -1690,7 +3225,7 @@
   SMOKE_CHECK(seen_llama_request.min_p && *seen_llama_request.min_p == 0.05);
   SMOKE_CHECK(seen_llama_request.repeat_penalty && *seen_llama_request.repeat_penalty == 1.1);
   SMOKE_CHECK(seen_llama_request.seed && *seen_llama_request.seed == 7);
-  auto llama_stream_events = llama_chat_model.stream(agent::GenerateParams{
+  auto llama_stream_events = capture_model_stream(llama_chat_model, agent::GenerateParams{
       .messages = {agent::create_message(agent::MessageRole::User, "stream")},
   });
   SMOKE_CHECK(llama_stream_events.size() == 6);
@@ -1883,7 +3418,7 @@
             .finish_reason = "stop",
         };
       };
-  auto llama_tool_stream = llama_tool_model.stream(agent::GenerateParams{
+  auto llama_tool_stream = capture_model_stream(llama_tool_model, agent::GenerateParams{
       .messages = {agent::create_message(agent::MessageRole::User, "lookup stream")},
       .tools = {llama_lookup_tool},
   });
@@ -2003,21 +3538,15 @@
               })},
           })},
       }),
-      "main",
-      {},
-      {},
-      {},
-      {},
-      {},
-      {},
-      agent::NativeLlamaCppAdapters{.binding = llama_binding});
+      native_resolve_options("main", {}, {}, {}, {}, {}, {},
+                             agent::NativeLlamaCppAdapters{.binding = llama_binding}));
   SMOKE_CHECK(configured_llama_embedding_calls == 1);
   SMOKE_CHECK(configured_llama_app.knowledge && configured_llama_app.knowledge->base);
   auto configured_llama_hits = configured_llama_app.knowledge->base->search(
       "llama native config embedding", agent::KnowledgeSearchOptions{.top_k = 1, .min_score = 0.0});
   SMOKE_CHECK(configured_llama_embedding_calls == 2);
   SMOKE_CHECK(!configured_llama_hits.empty());
-  auto configured_llama_run = configured_llama_app.runner->run("configured llama", "llama-config-session");
+  auto configured_llama_run = configured_llama_app.runner->execution().run("configured llama", "llama-config-session");
   SMOKE_CHECK(configured_llama_run.text == "final");
   SMOKE_CHECK(seen_llama_config.lora_adapters.size() == 1);
   SMOKE_CHECK(seen_llama_config.lora_adapters.front().path == "/loras/config-domain.gguf");
@@ -2045,16 +3574,10 @@
               })},
           })},
       }),
-      "main",
-      {},
-      {},
-      {},
-      {},
-      {},
-      {},
-      agent::NativeLlamaCppAdapters{.binding = llama_binding});
+      native_resolve_options("main", {}, {}, {}, {}, {}, {},
+                             agent::NativeLlamaCppAdapters{.binding = llama_binding}));
   auto llama_structured_capability_run =
-      llama_structured_capability_app.runner->run("structured fallback", "llama-capability-session");
+      llama_structured_capability_app.runner->execution().run("structured fallback", "llama-capability-session");
   SMOKE_CHECK(llama_structured_capability_run.text == "final");
   SMOKE_CHECK(seen_llama_config.model_path == "/models/structured.gguf");
   SMOKE_CHECK(seen_llama_request.model == "llama-structured");
@@ -2164,6 +3687,187 @@
     image_magnitude += value * value;
   }
   SMOKE_CHECK(image_magnitude > 0.99 && image_magnitude < 1.01);
+
+  {
+    class SmokeMediaGenerationProvider final : public agent::MediaGenerationProvider {
+     public:
+      const agent::MediaGenerationProviderMetadata& metadata() const override {
+        return metadata_;
+      }
+
+      agent::MediaGenerationCapabilities capabilities() const override {
+        return agent::MediaGenerationCapabilities{
+            .kinds = {
+                agent::MediaGenerationKind::Image,
+                agent::MediaGenerationKind::Video,
+                agent::MediaGenerationKind::Audio,
+            },
+            .models = {"smoke-media-model"},
+            .mime_types = {"image/png", "video/mp4", "audio/wav"},
+            .features = {"seed", "progress", "artifact-output"},
+            .max_count = 4,
+            .supports_seed = true,
+            .supports_negative_prompt = true,
+        };
+      }
+
+      agent::AgentOutput generate(
+          const agent::MediaGenerationRequest& request,
+          const agent::MediaGenerationContext& context = {}) override {
+        if (context.cancellation) {
+          context.cancellation->throw_if_cancelled(agent::ExecutionTarget::Tool);
+        }
+        if (context.progress) {
+          context.progress(agent::MediaGenerationProgress{
+              .stage = "queued",
+              .message = "Smoke media generation queued.",
+              .fraction = 0.25,
+              .provider = metadata_.name,
+              .kind = request.kind,
+          });
+          context.progress(agent::MediaGenerationProgress{
+              .stage = "completed",
+              .message = "Smoke media generation completed.",
+              .fraction = 1.0,
+              .provider = metadata_.name,
+              .kind = request.kind,
+          });
+        }
+        std::string mime_type = "image/png";
+        std::string filename = "smoke.png";
+        std::vector<std::uint8_t> bytes = {static_cast<std::uint8_t>(0x89), 'P', 'N', 'G'};
+        if (request.kind == agent::MediaGenerationKind::Video) {
+          mime_type = "video/mp4";
+          filename = "smoke.mp4";
+          bytes = {'m', 'p', '4'};
+        } else if (request.kind == agent::MediaGenerationKind::Audio) {
+          mime_type = "audio/wav";
+          filename = "smoke.wav";
+          bytes = {'w', 'a', 'v'};
+        }
+        agent::MediaSource source;
+        source.kind = agent::MediaSourceKind::Inline;
+        source.data = agent::base64_encode(bytes);
+        source.mime_type = mime_type;
+        source.filename = filename;
+        return agent::AgentOutput{
+            .provider = metadata_.name,
+            .model = request.model.empty() ? "smoke-media-model" : request.model,
+            .finish_reason = "stop",
+            .artifacts = {
+                agent::AgentArtifact{
+                    .id = "asset-1",
+                    .kind = agent::to_string(request.kind),
+                    .mime_type = mime_type,
+                    .filename = filename,
+                    .bytes = bytes,
+                    .source = source,
+                    .metadata = agent::Value::object({{"prompt", request.prompt}}),
+                },
+            },
+            .metadata = agent::Value::object({{"kind", agent::to_string(request.kind)},
+                                              {"count", static_cast<long long>(request.count)}}),
+        };
+      }
+
+     private:
+      agent::MediaGenerationProviderMetadata metadata_{
+          .name = "smoke-media",
+          .tier = "portable",
+          .title = "Smoke Media",
+      };
+    };
+
+    agent::MediaGenerationProviderRegistry media_generation_registry;
+    media_generation_registry.register_provider(std::make_shared<SmokeMediaGenerationProvider>());
+    auto media_provider = media_generation_registry.require_by_kind(
+        agent::MediaGenerationKind::Image, "smoke-media");
+    SMOKE_CHECK(media_provider->supports(agent::MediaGenerationKind::Video));
+    auto invalid_media_issues = media_provider->validate(agent::MediaGenerationRequest{
+        .kind = agent::MediaGenerationKind::Image,
+        .count = 0,
+    });
+    SMOKE_CHECK(invalid_media_issues.size() >= 2);
+    SMOKE_CHECK(media_provider->capabilities().kinds.size() == 3);
+    SMOKE_CHECK(media_provider->metadata().name == "smoke-media");
+
+    agent::InMemoryArtifactStore media_artifacts;
+    auto direct_request = agent::MediaGenerationRequest{
+        .kind = agent::MediaGenerationKind::Audio,
+        .prompt = "short tone",
+    };
+    auto direct_result = media_provider->generate(direct_request);
+    agent::MediaGenerationOutputValueOptions direct_options;
+    direct_options.artifact_writer = agent::create_in_memory_media_artifact_writer(&media_artifacts);
+    direct_options.artifact_key_prefix = "media/smoke";
+    auto materialized_direct = agent::materialize_media_generation_output(direct_result, direct_options);
+    SMOKE_CHECK(materialized_direct.artifacts.front().source.kind == agent::MediaSourceKind::Artifact);
+    auto direct_value = agent::media_generation_output_to_value(materialized_direct);
+    SMOKE_CHECK(!direct_value.at("artifacts").as_array().front().at("source").at("key").as_string().empty());
+    SMOKE_CHECK(!direct_value.at("artifacts").as_array().front().at("source").contains("data"));
+    SMOKE_CHECK(media_artifacts.get(materialized_direct.artifacts.front().source.key)->value.at("base64").as_bool());
+
+    agent::MediaGenerationToolOptions media_tool_options;
+    media_tool_options.output_options.artifact_writer =
+        agent::create_in_memory_media_artifact_writer(&media_artifacts);
+    media_tool_options.output_options.artifact_key_prefix = "media/tools";
+    auto media_tools = agent::create_media_generation_builtin_tools(nullptr, media_tool_options);
+    agent::ToolRegistry media_tool_registry(media_tools);
+    SMOKE_CHECK(media_tool_registry.get("media.generateImage") != nullptr);
+    SMOKE_CHECK(agent::create_builtin_tool_bundle_registry().get("media") != nullptr);
+    auto media_bundle_tools = agent::create_builtin_tools({"media"});
+    agent::ToolRegistry media_bundle_registry(media_bundle_tools);
+    SMOKE_CHECK(media_bundle_registry.get("media.generateAudio") != nullptr);
+
+    agent::ToolExecutor media_executor(media_tool_registry);
+    std::vector<agent::ToolProgressEvent> media_progress;
+    agent::ToolExecutionContext media_context;
+    std::string media_default_provider = "smoke-media";
+    media_context.service_refs.service_container.set(agent::kToolServiceMediaGenerationRegistry,
+                                                     &media_generation_registry);
+    media_context.service_refs.service_container.set(agent::kToolServiceDefaultMediaGenerationProvider,
+                                                     &media_default_provider);
+    media_context.emit_progress = [&](agent::ToolProgressEvent event) {
+      media_progress.push_back(std::move(event));
+    };
+    auto generated_image = media_executor.execute_tool_call(
+        agent::ToolCall{
+            .id = "media-smoke-image",
+            .name = "media.generateImage",
+            .arguments = agent::Value::object({
+                {"prompt", "draw smoke test"},
+                {"model", "smoke-media-model"},
+                {"width", 64},
+                {"height", 32},
+            }),
+        },
+        media_context);
+    SMOKE_CHECK(generated_image.ok);
+    SMOKE_CHECK(!media_progress.empty());
+    SMOKE_CHECK(generated_image.message.content.size() == 1);
+    SMOKE_CHECK(generated_image.message.content.front().type == agent::ContentPartType::Image);
+    SMOKE_CHECK(generated_image.message.content.front().source.kind == agent::MediaSourceKind::Artifact);
+    const auto& generated_envelope = std::get<agent::ToolResultEnvelope>(*generated_image.result);
+    SMOKE_CHECK(generated_envelope.value);
+    auto generated_artifacts = generated_envelope.value->at("artifacts").as_array();
+    SMOKE_CHECK(generated_artifacts.front().at("source").at("kind").as_string() == "artifact");
+    SMOKE_CHECK(!generated_artifacts.front().at("source").contains("data"));
+    SMOKE_CHECK(media_artifacts.get(generated_artifacts.front().at("source").at("key").as_string()).has_value());
+
+    auto generated_video = media_executor.execute_tool_call(
+        agent::ToolCall{
+            .id = "media-smoke-video",
+            .name = "media.generateVideo",
+            .arguments = agent::Value::object({
+                {"prompt", "render smoke test"},
+                {"durationSeconds", 1.5},
+            }),
+        },
+        media_context);
+    SMOKE_CHECK(generated_video.ok);
+    SMOKE_CHECK(generated_video.message.content.front().type == agent::ContentPartType::Video);
+    SMOKE_CHECK(generated_video.message.content.front().source.mime_type == "video/mp4");
+  }
 
   agent::ChatProviderRegistry concurrent_chat_registry;
   agent::EmbeddingProviderRegistry concurrent_embedding_registry;

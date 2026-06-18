@@ -35,7 +35,7 @@ auto result = agent::create_tool_result_message(
 
 ## Content Parts
 
-Messages support text, image, and file parts:
+Messages support text, image, file, audio, and video parts:
 
 ```cpp
 agent::MediaSource source;
@@ -52,11 +52,14 @@ auto message = agent::create_message(
 ```
 
 `image_part` stores `alt_text`, optional `detail` (`low`, `high`, or `auto`),
-and part metadata. Invalid detail strings are normalized to empty when parsing
-from `Value`.
+and part metadata. `audio_part` stores `title` and `transcript_hint`.
+`video_part` stores `title`, `text_hint`, `transcript_hint`, and optional
+clip/frame hints. Invalid image detail strings are normalized to empty when
+parsing from `Value`.
 
-`extract_text_content` concatenates text parts only. Image and file parts remain
-available to media preprocessing, provider serializers, and knowledge ingestion.
+`extract_text_content` concatenates text parts only. Image, file, audio, and
+video parts remain available to media preprocessing, provider serializers, and
+knowledge ingestion.
 
 ## Media Sources
 
@@ -90,8 +93,9 @@ The serialized form uses:
 - `metadata`
 
 Content parts use `type`, `text`, `source`, `altText`, `detail`, `title`,
-`textHint`, and `metadata`. Media sources use `kind`, `data`, `url`, `path`,
-`key`, `mimeType`, and `filename`.
+`textHint`, `transcriptHint`, `startTimeSeconds`, `endTimeSeconds`,
+`frameRateHint`, and `metadata`. Media sources use `kind`, `data`, `url`,
+`path`, `key`, `mimeType`, and `filename`.
 
 ## Normalization
 
@@ -113,7 +117,7 @@ message.
 
 ## Assistant Responses
 
-`assistant_message_from_response` converts a `ModelResponse` into an assistant
+`assistant_message_from_output` converts a `AgentOutput` into an assistant
 message for memory and tool-loop history. It preserves visible content, tool
 calls, provider/model ids, finish reason, and reasoning metadata when present.
 

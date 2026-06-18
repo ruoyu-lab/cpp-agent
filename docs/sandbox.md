@@ -64,10 +64,11 @@ class SandboxScope {
 };
 ```
 
-The executor parks the active `SandboxScope*` on `ToolExecutionContext::
-service_refs.sandbox_scope` for the duration of `invoke()` so downstream
+The executor registers the active `SandboxScope*` as
+`kToolServiceSandboxScope` for the duration of `invoke()` so downstream
 consumers (e.g. `DeveloperProcessExecutor` reached via `shell.exec`) can
-pick up `request()` without rethreading arguments.
+pick up `request()` from the scoped service view without rethreading
+arguments.
 
 ## Contract semantics
 

@@ -155,7 +155,7 @@ struct PreprocessedDocument {
 };
 
 [[nodiscard]] std::string extract_pdf_text_from_bytes(const std::vector<std::uint8_t>& bytes);
-MediaResolverFunction create_native_http_media_resolver(HttpTransport transport = create_native_http_transport());
+MediaResolverFunction create_native_http_media_resolver(HttpTransport transport);
 
 class DocumentPreprocessor {
  public:

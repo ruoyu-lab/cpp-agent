@@ -1,4 +1,5 @@
-#include "agent/agent.hpp"
+#include "agent/context.hpp"
+#include "agent/tools.hpp"
 #include "detail/helpers.hpp"
 
 #include <algorithm>
@@ -51,6 +52,43 @@ Value string_vector_value(const std::vector<std::string>& values) {
     array.emplace_back(value);
   }
   return Value(std::move(array));
+}
+
+Value context_stats_metadata(Value metadata,
+                             const std::string& source_id,
+                             const std::string& source_title,
+                             const EmbeddedContextBlock& block,
+                             bool derived = false) {
+  if (!metadata.is_object()) {
+    metadata = Value::object({});
+  }
+  metadata["source"] = "embedded-context";
+  if (!source_id.empty()) {
+    metadata["sourceId"] = source_id;
+  }
+  if (!source_title.empty()) {
+    metadata["sourceTitle"] = source_title;
+  }
+  if (!block.title.empty()) {
+    metadata["blockTitle"] = block.title;
+  }
+  if (derived) {
+    metadata["derived"] = true;
+  }
+  return metadata;
+}
+
+std::string render_embedded_context_block(const EmbeddedContextBlock& block) {
+  return "\n\n### " + block.title + "\n" + block.content;
+}
+
+Value messages_to_value(const std::vector<AgentMessage>& messages) {
+  Value::Array values;
+  values.reserve(messages.size());
+  for (const auto& message : messages) {
+    values.push_back(agent_message_to_value(message));
+  }
+  return Value(std::move(values));
 }
 
 std::string truncate_plan_text(const std::string& value, std::size_t max_size = 700) {
@@ -146,6 +184,46 @@ std::string build_model_planner_prompt(const PlannerParams& params, std::size_t 
 
 }  // namespace
 
+std::string to_string(PromptAssemblySegmentKind kind) {
+  switch (kind) {
+    case PromptAssemblySegmentKind::System:
+      return "system";
+    case PromptAssemblySegmentKind::Preface:
+      return "preface";
+    case PromptAssemblySegmentKind::EmbeddedContext:
+      return "embedded-context";
+    case PromptAssemblySegmentKind::Conversation:
+      return "conversation";
+  }
+  return "conversation";
+}
+
+Value prompt_assembly_segment_to_value(const PromptAssemblySegment& segment) {
+  return Value::object({
+      {"id", segment.id},
+      {"label", segment.label},
+      {"kind", to_string(segment.kind)},
+      {"messages", messages_to_value(segment.messages)},
+      {"metadata", segment.metadata},
+  });
+}
+
+Value prompt_assembly_to_value(const PromptAssembly& assembly) {
+  Value::Array segments;
+  segments.reserve(assembly.segments.size());
+  for (const auto& segment : assembly.segments) {
+    segments.push_back(prompt_assembly_segment_to_value(segment));
+  }
+  return Value::object({
+      {"version", assembly.version},
+      {"sessionId", assembly.session_id},
+      {"iteration", assembly.iteration},
+      {"segments", Value(std::move(segments))},
+      {"messages", messages_to_value(assembly.messages)},
+      {"metadata", assembly.metadata},
+  });
+}
+
 EmbeddedContextManager::EmbeddedContextManager(std::vector<ContextSource> sources) {
   for (auto& source : sources) {
     register_source(std::move(source));
@@ -207,6 +285,8 @@ std::vector<EmbeddedContextBlock> EmbeddedContextManager::resolve_blocks(const V
   std::vector<EmbeddedContextBlock> blocks;
   for (const auto& source : sources) {
     auto resolved = source.resolve(runtime);
+    const bool multiple_blocks = resolved.size() > 1;
+    std::size_t block_index = 0;
     for (auto& block : resolved) {
       if (block.title.empty()) {
         block.title = source.title;
@@ -214,9 +294,26 @@ std::vector<EmbeddedContextBlock> EmbeddedContextManager::resolve_blocks(const V
       if (block.priority == 0) {
         block.priority = source.priority;
       }
+      if (!block.stats_kind) {
+        block.stats_kind = ContextStatsBucketKind::Context;
+      }
+      if (block.stats_id.empty()) {
+        block.stats_id = "context." + source.id;
+        if (multiple_blocks) {
+          block.stats_id += "." + std::to_string(block_index);
+        }
+      }
+      if (block.stats_label.empty()) {
+        block.stats_label = block.title.empty() ? source.title : block.title;
+      }
+      block.stats_metadata = context_stats_metadata(std::move(block.stats_metadata),
+                                                    source.id,
+                                                    source.title,
+                                                    block);
       if (!block.content.empty()) {
         blocks.push_back(std::move(block));
       }
+      ++block_index;
     }
   }
   std::sort(blocks.begin(), blocks.end(), [](const auto& left, const auto& right) {
@@ -225,19 +322,54 @@ std::vector<EmbeddedContextBlock> EmbeddedContextManager::resolve_blocks(const V
   return blocks;
 }
 
+EmbeddedContextAssembly EmbeddedContextManager::build_assembly(const Value& runtime) const {
+  EmbeddedContextAssembly assembly;
+  assembly.blocks = resolve_blocks(runtime);
+  if (assembly.blocks.empty()) {
+    return assembly;
+  }
+  constexpr std::string_view header = "Embedded context";
+  assembly.stats_buckets.push_back(ContextStatsBucketInput{
+      .id = "context.preamble",
+      .label = "Runtime Context Preamble",
+      .kind = ContextStatsBucketKind::Context,
+      .text = std::string(header),
+      .metadata = Value::object({{"source", "embedded-context"}, {"derived", true}}),
+  });
+
+  std::string content(header);
+  Value::Array block_titles;
+  Value::Array block_stats;
+  for (const auto& block : assembly.blocks) {
+    const std::string rendered = render_embedded_context_block(block);
+    content += rendered;
+    block_titles.emplace_back(block.title);
+    block_stats.push_back(Value::object({
+        {"id", block.stats_id},
+        {"label", block.stats_label},
+        {"kind", to_string(block.stats_kind.value_or(ContextStatsBucketKind::Context))},
+    }));
+    assembly.stats_buckets.push_back(ContextStatsBucketInput{
+        .id = block.stats_id,
+        .label = block.stats_label.empty() ? block.title : block.stats_label,
+        .kind = block.stats_kind.value_or(ContextStatsBucketKind::Context),
+        .text = rendered,
+        .metadata = block.stats_metadata,
+    });
+  }
+  assembly.message = create_message(MessageRole::System, content,
+                                    Value::object({{"source", "embedded-context"},
+                                                   {"blocks", Value(block_titles)},
+                                                   {"statsBlocks", Value(block_stats)}}));
+  return assembly;
+}
+
 std::optional<AgentMessage> EmbeddedContextManager::build_message(const Value& runtime) const {
-  const auto blocks = resolve_blocks(runtime);
-  if (blocks.empty()) {
-    return std::nullopt;
+  const auto assembly = build_assembly(runtime);
+  if (assembly.message) {
+    return assembly.message;
   }
-  std::string content = "Embedded context";
-  Value::Array block_ids;
-  for (const auto& block : blocks) {
-    content += "\n\n### " + block.title + "\n" + block.content;
-    block_ids.emplace_back(block.title);
-  }
-  return create_message(MessageRole::System, content,
-                        Value::object({{"source", "embedded-context"}, {"blocks", Value(block_ids)}}));
+  return std::nullopt;
 }
 
 StaticPlanner::StaticPlanner(ExecutionPlan plan) : plan_(std::move(plan)) {}

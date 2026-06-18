@@ -1,4 +1,4 @@
-#include "agent/agent.hpp"
+#include "agent/web.hpp"
 #include "detail/helpers.hpp"
 
 #include <algorithm>
@@ -525,16 +525,6 @@ NativeWebFetchTransport create_native_web_fetch_transport(HttpTransport transpor
       http_request.headers["user-agent"] = "native-agent-framework-cpp/1.0";
     }
     return page_from_http_response(request.request, transport(http_request));
-  };
-}
-
-NativeWebFetchTransport create_native_web_fetch_transport(NativeHttpClientConfig config) {
-  return [config](const NativeWebFetchTransportRequest& request) -> WebFetchedPage {
-    auto request_config = config;
-    if (request.request.timeout_ms > 0) {
-      request_config.timeout_ms = request.request.timeout_ms;
-    }
-    return create_native_web_fetch_transport(create_native_http_transport(request_config))(request);
   };
 }
 

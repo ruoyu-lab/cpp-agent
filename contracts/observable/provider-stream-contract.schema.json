@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "schema": {
+    "type": "object",
+    "required": [
+      "schemaVersion",
+      "provider",
+      "model",
+      "frameBoundary",
+      "textDelta",
+      "reasoningDelta",
+      "toolCallDelta",
+      "contentPart"
+    ],
+    "additionalProperties": false,
+    "properties": {
+      "schemaVersion": {
+        "type": "integer",
+        "const": 1
+      },
+      "provider": {
+        "type": "string",
+        "minLength": 1
+      },
+      "model": {
+        "type": "string"
+      },
+      "frameBoundary": {
+        "type": "string",
+        "enum": ["none", "sse-event", "json-line", "native-callback"]
+      },
+      "textDelta": {
+        "type": "boolean"
+      },
+      "reasoningDelta": {
+        "type": "boolean"
+      },
+      "toolCallDelta": {
+        "type": "boolean"
+      },
+      "contentPart": {
+        "type": "boolean"
+      }
+    }
+  },
+  "validSamples": [
+    {
+      "schemaVersion": 1,
+      "provider": "openai",
+      "model": "gpt-4.1",
+      "frameBoundary": "sse-event",
+      "textDelta": true,
+      "reasoningDelta": true,
+      "toolCallDelta": true,
+      "contentPart": true
+    },
+    {
+      "schemaVersion": 1,
+      "provider": "ollama",
+      "model": "qwen3",
+      "frameBoundary": "json-line",
+      "textDelta": true,
+      "reasoningDelta": true,
+      "toolCallDelta": false,
+      "contentPart": true
+    }
+  ],
+  "invalidSamples": [
+    {
+      "schemaVersion": 1,
+      "provider": "",
+      "model": "x",
+      "frameBoundary": "json-line",
+      "textDelta": true,
+      "reasoningDelta": true,
+      "toolCallDelta": false,
+      "contentPart": true
+    },
+    {
+      "schemaVersion": 1,
+      "provider": "fixture",
+      "model": "x",
+      "frameBoundary": "bytes",
+      "textDelta": true,
+      "reasoningDelta": false,
+      "toolCallDelta": false,
+      "contentPart": false
+    }
+  ]
+}

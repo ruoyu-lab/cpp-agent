@@ -1,6 +1,7 @@
 #pragma once
 
 #include "agent/autonomous.hpp"
+#include "agent/async.hpp"
 #include "agent/config.hpp"
 #include "agent/http.hpp"
 #include "agent/runtime.hpp"
@@ -346,6 +347,12 @@ struct AgentServerAutonomousConfig {
   AgentServerAutonomousAccessConfig access;
 };
 
+struct AgentServerAsyncRunsConfig {
+  AsyncAgentRunController* controller = nullptr;
+  AsyncAgentRunWorker* worker = nullptr;
+  AgentServerTaskAccessConfig access;
+};
+
 struct AgentServerWorkflowConfig {
   WorkflowEngine* engine = nullptr;
   WorkflowStore* store = nullptr;
@@ -419,6 +426,7 @@ struct AgentServerOptions {
   AgentServerSessionPolicy session;
   SessionStore* session_store = nullptr;
   std::optional<AgentServerTasksConfig> tasks;
+  std::optional<AgentServerAsyncRunsConfig> async_runs;
   std::optional<AgentServerAutonomousConfig> autonomous;
   std::optional<AgentServerWorkflowConfig> workflow;
   std::optional<AgentServerApprovalsConfig> approvals;
@@ -475,6 +483,14 @@ class AgentServerApp {
 
  private:
   void register_builtin_routes();
+  void register_core_routes();
+  void register_session_routes();
+  void register_approval_routes();
+  void register_task_routes();
+  void register_async_run_routes();
+  void register_autonomous_routes();
+  void register_workflow_routes();
+  void register_chat_routes();
   std::optional<HttpResponse> handle_cors_preflight(const HttpRequest& request, const std::string& path);
   void apply_cors_headers(const HttpRequest& request, HttpResponse& response) const;
   AgentServerAccessContext enforce_access(const HttpRequest& request, HttpResponse& response,
@@ -489,6 +505,15 @@ class AgentServerApp {
   HttpResponse handle_task_state(const AgentServerRequestContext& context);
   HttpResponse handle_task_resume(const AgentServerRequestContext& context);
   HttpResponse handle_task_cancel(const AgentServerRequestContext& context);
+  HttpResponse handle_async_run_list(const AgentServerRequestContext& context);
+  HttpResponse handle_async_run_create(const AgentServerRequestContext& context);
+  HttpResponse handle_async_run_get(const AgentServerRequestContext& context);
+  HttpResponse handle_async_run_events(const AgentServerRequestContext& context);
+  HttpResponse handle_async_run_checkpoints(const AgentServerRequestContext& context);
+  HttpResponse handle_async_run_transcript(const AgentServerRequestContext& context);
+  HttpResponse handle_async_run_resume(const AgentServerRequestContext& context);
+  HttpResponse handle_async_run_cancel(const AgentServerRequestContext& context);
+  HttpResponse handle_async_run_work_once(const AgentServerRequestContext& context);
   HttpResponse handle_autonomous_list(const AgentServerRequestContext& context);
   HttpResponse handle_autonomous_create(const AgentServerRequestContext& context);
   HttpResponse handle_autonomous_get(const AgentServerRequestContext& context);
@@ -505,6 +530,7 @@ class AgentServerApp {
   HttpResponse handle_approval_resolve(const AgentServerRequestContext& context);
   HttpResponse handle_session_list(const AgentServerRequestContext& context);
   HttpResponse handle_session_get(const AgentServerRequestContext& context);
+  HttpResponse handle_session_compact(const AgentServerRequestContext& context);
   HttpResponse handle_session_delete(const AgentServerRequestContext& context);
   void append_audit(AuditRecord record) const;
   struct ResolvedWorkflowRuntime {
@@ -547,5 +573,6 @@ class AgentServerApp {
 };
 
 AgentServerApp create_agent_server_app(AgentServerOptions options = {});
+AgentServerApp create_server_app(AgentServerOptions options = {});
 
 }  // namespace agent

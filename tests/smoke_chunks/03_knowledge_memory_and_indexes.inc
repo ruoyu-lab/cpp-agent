@@ -397,11 +397,18 @@
   SMOKE_CHECK(qdrant_vector_index_provider != nullptr);
   SMOKE_CHECK(qdrant_vector_index_provider->metadata.tier == "external");
   SMOKE_CHECK(contains_string(qdrant_vector_index_provider->metadata.tags, "qdrant"));
-  SMOKE_CHECK(vector_index_registry.create("qdrant", agent::Value::object({
-      {"baseUrl", "http://127.0.0.1:6333"},
-      {"collection", "agent-smoke"},
-      {"headers", agent::Value::object({{"x-test", "yes"}})},
-  })) != nullptr);
+  bool qdrant_without_transport_failed = false;
+  try {
+    (void)vector_index_registry.create("qdrant", agent::Value::object({
+        {"baseUrl", "http://127.0.0.1:6333"},
+        {"collection", "agent-smoke"},
+        {"headers", agent::Value::object({{"x-test", "yes"}})},
+    }));
+  } catch (const agent::ConfigurationError& error) {
+    qdrant_without_transport_failed =
+        std::string(error.what()).find("requires an HTTP transport") != std::string::npos;
+  }
+  SMOKE_CHECK(qdrant_without_transport_failed);
   SMOKE_CHECK(vector_index_registry.create("missing-vector-index") == nullptr);
   agent::KnowledgeVectorIndexRegistry legacy_vector_index_registry;
   legacy_vector_index_registry.register_index("custom", [] {
@@ -1175,8 +1182,8 @@
   SMOKE_CHECK(empty_knowledge.ok);
   SMOKE_CHECK(empty_knowledge.output.find("\"hits\": []") != std::string::npos);
   agent::ToolExecutionContext agent_service_context;
-  agent_service_context.service_refs.session = &tool_session;
-  agent_service_context.service_refs.knowledge_base = &kb;
+  agent_service_context.service_refs.service_container.set(agent::kToolServiceSessionMemory, &tool_session);
+  agent_service_context.service_refs.service_container.set(agent::kToolServiceKnowledgeProvider, &kb);
   auto service_session_snapshot = empty_agent_executor.execute_tool_call(agent::ToolCall{
       .id = "session_service_1",
       .name = "session.snapshot",
@@ -1263,17 +1270,17 @@
   }
   SMOKE_CHECK(rejected_nameless_tool_message);
 
-  agent::ModelResponse assistant_reasoning_response;
+  agent::AgentOutput assistant_reasoning_response;
   assistant_reasoning_response.provider = "fixture";
   assistant_reasoning_response.model = "reasoning-model";
   assistant_reasoning_response.text = "answer";
   assistant_reasoning_response.reasoning = agent::ModelReasoning{.text = "reasoned", .format = "summary"};
-  auto assistant_reasoning_message = agent::assistant_message_from_response(assistant_reasoning_response);
+  auto assistant_reasoning_message = agent::assistant_message_from_output(assistant_reasoning_response);
   SMOKE_CHECK(assistant_reasoning_message.metadata.at("reasoning").at("text").as_string() == "reasoned");
   SMOKE_CHECK(assistant_reasoning_message.metadata.at("reasoning").at("format").as_string() == "summary");
-  agent::ModelResponse assistant_plain_response;
+  agent::AgentOutput assistant_plain_response;
   assistant_plain_response.text = "plain";
-  auto assistant_plain_message = agent::assistant_message_from_response(assistant_plain_response);
+  auto assistant_plain_message = agent::assistant_message_from_output(assistant_plain_response);
   SMOKE_CHECK(assistant_plain_message.metadata.at("reasoning").is_null());
   SMOKE_CHECK(assistant_plain_message.metadata.at("provider").is_null());
 
@@ -1380,6 +1387,79 @@
     SMOKE_CHECK(agent::extract_text_content(summarized_messages.front().content).find("Custom summary:\ncustom:one") !=
            std::string::npos);
     SMOKE_CHECK(summarized_messages.front().metadata.at("source").as_string() == "session-memory");
+  }
+
+  {
+    class CapturingMemorySummaryAdapter : public agent::ChatModelAdapter {
+     public:
+      CapturingMemorySummaryAdapter()
+          : agent::ChatModelAdapter("test", "memory-summary", 0.0, 1024, {"input.text"}) {}
+
+      agent::AgentOutput generate(const agent::GenerateParams& params) override {
+        calls.push_back(params);
+        agent::AgentOutput response;
+        response.text = next_text;
+        return build_output(response);
+      }
+
+      std::vector<agent::GenerateParams> calls;
+      std::string next_text = "summary from model";
+    };
+
+    auto adapter = std::make_shared<CapturingMemorySummaryAdapter>();
+    agent::LLMSessionSummarizerOptions llm_options;
+    llm_options.model = adapter;
+    llm_options.max_input_chars = 80;
+    llm_options.max_archived_messages = 1;
+    llm_options.max_summary_tokens = 64;
+    auto summarizer = agent::create_llm_session_summarizer(llm_options);
+    const auto summary = summarizer(agent::SessionMemorySummaryInput{
+        "llm-summary",
+        "User prefers concise answers.",
+        {
+            agent::create_message(agent::MessageRole::User,
+                                  "older turn that should be omitted by count"),
+            agent::create_message(agent::MessageRole::Assistant,
+                                  "recent implementation detail with /tmp/workspace/file.cpp"),
+        },
+    });
+    SMOKE_CHECK(summary == "summary from model");
+    SMOKE_CHECK(adapter->calls.size() == 1);
+    SMOKE_CHECK(adapter->calls.front().settings.max_output_tokens == 64);
+    std::string prompt_text;
+    for (const auto& message : adapter->calls.front().messages) {
+      prompt_text += agent::extract_text_content(message.content);
+      prompt_text += "\n";
+    }
+    SMOKE_CHECK(prompt_text.find("Previous summary:") != std::string::npos);
+    SMOKE_CHECK(prompt_text.find("User prefers concise answers.") != std::string::npos);
+    SMOKE_CHECK(prompt_text.find("Archived messages omitted by count: 1") != std::string::npos);
+    SMOKE_CHECK(prompt_text.find("recent implementation detail") != std::string::npos);
+    SMOKE_CHECK(prompt_text.find("older turn that should be omitted") == std::string::npos);
+  }
+
+  {
+    class ThrowingMemorySummaryAdapter : public agent::ChatModelAdapter {
+     public:
+      ThrowingMemorySummaryAdapter()
+          : agent::ChatModelAdapter("test", "throwing-summary", 0.0, 1024, {"input.text"}) {}
+
+      agent::AgentOutput generate(const agent::GenerateParams&) override {
+        throw agent::AdapterError("provider unavailable");
+      }
+    };
+
+    agent::LLMSessionSummarizerOptions llm_options;
+    llm_options.model = std::make_shared<ThrowingMemorySummaryAdapter>();
+    llm_options.on_error = agent::LLMSessionSummarizerErrorMode::Fallback;
+    auto summarizer = agent::create_llm_session_summarizer(llm_options);
+    const auto summary = summarizer(agent::SessionMemorySummaryInput{
+        "llm-fallback",
+        "existing",
+        {agent::create_message(agent::MessageRole::Assistant, "archived detail")},
+    });
+    SMOKE_CHECK(summary.find("existing") != std::string::npos);
+    SMOKE_CHECK(summary.find("archived detail") != std::string::npos);
   }
 
   {
@@ -1738,6 +1818,122 @@
     });
     SMOKE_CHECK(plan3.drop_count == 0);
     SMOKE_CHECK(plan3.overflow.empty());
+  }
+
+  {
+    agent::PromptAssembly prompt_assembly;
+    prompt_assembly.session_id = "prompt-contract";
+    prompt_assembly.iteration = 2;
+    prompt_assembly.segments.push_back(agent::PromptAssemblySegment{
+        .id = "system.prompt",
+        .label = "System Prompt",
+        .kind = agent::PromptAssemblySegmentKind::System,
+        .messages = {agent::create_message(agent::MessageRole::System, "system root")},
+        .metadata = agent::Value::object({{"source", "test"}}),
+    });
+    prompt_assembly.segments.push_back(agent::PromptAssemblySegment{
+        .id = "session.conversation",
+        .label = "Conversation",
+        .kind = agent::PromptAssemblySegmentKind::Conversation,
+        .messages = {agent::create_message(agent::MessageRole::User, "hello")},
+        .metadata = agent::Value::object({{"source", "session-memory"}}),
+    });
+    for (const auto& segment : prompt_assembly.segments) {
+      prompt_assembly.messages.insert(prompt_assembly.messages.end(),
+                                      segment.messages.begin(),
+                                      segment.messages.end());
+    }
+    const auto prompt_value = agent::prompt_assembly_to_value(prompt_assembly);
+    SMOKE_CHECK(prompt_value.at("version").as_integer() == 1);
+    SMOKE_CHECK(prompt_value.at("sessionId").as_string() == "prompt-contract");
+    SMOKE_CHECK(prompt_value.at("segments").as_array().size() == 2);
+    SMOKE_CHECK(prompt_value.at("segments").as_array().front().at("kind").as_string() == "system");
+    SMOKE_CHECK(prompt_value.at("messages").as_array().size() == 2);
+  }
+
+  {
+    agent::SessionMemoryOptions options;
+    options.storage.session_id = "rehydrate-native";
+    options.compaction.compaction_budget.max_messages = 1;
+    agent::SessionMemory session(options);
+    session.add(agent::create_message(agent::MessageRole::User, "first"));
+    session.add(agent::create_message(agent::MessageRole::Assistant, "second"));
+    session.compact();
+    auto rehydrated = agent::rehydrate_session_memory(session.snapshot(), options);
+    const auto messages = rehydrated->get_messages();
+    std::string rendered;
+    for (const auto& message : messages) {
+      rendered += agent::extract_text_content(message.content);
+      rendered += "\n";
+    }
+    SMOKE_CHECK(rendered.find("Conversation summary") != std::string::npos);
+    SMOKE_CHECK(rendered.find("first") != std::string::npos);
+    SMOKE_CHECK(rendered.find("second") != std::string::npos);
+    SMOKE_CHECK(rehydrated->snapshot().session_id == "rehydrate-native");
+  }
+
+  {
+    agent::InMemoryRunTranscript transcript;
+    auto first = transcript.append(agent::RunTranscriptAppendInput{
+        .run_id = "run-a",
+        .kind = "prompt-assembly",
+        .payload = agent::Value::object({{"ok", true}}),
+    });
+    auto second = transcript.append(agent::RunTranscriptAppendInput{
+        .run_id = "run-a",
+        .kind = "model-response",
+        .payload = agent::Value::object({{"text", "done"}}),
+    });
+    SMOKE_CHECK(first.sequence == 1);
+    SMOKE_CHECK(second.sequence == 2);
+    SMOKE_CHECK(transcript.list(agent::RunTranscriptListOptions{.run_id = "run-a"}).size() == 2);
+    SMOKE_CHECK(transcript.list(agent::RunTranscriptListOptions{.kind = "model-response"}).size() == 1);
+
+    const auto transcript_path = persistent_dir / "run-transcript.jsonl";
+    std::filesystem::remove(transcript_path);
+    agent::FileRunTranscript file_transcript(transcript_path);
+    file_transcript.append(agent::RunTranscriptAppendInput{.run_id = "file-run", .kind = "event"});
+    file_transcript.append(agent::RunTranscriptAppendInput{.run_id = "file-run", .kind = "checkpoint"});
+    agent::FileRunTranscript reopened_transcript(transcript_path);
+    auto third = reopened_transcript.append(agent::RunTranscriptAppendInput{.run_id = "other", .kind = "event"});
+    SMOKE_CHECK(third.sequence == 3);
+    SMOKE_CHECK(reopened_transcript.list(agent::RunTranscriptListOptions{.run_id = "file-run"}).size() == 2);
+  }
+
+  {
+    const auto layered_dir = persistent_dir / "layered-memory";
+    std::filesystem::remove_all(layered_dir);
+    agent::FileLayeredMemoryStore layered(agent::FileLayeredMemoryConfig{
+        .base_dir = layered_dir,
+        .layers = {agent::FileMemoryLayerConfig{.id = "project"}},
+        .default_layer = "profile",
+    });
+    layered.remember(agent::LayeredMemoryRememberInput{
+        .content = "User prefers concise replies.",
+    });
+    layered.remember(agent::LayeredMemoryRememberInput{
+        .layer = "project",
+        .content = "Project uses PromptAssembly.",
+    });
+    agent::FileLayeredMemoryStore reopened(agent::FileLayeredMemoryConfig{
+        .base_dir = layered_dir,
+        .default_layer = "profile",
+    });
+    const auto profile_hits = reopened.search("concise", agent::LayeredMemorySearchOptions{
+        .layers = {"profile"},
+    });
+    const auto project_hits = reopened.search("PromptAssembly", agent::LayeredMemorySearchOptions{
+        .layers = {"project"},
+    });
+    SMOKE_CHECK(profile_hits.size() == 1);
+    SMOKE_CHECK(project_hits.size() == 1);
+    std::vector<agent::LayeredMemorySearchHit> combined = profile_hits;
+    combined.insert(combined.end(), project_hits.begin(), project_hits.end());
+    const auto context_message = reopened.create_context_message(combined);
+    SMOKE_CHECK(context_message.has_value());
+    const auto context_text = agent::extract_text_content(context_message->content);
+    SMOKE_CHECK(context_text.find("[profile]") != std::string::npos);
+    SMOKE_CHECK(context_text.find("[project]") != std::string::npos);
   }
 
   // === SessionMemory hardening — race + event + structured error ===
@@ -2740,6 +2936,27 @@
     auto definitions = manager.list_knowledge_bases("tenant-a");
     SMOKE_CHECK(definitions.size() == 1);
     SMOKE_CHECK(!definitions.front().store_file_path.empty());
+    const auto manager_root = std::filesystem::weakly_canonical(knowledge_manager_dir).lexically_normal();
+    const auto managed_store_path =
+        std::filesystem::weakly_canonical(std::filesystem::path(definitions.front().store_file_path)).lexically_normal();
+    const auto managed_store_rel = managed_store_path.lexically_relative(manager_root);
+    SMOKE_CHECK(!managed_store_rel.empty());
+    SMOKE_CHECK(managed_store_rel.native().find("..") != 0);
+
+    auto escaped = manager.create_knowledge_base(agent::ManagedKnowledgeBaseConfig{
+        .id = "../managed/escape",
+        .tenant_id = "..",
+        .title = "Escaped path input",
+    });
+    SMOKE_CHECK(escaped->id() == "../managed/escape");
+    auto escaped_definitions = manager.list_knowledge_bases("..");
+    SMOKE_CHECK(escaped_definitions.size() == 1);
+    const auto escaped_store_path =
+        std::filesystem::weakly_canonical(std::filesystem::path(escaped_definitions.front().store_file_path)).lexically_normal();
+    const auto escaped_store_rel = escaped_store_path.lexically_relative(manager_root);
+    SMOKE_CHECK(!escaped_store_rel.empty());
+    SMOKE_CHECK(escaped_store_rel.native().find("..") != 0);
+    SMOKE_CHECK(manager.delete_knowledge_base("../managed/escape", ".."));
   }
   {
     agent::KnowledgeBaseManager reloaded_manager(
@@ -2763,6 +2980,33 @@
     SMOKE_CHECK(reloaded_manager.delete_knowledge_base("managed", "tenant-a"));
     SMOKE_CHECK(!reloaded_manager.get_knowledge_base("managed", "tenant-a"));
     SMOKE_CHECK(!std::filesystem::exists(knowledge_manager_dir / "tenant-a" / "managed"));
+  }
+  {
+    const auto hostile_manager_dir = persistent_dir / "knowledge-manager-hostile";
+    const auto outside_store = persistent_dir / "outside-store.json";
+    std::filesystem::create_directories(hostile_manager_dir);
+    agent::write_json_file(hostile_manager_dir / "knowledge-bases.json", agent::Value::object({
+        {"knowledgeBases", agent::Value::array({
+            agent::Value::object({
+                {"id", std::string("evil")},
+                {"tenantId", std::string("default")},
+                {"title", std::string("Evil")},
+                {"storeFilePath", outside_store.string()},
+            }),
+        })},
+    }));
+    agent::KnowledgeBaseManager hostile_manager(
+        hostile_manager_dir,
+        std::make_shared<agent::HashEmbeddingAdapter>(),
+        std::make_shared<agent::HashImageEmbeddingAdapter>(),
+        std::make_shared<agent::TextKnowledgeSourceLoader>());
+    bool hostile_path_rejected = false;
+    try {
+      (void)hostile_manager.get_knowledge_base("evil", "default");
+    } catch (const agent::ConfigurationError&) {
+      hostile_path_rejected = true;
+    }
+    SMOKE_CHECK(hostile_path_rejected);
   }
 
   const auto task_file = persistent_dir / "tasks.json";

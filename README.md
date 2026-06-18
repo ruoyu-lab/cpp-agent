@@ -17,7 +17,7 @@ compatible, but the deployment model is intentionally different:
 
 - zero-dependency core by default
 - host-owned transports, drivers, browser engines, and external service clients
-- one embeddable native library instead of the npm workspace package split
+- layered native targets with an embeddable default and explicit full-stack opt-in
 
 See [`../ENGINEERING.md`](../ENGINEERING.md) for the repo-level engineering
 roadmap, technical debt priorities, and recommended abstraction work.
@@ -25,10 +25,12 @@ roadmap, technical debt priorities, and recommended abstraction work.
 Current migration stage:
 
 - Pure C++20, standard library only.
-- Static library target: `agent_native`.
+- Embeddable aggregate target: `agent_native`.
+- Full-stack aggregate target: `agent_full`.
 - CLI executable target: `native_agent_cli`.
 - No plugin loader, dynamic module system, Node runtime, npm package, or external dependency.
-- Public include entrypoint: `include/agent/agent.hpp`.
+- Runtime include entrypoint: `include/agent/agent.hpp`.
+- Full-stack include entrypoint: `include/agent/full.hpp`.
 - Internal modules: `include/agent/*.hpp` and `src/agent/*.cpp`.
 - Ported first-pass core surfaces:
   - value / JSON-like payloads
@@ -44,7 +46,7 @@ Current migration stage:
   - file-backed session, vector, task, approval, artifact, and shared-state stores, plus injected-Postgres approval persistence
   - embedded context
   - execution plan rendering, JSON normalization/parsing/serialization, static planners, model-backed planners, and config-created planner wiring
-  - agent loop and runner, including runner planner injection/result reporting/stream planning events, automatic knowledge-base context retrieval with knowledge hit/debug propagation, AgentLoop and AgentRunner durable checkpoint/resume state, string/content-part/full `AgentMessage` runtime input entrypoints with message metadata preservation, CancellationToken propagation through runner/loop/model/retrieval/tool execution with active model cancellation callbacks, timeout enforcement and retry scheduling events for model/retrieval/tool execution policies, run lifecycle EventBus events, stream status events for knowledge/memory/planning/model/tool stages, synchronous stream-event execution for model deltas, tool progress, and aggregate tool-batch events, lifecycle hook dispatch including retrieval hooks/events, and merged typed/JSON tool execution services with runner-bound knowledge references
+  - ReAct runner, including runner planner injection/result reporting/stream planning events, automatic knowledge-base context retrieval with knowledge hit/debug propagation, durable checkpoint/resume state, string/content-part/full `AgentMessage` runtime input entrypoints with message metadata preservation, CancellationToken propagation through runner/model/retrieval/tool execution with active model cancellation callbacks, timeout enforcement and retry scheduling events for model/retrieval/tool execution policies, run lifecycle EventBus events, stream status events for knowledge/memory/planning/model/tool stages, synchronous stream-event execution for model deltas, tool progress, and aggregate tool-batch events, lifecycle hook dispatch including retrieval hooks/events, and merged typed/JSON tool execution services with runner-bound knowledge references
   - workflow state/checkpoint/signal serialization, node registry, built-in start/transform/tool/agent/condition/human-wait/artifact/router/join/webhook-wait/end handlers, direct `workflow-node-human` and injected-transport `workflow-node-webhook` handler factories, builder helpers, lifecycle hooks, in-memory/file-backed stores, callback and AgentRunner child-agent bindings, persisted resume, and native config engine wiring
   - core and developer builtin tools
   - browser renderer interfaces, callback-backed renderer adapter, and browser render/extract/screenshot builtin tools

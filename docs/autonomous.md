@@ -5,6 +5,11 @@ steps, checkpoints, events, waiting states, resume, and cancellation. It is
 separate from the task queue: tasks schedule work; autonomous runs model a
 multi-step goal.
 
+Autonomous stores are `runtime-owned` state for long-running agent execution.
+They may be enough for small local applications, but larger hosts should treat
+them as the execution ledger around a business operation, not as the business
+operation's source of truth.
+
 ## Data Model
 
 An autonomous run contains:

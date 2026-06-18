@@ -3,6 +3,11 @@
 The native orchestration module provides artifact stores, shared state,
 mailboxes, routing strategies, replanning strategies, and coordinator loops.
 
+Artifact stores, shared state stores, and mailboxes are coordination substrate.
+They are useful as canonical state in small local deployments, and as
+`runtime-owned` or `derived` infrastructure in larger hosts. Business records
+and tenant-owned domain data should remain in the embedding application.
+
 ## File Stores
 
 File-backed artifact and shared-state stores support NodeJS-style config-object

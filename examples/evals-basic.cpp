@@ -10,15 +10,15 @@
 // Echo model returns the input verbatim, so each case asserts that the
 // output mentions a chosen phrase.
 
-#include "agent/agent.hpp"
+#include "agent/app_api.hpp"
 
 #include <iostream>
 #include <memory>
 
 int main() {
   agent::AgentRunnerConfig config;
-  config.adapter = std::make_shared<agent::EchoChatModelAdapter>();
-  config.max_iterations = 1;
+  config.model_runtime.adapter = std::make_shared<agent::EchoChatModelAdapter>();
+  config.context_runtime.max_iterations = 1;
   agent::AgentRunner runner(std::move(config));
 
   agent::EvalSuite suite;

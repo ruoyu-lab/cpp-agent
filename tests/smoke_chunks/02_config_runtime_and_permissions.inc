@@ -100,8 +100,12 @@
     governed_schema.properties["message"].type = agent::JsonSchemaType::String;
     auto governance_model = std::make_shared<GovernanceModel>();
     agent::AgentRunner governance_runner(agent::AgentRunnerConfig{
-        .adapter = governance_model,
-        .max_iterations = 1,
+        .model_runtime = {
+            .adapter = governance_model,
+        },
+        .context_runtime = {
+            .max_iterations = 1,
+        },
     });
     agent::AgentServerApp governance_server(agent::AgentServerOptions{.allow_unauthenticated = true,
         .runner = &governance_runner,
@@ -165,6 +169,31 @@
   });
   assert(locked_delete_response.status == 403);
   assert(!locked_sessions.list_session_ids().empty());
+
+  agent::SessionMemoryOptions compact_route_options;
+  compact_route_options.compaction.compaction_budget.max_messages = 1;
+  agent::InMemorySessionStore compact_route_sessions(agent::InMemorySessionStoreConfig{
+      .session_options = compact_route_options,
+  });
+  auto compact_route_session = compact_route_sessions.get("manual-compact");
+  compact_route_session->add(agent::create_message(agent::MessageRole::User, "first"));
+  compact_route_session->add(agent::create_message(agent::MessageRole::Assistant, "second"));
+  compact_route_session->add(agent::create_message(agent::MessageRole::User, "third"));
+  agent::AgentServerApp compact_route_server(agent::AgentServerOptions{.allow_unauthenticated = true,
+      .session_store = &compact_route_sessions,
+  });
+  auto compact_route_response = compact_route_server.handle(agent::HttpRequest{
+      .url = "/sessions/manual-compact/compact",
+      .method = "POST",
+  });
+  assert(compact_route_response.status == 200);
+  auto compact_route_payload = agent::parse_json(compact_route_response.body);
+  assert(compact_route_payload.at("ok").as_bool());
+  assert(compact_route_payload.at("sessionId").as_string() == "manual-compact");
+  assert(compact_route_payload.at("snapshot").at("messages").as_array().size() == 1);
+  assert(compact_route_payload.at("snapshot").at("summary").as_string().find("first") !=
+         std::string::npos);
+
   agent::SessionMemoryOptions configured_session_options;
   configured_session_options.storage.summary_label = "Configured summary";
   configured_session_options.storage.summary = "seed summary";
@@ -1623,14 +1652,18 @@
       .text = "# Feature Docs\nEncoded branch ref content.\n",
   });
   agent::NativeWebCrawler knowledge_crawler(&knowledge_fetcher);
-  auto knowledge_loader = agent::create_default_knowledge_loader(&knowledge_fetcher, &knowledge_crawler);
-  auto pdf_documents = knowledge_loader->load(agent::Value::object({
-      {"type", "file"},
-      {"path", (knowledge_dir / "paper.pdf").string()},
-  }));
-  assert(pdf_documents.size() == 1);
-  assert(pdf_documents.front().content.find("Native PDF Knowledge") != std::string::npos);
-  assert(pdf_documents.front().metadata.at("pdfExtractor").as_string() == "native");
+  auto knowledge_loader = agent::create_web_enabled_knowledge_loader(&knowledge_fetcher, &knowledge_crawler);
+  bool pdf_requires_optional_document_io = false;
+  try {
+    (void)knowledge_loader->load(agent::Value::object({
+        {"type", "file"},
+        {"path", (knowledge_dir / "paper.pdf").string()},
+    }));
+  } catch (const agent::ConfigurationError& error) {
+    pdf_requires_optional_document_io =
+        std::string(error.what()).find("optional document I/O pipeline") != std::string::npos;
+  }
+  assert(pdf_requires_optional_document_io);
   auto markdown_documents = knowledge_loader->load(agent::Value::object({
       {"type", "markdown"},
       {"path", knowledge_dir.string()},
@@ -1695,7 +1728,10 @@
       agent::Value::object({{"type", "text"}, {"text", "Inline native knowledge."}, {"title", "Inline"}}),
       agent::Value::object({{"type", "file"}, {"path", (knowledge_dir / "guide.md").string()}}),
       agent::Value::object({{"type", "markdown"}, {"path", knowledge_dir.string()}, {"recursive", false}}),
-      agent::Value::object({{"type", "directory"}, {"path", knowledge_dir.string()}, {"recursive", true}}),
+      agent::Value::object({{"type", "directory"},
+                            {"path", knowledge_dir.string()},
+                            {"recursive", true},
+                            {"excludeExtensions", agent::Value::array({".pdf"})}}),
       agent::Value::object({{"type", "web"}, {"url", "https://knowledge.example.test/web"}}),
       agent::Value::object({{"type", "website"}, {"url", "https://knowledge.example.test/"}, {"maxDepth", 1}, {"maxPages", 3}}),
       agent::Value::object({{"type", "sitemap"}, {"url", "https://knowledge.example.test/sitemap.xml"}, {"limit", 1}}),
@@ -1746,7 +1782,7 @@
         };
       });
   auto render_knowledge_loader =
-      agent::create_default_knowledge_loader(&knowledge_fetcher, &knowledge_crawler, &knowledge_browser);
+      agent::create_web_enabled_knowledge_loader(&knowledge_fetcher, &knowledge_crawler, &knowledge_browser);
   auto rendered_website_documents = render_knowledge_loader->load(agent::Value::object({
       {"type", "website"},
       {"url", "https://knowledge.example.test/workflow"},
@@ -1760,7 +1796,7 @@
   assert(rendered_website_documents.front().content.find("Rendered website knowledge") != std::string::npos);
 
   auto loader_registry =
-      agent::create_default_knowledge_loader_registry(&knowledge_fetcher, &knowledge_crawler, &knowledge_browser);
+      agent::create_web_enabled_knowledge_loader_registry(&knowledge_fetcher, &knowledge_crawler, &knowledge_browser);
   auto loader_provider_names = loader_registry.list_names();
   assert(contains_string(loader_provider_names, "text"));
   assert(contains_string(loader_provider_names, "file"));

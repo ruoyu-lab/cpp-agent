@@ -7,6 +7,7 @@
 //   - Persisting and inspecting the run state through an in-memory store.
 
 #include "agent/agent.hpp"
+#include "agent/workflow.hpp"
 
 #include <iostream>
 

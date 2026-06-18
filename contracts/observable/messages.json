@@ -119,6 +119,87 @@
         "toolCalls": [],
         "metadata": {}
       }
+    },
+    {
+      "name": "user audio and video message",
+      "input": {
+        "role": "user",
+        "content": [
+          {
+            "type": "audio",
+            "source": {
+              "kind": "inline",
+              "data": "UklGRg==",
+              "mimeType": "audio/wav",
+              "filename": "clip.wav"
+            },
+            "title": "Voice note",
+            "transcriptHint": "speaker asks for status",
+            "metadata": {
+              "channel": "mic"
+            }
+          },
+          {
+            "type": "video",
+            "source": {
+              "kind": "url",
+              "url": "https://example.test/demo.mp4",
+              "mimeType": "video/mp4",
+              "filename": "demo.mp4"
+            },
+            "title": "Demo clip",
+            "textHint": "screen recording",
+            "transcriptHint": "user narrates the bug",
+            "startTimeSeconds": 1.5,
+            "endTimeSeconds": 8,
+            "frameRateHint": 24,
+            "metadata": {
+              "scene": "desktop"
+            }
+          }
+        ]
+      },
+      "expected": {
+        "role": "user",
+        "content": [
+          {
+            "type": "audio",
+            "source": {
+              "kind": "inline",
+              "data": "UklGRg==",
+              "mimeType": "audio/wav",
+              "filename": "clip.wav"
+            },
+            "title": "Voice note",
+            "transcriptHint": "speaker asks for status",
+            "metadata": {
+              "channel": "mic"
+            }
+          },
+          {
+            "type": "video",
+            "source": {
+              "kind": "url",
+              "url": "https://example.test/demo.mp4",
+              "mimeType": "video/mp4",
+              "filename": "demo.mp4"
+            },
+            "title": "Demo clip",
+            "textHint": "screen recording",
+            "transcriptHint": "user narrates the bug",
+            "startTimeSeconds": 1.5,
+            "endTimeSeconds": 8,
+            "frameRateHint": 24,
+            "metadata": {
+              "scene": "desktop"
+            }
+          }
+        ],
+        "name": null,
+        "toolCallId": null,
+        "toolCalls": [],
+        "metadata": {}
+      }
     }
   ]
 }

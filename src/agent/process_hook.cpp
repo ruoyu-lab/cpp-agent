@@ -1,4 +1,4 @@
-#include "agent/agent.hpp"
+#include "agent/process_hook.hpp"
 
 #include <cerrno>
 #include <chrono>
@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifndef _WIN32
@@ -23,7 +24,75 @@ namespace agent {
 
 namespace {
 
+class UniqueFd {
+ public:
+  UniqueFd() = default;
+  explicit UniqueFd(int fd) : fd_(fd) {}
+  UniqueFd(const UniqueFd&) = delete;
+  UniqueFd& operator=(const UniqueFd&) = delete;
+  UniqueFd(UniqueFd&& other) noexcept : fd_(other.release()) {}
+  UniqueFd& operator=(UniqueFd&& other) noexcept {
+    if (this != &other) {
+      reset(other.release());
+    }
+    return *this;
+  }
+  ~UniqueFd() {
+    reset();
+  }
+
+  [[nodiscard]] int get() const noexcept {
+    return fd_;
+  }
+
+  [[nodiscard]] int release() noexcept {
+    const int fd = fd_;
+    fd_ = -1;
+    return fd;
+  }
+
+  void reset(int fd = -1) noexcept {
+    if (fd_ >= 0) {
+      (void)::close(fd_);
+    }
+    fd_ = fd;
+  }
+
+ private:
+  int fd_ = -1;
+};
+
+std::pair<UniqueFd, UniqueFd> make_pipe() {
+  int fds[2] = {-1, -1};
+  if (::pipe(fds) != 0) {
+    throw ConfigurationError(std::string("Failed to create pipe: ") + std::strerror(errno));
+  }
+  return {UniqueFd(fds[0]), UniqueFd(fds[1])};
+}
+
+class SigpipeGuard {
+ public:
+  SigpipeGuard() {
+    struct sigaction action {};
+    action.sa_handler = SIG_IGN;
+    sigemptyset(&action.sa_mask);
+    changed_ = ::sigaction(SIGPIPE, &action, &previous_) == 0;
+  }
+  SigpipeGuard(const SigpipeGuard&) = delete;
+  SigpipeGuard& operator=(const SigpipeGuard&) = delete;
+  ~SigpipeGuard() {
+    if (changed_) {
+      (void)::sigaction(SIGPIPE, &previous_, nullptr);
+    }
+  }
+
+ private:
+  struct sigaction previous_ {};
+  bool changed_ = false;
+};
+
 void write_all(int fd, const std::string& data) {
+  SigpipeGuard sigpipe_guard;
   std::size_t written = 0;
   while (written < data.size()) {
     const auto n = ::write(fd, data.data() + written, data.size() - written);
@@ -35,9 +104,8 @@ void write_all(int fd, const std::string& data) {
   }
 }
 
-std::string read_all_with_timeout(int fd, std::chrono::milliseconds timeout) {
+std::string read_all_until_deadline(int fd, std::chrono::steady_clock::time_point deadline) {
   std::string out;
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
   char buf[1024];
   ::fcntl(fd, F_SETFL, O_NONBLOCK);
   while (true) {
@@ -66,27 +134,27 @@ ProcessHookResult run_process_hook(const ProcessHookConfig& config, const Value&
   if (config.executable.empty()) {
     throw ConfigurationError("ProcessHookConfig.executable is required.");
   }
-  int stdin_pipe[2] = {-1, -1};
-  int stdout_pipe[2] = {-1, -1};
-  int stderr_pipe[2] = {-1, -1};
-  if (::pipe(stdin_pipe) != 0 || ::pipe(stdout_pipe) != 0 || ::pipe(stderr_pipe) != 0) {
-    throw ConfigurationError(std::string("Failed to create pipe: ") + std::strerror(errno));
-  }
+  auto stdin_pipe = make_pipe();
+  auto stdout_pipe = make_pipe();
+  auto stderr_pipe = make_pipe();
+  const auto deadline = std::chrono::steady_clock::now() + config.timeout;
   const pid_t pid = ::fork();
   if (pid < 0) {
     throw ConfigurationError(std::string("fork failed: ") + std::strerror(errno));
   }
   if (pid == 0) {
     // Child.
-    ::dup2(stdin_pipe[0], 0);
-    ::dup2(stdout_pipe[1], 1);
-    ::dup2(stderr_pipe[1], 2);
-    ::close(stdin_pipe[0]);
-    ::close(stdin_pipe[1]);
-    ::close(stdout_pipe[0]);
-    ::close(stdout_pipe[1]);
-    ::close(stderr_pipe[0]);
-    ::close(stderr_pipe[1]);
+    if (::dup2(stdin_pipe.first.get(), 0) < 0 ||
+        ::dup2(stdout_pipe.second.get(), 1) < 0 ||
+        ::dup2(stderr_pipe.second.get(), 2) < 0) {
+      std::_Exit(127);
+    }
+    stdin_pipe.first.reset();
+    stdin_pipe.second.reset();
+    stdout_pipe.first.reset();
+    stdout_pipe.second.reset();
+    stderr_pipe.first.reset();
+    stderr_pipe.second.reset();
 
     std::vector<std::string> argv_storage;
     argv_storage.reserve(config.args.size() + 1);
@@ -115,26 +183,26 @@ ProcessHookResult run_process_hook(const ProcessHookConfig& config, const Value&
   }
 
   // Parent.
-  ::close(stdin_pipe[0]);
-  ::close(stdout_pipe[1]);
-  ::close(stderr_pipe[1]);
+  stdin_pipe.first.reset();
+  stdout_pipe.second.reset();
+  stderr_pipe.second.reset();
 
   const std::string payload_text = payload.stringify(0);
-  write_all(stdin_pipe[1], payload_text);
-  ::close(stdin_pipe[1]);
+  write_all(stdin_pipe.second.get(), payload_text);
+  stdin_pipe.second.reset();
 
   std::string stdout_text;
   std::string stderr_text;
-  // Drain stdout and stderr concurrently (we just block in serial with timeout).
-  std::thread stderr_thread([&] { stderr_text = read_all_with_timeout(stderr_pipe[0], config.timeout); });
-  stdout_text = read_all_with_timeout(stdout_pipe[0], config.timeout);
+  std::thread stderr_thread([&] {
+    stderr_text = read_all_until_deadline(stderr_pipe.first.get(), deadline);
+  });
+  stdout_text = read_all_until_deadline(stdout_pipe.first.get(), deadline);
   stderr_thread.join();
 
-  ::close(stdout_pipe[0]);
-  ::close(stderr_pipe[0]);
+  stdout_pipe.first.reset();
+  stderr_pipe.first.reset();
 
   int status = 0;
-  const auto deadline = std::chrono::steady_clock::now() + config.timeout;
   bool reaped = false;
   while (std::chrono::steady_clock::now() < deadline) {
     const pid_t r = ::waitpid(pid, &status, WNOHANG);

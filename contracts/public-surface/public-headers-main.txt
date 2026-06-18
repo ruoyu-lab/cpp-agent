@@ -1,0 +1,16 @@
+include/agent/core_api.hpp
+include/agent/model_api.hpp
+include/agent/tools_api.hpp
+include/agent/runtime_api.hpp
+include/agent/runtime_loop.hpp
+include/agent/runtime_runner.hpp
+include/agent/runtime_runner_facades.hpp
+include/agent/runtime.hpp
+include/agent/knowledge_runtime.hpp
+include/agent/memory_retrieval.hpp
+include/agent/memory_session.hpp
+include/agent/skills_core.hpp
+include/agent/agent.hpp
+include/agent/tool_runs.hpp
+include/agent/context_stats.hpp
+include/agent_capi.h

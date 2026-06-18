@@ -6,20 +6,32 @@ Lua, …). The framework itself is C++20, but the integration boundary is a
 thin **C ABI shim** that callers in other languages bind through their normal
 FFI.
 
-The shim is shipped in-tree as the `agent_capi` CMake target:
+The shim is shipped in two in-tree CMake targets:
 
-- Header: [`include/agent_capi.h`](../include/agent_capi.h) (pure C99).
-- Source: [`src/agent_capi.cpp`](../src/agent_capi.cpp) (links `agent_native`).
+- `agent_capi`: embeddable runner ABI. Header:
+  [`include/agent_capi.h`](../include/agent_capi.h) (pure C99). Links
+  `agent_runtime`, not app/server/I/O.
+- `agent_capi_full`: batteries-included C ABI. Header:
+  [`include/agent_capi_full.h`](../include/agent_capi_full.h) (pure C99,
+  extends `agent_capi.h`). Links `agent_app` for config-backed constructors
+  and async-agent-run modules.
+- Source: [`src/agent_capi.cpp`](../src/agent_capi.cpp), compiled once for the
+  minimal target and once with full extensions enabled.
 - Round-trip test: [`tests/capi_smoke.c`](../tests/capi_smoke.c) (compiled as
   C99 to prove the header has no C++ leaks; registered with CTest as
   `agent_capi_smoke`).
+- Host-language fixture: [`tests/capi_ctypes_smoke.py`](../tests/capi_ctypes_smoke.py)
+  (loads the built shared shim through Python `ctypes`; registered with CTest
+  as `agent_python_ctypes_smoke` when Python is available).
 
-The shim ships a minimal but representative surface (runner lifecycle,
-synchronous run, callback-based streaming, error reporting, memory ownership,
-version metadata). Extend it the same way for evals, workflows, sessions,
-config loading, or any other capability your host needs to expose — every new
-function is one more stability commitment, so only export the surface you
-actually use.
+The shim ships a representative ABI v4 surface: runner lifecycle,
+synchronous run, callback streaming, pull-based async-iterator streaming,
+explicit cancellation handles, opaque async run handles, structured error
+objects, host model vtable injection, usage metadata, version negotiation, memory
+ownership, and a machine-readable contract document. Extend it the same way for
+evals, workflows, sessions, config loading, or any other capability your host
+needs to expose - every new function is one more stability commitment, so only
+export the surface you actually use.
 
 This page is about how to wire and extend that shim. The framework
 intentionally does not ship a generated SWIG/pybind/Napi surface, because the
@@ -42,30 +54,60 @@ right shape depends on which slice of capability the host wants to expose.
 2. **JSON at the boundary.** Pass payloads as UTF-8 JSON `const char*`. The
    framework already has `agent::parse_json` / `agent::stringify` for both
    directions, so the shim adds no parsing dependency.
-3. **Error codes plus an error-detail JSON.** Return an `int32_t` status and
-   write the last error message into a thread-local string accessible via
-   `agent_last_error()`. The framework's `AgentFrameworkError::details()`
-   provides a `Value` that serializes cleanly.
-4. **Callbacks via function pointer + `void* user`.** Hosts that need to
-   implement an adapter (model, HTTP transport, MCP transport, browser
-   renderer, …) supply a `int (*fn)(const char* req_json, char** resp_json,
-   void* user)`. The shim wraps that into the matching C++ interface using
-   `agent::make_callback_*` factories.
+3. **Error codes plus error objects.** Return an `int32_t` status and expose
+   `agent_last_error()` for quick diagnostics. Bindings that need stable
+   machine handling should copy `agent_last_error_object()` immediately and
+   release it with `agent_error_release()`.
+4. **Callbacks via function pointer + `void* user`.** The shipped C ABI uses
+   this pattern for host-owned chat models:
+   `int (*model)(const char* req_json, char** resp_json, void* user)`.
+   Additional host-owned adapters such as HTTP transport, MCP transport, or
+   browser renderer should be added as separate ABI surfaces when they are
+   actually wired and tested.
 5. **Memory ownership is explicit.** All `char*` returned by the shim must be
    freed by `agent_string_free`. Hosts must never `free()` framework memory
    directly.
 
 ## Reference: Shipped Surface
 
-The current `agent_capi.h` exposes (see the header for full doc comments):
+The current `agent_capi.h` exposes the groups below; the header remains the
+authoritative signature contract:
+
+- ABI/version: `agent_capi_abi_version`,
+  `agent_capi_negotiate_abi_version`, `agent_capi_version_info_json`,
+  `agent_capi_contract_json`.
+- Memory and errors: `agent_string_clone`, `agent_string_free`,
+  `agent_last_error`, `agent_last_error_object`, `agent_error_*`.
+- Host injection: `agent_host_runtime_create`,
+  `agent_host_runtime_describe_json`, `agent_runner_create_with_host_model`.
+- Runner lifecycle: echo/host constructors and `agent_runner_release`.
+- Run/stream: text and JSON run, cancellable variants, callback streaming, and
+  pull-based event streams.
+- Async run handles: `agent_runner_run_async`,
+  `agent_runner_run_json_async`, `agent_run_wait_json`,
+  `agent_run_try_get_json`, `agent_run_cancel`, `agent_run_release`.
+- Generic ToolRun runtime through JSON.
+
+`agent_capi_full.h` adds the app/config and async-agent-run module surface:
+`agent_runner_create_from_config_json`, `agent_runner_create_from_config_path`,
+`agent_async_runtime_create`, and `agent_async_run_*`.
+
+The common core still looks like:
 
 ```c
 const char* agent_last_error(void);
+char*       agent_string_clone(const char* str);
 void        agent_string_free(char* str);
 const char* agent_version(void);
 int32_t     agent_capi_abi_version(void);
+int32_t     agent_capi_negotiate_abi_version(int32_t min_version,
+                                             int32_t max_version,
+                                             int32_t* out_version);
+const char* agent_capi_contract_json(void);
 
 typedef struct agent_runner_t agent_runner_t;
+typedef struct agent_runner_event_stream_t agent_runner_event_stream_t;
+typedef struct agent_tool_run_runtime_t agent_tool_run_runtime_t;
 
 int32_t agent_runner_create_with_echo_model(agent_runner_t** out);
 void    agent_runner_release(agent_runner_t* runner);
@@ -75,13 +117,77 @@ int32_t agent_runner_run(agent_runner_t* runner,
                          const char* session_id,
                          char** out_result_json);
 
-typedef int (*agent_stream_callback_t)(const char* event_json, void* user_data);
+int32_t agent_runner_run_json(agent_runner_t* runner,
+                              const char* input_json,
+                              const char* session_id,
+                              char** out_result_json);
+
+typedef int32_t (*agent_stream_callback_t)(const char* event_json, void* user_data);
 
 int32_t agent_runner_stream(agent_runner_t* runner,
                             const char* input,
                             const char* session_id,
                             agent_stream_callback_t on_event,
                             void* user_data);
+
+int32_t agent_runner_stream_json(agent_runner_t* runner,
+                                 const char* input_json,
+                                 const char* session_id,
+                                 agent_stream_callback_t on_event,
+                                 void* user_data);
+
+int32_t agent_runner_stream_events(agent_runner_t* runner,
+                                   const char* input,
+                                   const char* session_id,
+                                   size_t capacity,
+                                   agent_runner_event_stream_t** out_stream);
+
+int32_t agent_runner_stream_events_json(agent_runner_t* runner,
+                                        const char* input_json,
+                                        const char* session_id,
+                                        size_t capacity,
+                                        agent_runner_event_stream_t** out_stream);
+
+int32_t agent_runner_event_stream_next_json(agent_runner_event_stream_t* stream,
+                                            char** out_event_json,
+                                            int32_t* out_has_event);
+
+void agent_runner_event_stream_cancel(agent_runner_event_stream_t* stream,
+                                      const char* reason);
+void agent_runner_event_stream_close(agent_runner_event_stream_t* stream);
+void agent_runner_event_stream_release(agent_runner_event_stream_t* stream);
+
+int32_t agent_tool_run_runtime_create(agent_tool_run_runtime_t** out);
+void    agent_tool_run_runtime_release(agent_tool_run_runtime_t* runtime);
+int32_t agent_tool_run_start_json(agent_tool_run_runtime_t* runtime,
+                                  const char* start_json,
+                                  char** out_snapshot_json);
+int32_t agent_tool_run_status_json(agent_tool_run_runtime_t* runtime,
+                                   const char* run_id,
+                                   char** out_snapshot_json);
+int32_t agent_tool_run_list_json(agent_tool_run_runtime_t* runtime,
+                                 const char* filter_json,
+                                 char** out_runs_json);
+int32_t agent_tool_run_update_json(agent_tool_run_runtime_t* runtime,
+                                   const char* run_id,
+                                   const char* update_json,
+                                   char** out_snapshot_json);
+int32_t agent_tool_run_append_event_json(agent_tool_run_runtime_t* runtime,
+                                         const char* run_id,
+                                         const char* event_json,
+                                         char** out_event_json);
+int32_t agent_tool_run_read_json(agent_tool_run_runtime_t* runtime,
+                                 const char* run_id,
+                                 const char* read_json,
+                                 char** out_read_json);
+int32_t agent_tool_run_cancel_json(agent_tool_run_runtime_t* runtime,
+                                   const char* run_id,
+                                   const char* cancel_json,
+                                   char** out_snapshot_json);
+int32_t agent_tool_run_wait_json(agent_tool_run_runtime_t* runtime,
+                                 const char* run_id,
+                                 const char* wait_json,
+                                 char** out_snapshot_json);
 ```
 
 All non-void entry points return:
@@ -94,6 +200,98 @@ All non-void entry points return:
 | `3` | unknown error |
 
 On non-zero return, call `agent_last_error()` for the thread-local message.
+
+The full extension `agent_runner_create_from_config_json` resolves relative paths from the host
+process current working directory because the shim has no config file path at
+that boundary. Hosts that need file-relative semantics should either chdir
+before construction or use `agent_runner_create_from_config_path`.
+
+The full extension `agent_runner_create_from_config_path` accepts a JSON config file path or a
+directory to search for the default native config file. JS/TS module configs
+remain unsupported at this boundary because the C shim does not accept a
+`NativeConfigModuleLoader` callback.
+
+`agent_capi_contract_json()` returns a borrowed JSON document that binding
+generators can inspect at runtime. It carries:
+
+- Native version string.
+- ABI version.
+- Status-code meanings.
+- Constructor names.
+- The stable run-result envelope and stream event categories.
+- Async-iterator entry points for pull-based runner streaming.
+- ToolRun entry points for generic custom/background tool work.
+
+This is the release-governed metadata surface for foreign-language tooling.
+
+ToolRun is independent of `AgentRunner`: a host can create
+`agent_tool_run_runtime_t` and manage custom background jobs entirely through
+UTF-8 JSON. The stable snapshot fields are `runId`, `toolCallId`, `toolName`,
+`kind`, `label`, `status`, `startedAt`, `updatedAt`, `finishedAt`, `ready`,
+`error`, and `metadata`; event reads return `{ run, cursor, nextCursor,
+events }`. Process execution can be layered on this surface, but the ABI does
+not assume the run is a terminal command.
+
+Long-running background agent work is governed by the language-neutral
+[Async Agent Run](async-agent-run.md) JSON contract. C, C#, Rust, Python, and
+other bindings should expose async start/read/cancel/resume operations as JSON
+documents instead of leaking C++ futures, host threads, or platform timer
+handles across the ABI.
+
+## Pull Stream Contract
+
+ABI v4 bindings should expose `agent_runner_stream_events_json` as the primary
+realtime surface. The C handle maps directly to a host-language async iterator:
+
+```text
+open(inputJson, sessionId, capacity) -> handle
+next(handle) -> { done: false, value: AgentRunnerStreamEventJson }
+next(handle) -> { done: true }
+cancel(handle, reason)
+close(handle)
+release(handle)
+```
+
+`capacity` controls backpressure. When the bounded queue is full, the native
+runner worker waits until the host pulls another event. `cancel` and `close`
+are cooperative: they close the queue, cancel the internally owned runner token
+when the stream was opened without an external token, and make later `next`
+calls return `hasEvent = 0`. `release` destroys the handle; bindings should
+call `cancel` first when a user cancels iteration early.
+
+Every pulled JSON event has the stable envelope:
+
+```json
+{
+  "schemaVersion": 1,
+  "sequence": 1,
+  "type": "status"
+}
+```
+
+`sequence` is monotonically increasing per runner stream. The formal JSON
+Schema contract is in
+`contracts/observable/stream-events.schema.json`; provider streaming capability
+metadata is in `contracts/observable/provider-stream-contract.schema.json`.
+
+## Result And Event Contracts
+
+The synchronous run surface intentionally stays narrow:
+
+```json
+{
+  "sessionId": "...",
+  "text": "...",
+  "iterationCount": 1,
+  "terminationReason": "completed"
+}
+```
+
+That compact envelope is the compatibility contract used by existing bindings
+and observable contract tests. Richer state such as retrieval payloads,
+planning payloads, tool-call deltas, loop events, and error snapshots is
+available through streaming events instead of being added to the synchronous
+result object.
 
 ## Skeleton: Extending the Shim
 
@@ -137,9 +335,9 @@ void        agent_string_free(char* str);
 ## Skeleton: Shim Implementation
 
 ```cpp
-// agent_capi.cpp — links agent_native.
+// agent_capi.cpp — links agent_app for config-backed runner constructors.
 #include "agent_capi.h"
-#include "agent/agent.hpp"
+#include "agent/app_api.hpp"
 
 #include <atomic>
 #include <cstring>
@@ -207,11 +405,13 @@ extern "C" int32_t agent_runner_stream_json(agent_runner_t* runner,
                                             void* user) {
   return guarded([&] {
     auto input = agent::parse_json(input_json);
-    auto stream = runner->runner->stream(input, session_id ? session_id : "");
-    for (const auto& ev : stream.events) {
+    auto callback = [on_event, user, forwarding = true](
+                        const agent::AgentRunnerStreamEvent& ev) mutable {
+      if (!forwarding) return;
       std::string payload = agent::stringify(ev.to_value());
-      if (on_event(payload.c_str(), user) != 0) break;
-    }
+      if (on_event(payload.c_str(), user) != 0) forwarding = false;
+    };
+    (void)runner->runner->stream(input, callback, session_id ? session_id : "");
   });
 }
 
@@ -253,7 +453,7 @@ The patterns below all assume the C shim above.
 ```python
 import ctypes, json
 
-lib = ctypes.CDLL("./libagent_capi.so")
+lib = ctypes.CDLL("./libagent_capi_full_shared.so")
 lib.agent_runner_create_from_config_json.restype = ctypes.c_int32
 lib.agent_runner_run_json.restype = ctypes.c_int32
 lib.agent_string_free.argtypes = [ctypes.c_char_p]
@@ -275,8 +475,8 @@ lib.agent_runner_release(handle)
 
 ```go
 /*
-#cgo LDFLAGS: -L. -lagent_capi -lagent_native -lstdc++
-#include "agent_capi.h"
+#cgo LDFLAGS: -L. -lagent_capi_full -lagent_app -lagent_mcp_native -lagent_mcp -lagent_model_providers -lagent_runtime_modules -lagent_runtime_io_native -lagent_runtime_io -lagent_platform -lagent_runtime -lagent_tools -lagent_model -lagent_core -lstdc++
+#include "agent_capi_full.h"
 #include <stdlib.h>
 */
 import "C"
@@ -304,7 +504,7 @@ func NewRunner(cfg any) (*Runner, error) {
 ### Rust
 
 ```rust
-// build.rs links libagent_capi and libagent_native; bindgen generates the FFI.
+// build.rs links libagent_capi_full and the native layer libraries; bindgen generates the FFI.
 use std::ffi::{CStr, CString};
 
 pub struct Runner { handle: *mut agent_runner_t }

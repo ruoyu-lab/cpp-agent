@@ -1,0 +1,283 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "metadata",
+      "kind": "metadata",
+      "expectedShape": {
+        "abiVersion": 4,
+        "version": {
+          "$type": "string",
+          "nonEmpty": true
+        },
+        "versionNegotiation": "agent_capi_negotiate_abi_version",
+        "errorObject": "agent_last_error_object",
+        "hostRuntime": "agent_host_runtime_create",
+        "asyncRunHandle": "agent_runner_run_async",
+        "asyncIteratorCancel": "agent_runner_event_stream_cancel",
+        "asyncIteratorNext": "agent_runner_event_stream_next_json",
+        "toolRunStart": "agent_tool_run_start_json"
+      }
+    },
+    {
+      "name": "tool_run_json",
+      "kind": "toolRunJson",
+      "startJson": {
+        "runId": "contract-tool-run",
+        "toolCallId": "contract-tool-call",
+        "toolName": "custom.contract",
+        "kind": "custom",
+        "label": "contract custom run",
+        "metadata": {
+          "source": "contract"
+        }
+      },
+      "eventJson": {
+        "type": "log",
+        "stream": "stdout",
+        "text": "contract log"
+      },
+      "updateJson": {
+        "status": "waiting",
+        "ready": true,
+        "metadata": {
+          "url": "http://localhost:5173"
+        }
+      },
+      "cancelJson": {
+        "reason": "contract cancel"
+      },
+      "expectedShape": {
+        "started": {
+          "runId": "contract-tool-run",
+          "toolCallId": "contract-tool-call",
+          "toolName": "custom.contract",
+          "kind": "custom",
+          "label": "contract custom run",
+          "status": "running",
+          "startedAt": {
+            "$type": "string",
+            "nonEmpty": true
+          },
+          "updatedAt": {
+            "$type": "string",
+            "nonEmpty": true
+          },
+          "ready": false,
+          "metadata": {
+            "source": "contract"
+          }
+        },
+        "read": {
+          "run": {
+            "runId": "contract-tool-run"
+          },
+          "cursor": {
+            "$type": "number"
+          },
+          "nextCursor": {
+            "$type": "number"
+          },
+          "events": {
+            "$type": "array",
+            "minItems": 2
+          }
+        },
+        "waited": {
+          "runId": "contract-tool-run",
+          "status": "waiting",
+          "ready": true,
+          "metadata": {
+            "source": "contract",
+            "url": "http://localhost:5173"
+          }
+        },
+        "listCount": {
+          "$type": "number"
+        },
+        "cancelled": {
+          "runId": "contract-tool-run",
+          "status": "cancelled",
+          "error": "contract cancel"
+        }
+      }
+    },
+    {
+      "name": "config_run_json",
+      "kind": "runJson",
+      "configJson": {
+        "agents": {
+          "ffi": {
+            "model": {
+              "provider": "echo",
+              "model": "echo"
+            }
+          }
+        }
+      },
+      "agentId": "ffi",
+      "inputJson": "ffi contract run",
+      "sessionId": "ffi-contract-run",
+      "expectedShape": {
+        "sessionId": "ffi-contract-run",
+        "text": {
+          "$type": "string",
+          "nonEmpty": true
+        },
+        "iterationCount": {
+          "$type": "number"
+        },
+        "terminationReason": "completed",
+        "response": {
+          "$type": "object"
+        },
+        "messages": {
+          "$type": "array"
+        },
+        "usage": {
+          "$type": "object"
+        },
+        "memoryHits": {
+          "$type": "array"
+        },
+        "knowledgeHits": {
+          "$type": "array"
+        },
+        "knowledgeDebug": {
+          "$type": "object"
+        },
+        "plan": null,
+        "latestNonEmptyReasoning": {
+          "$type": "string"
+        }
+      }
+    },
+    {
+      "name": "config_stream_json",
+      "kind": "streamJson",
+      "configJson": {
+        "agents": {
+          "ffi": {
+            "model": {
+              "provider": "echo",
+              "model": "echo"
+            }
+          }
+        }
+      },
+      "agentId": "ffi",
+      "inputJson": {
+        "content": "ffi contract stream"
+      },
+      "sessionId": "ffi-contract-stream",
+      "expectedShape": {
+        "eventCount": {
+          "$type": "number"
+        },
+        "firstType": {
+          "$type": "string",
+          "nonEmpty": true
+        },
+        "lastType": "done",
+        "doneResult": {
+          "sessionId": "ffi-contract-stream",
+          "text": {
+            "$type": "string",
+            "nonEmpty": true
+          },
+          "iterationCount": {
+            "$type": "number"
+          },
+          "terminationReason": "completed",
+          "response": {
+            "$type": "object"
+          },
+          "messages": {
+            "$type": "array"
+          },
+          "usage": {
+            "$type": "object"
+          },
+          "memoryHits": {
+            "$type": "array"
+          },
+          "knowledgeHits": {
+            "$type": "array"
+          },
+          "knowledgeDebug": {
+            "$type": "object"
+          },
+          "plan": null,
+          "latestNonEmptyReasoning": {
+            "$type": "string"
+          }
+        }
+      }
+    },
+    {
+      "name": "config_stream_events_json",
+      "kind": "streamEventsJson",
+      "configJson": {
+        "agents": {
+          "ffi": {
+            "model": {
+              "provider": "echo",
+              "model": "echo"
+            }
+          }
+        }
+      },
+      "agentId": "ffi",
+      "inputJson": {
+        "content": "ffi contract pull stream"
+      },
+      "sessionId": "ffi-contract-pull-stream",
+      "capacity": 1,
+      "expectedShape": {
+        "eventCount": {
+          "$type": "number"
+        },
+        "firstType": {
+          "$type": "string",
+          "nonEmpty": true
+        },
+        "lastType": "done",
+        "firstSchemaVersion": 1,
+        "firstSequence": 1,
+        "doneResult": {
+          "sessionId": "ffi-contract-pull-stream",
+          "text": {
+            "$type": "string",
+            "nonEmpty": true
+          },
+          "iterationCount": {
+            "$type": "number"
+          },
+          "terminationReason": "completed",
+          "response": {
+            "$type": "object"
+          },
+          "messages": {
+            "$type": "array"
+          },
+          "usage": {
+            "$type": "object"
+          },
+          "memoryHits": {
+            "$type": "array"
+          },
+          "knowledgeHits": {
+            "$type": "array"
+          },
+          "knowledgeDebug": {
+            "$type": "object"
+          },
+          "plan": null,
+          "latestNonEmptyReasoning": {
+            "$type": "string"
+          }
+        }
+      }
+    }
+  ]
+}

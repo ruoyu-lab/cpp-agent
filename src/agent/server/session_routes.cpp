@@ -27,6 +27,55 @@ HttpResponse AgentServerApp::handle_session_get(const AgentServerRequestContext&
   return send_json(200, session_memory_snapshot_to_value(store->get(context.params.at("sessionId"))->snapshot()));
 }
 
+HttpResponse AgentServerApp::handle_session_compact(const AgentServerRequestContext& context) {
+  const auto agent_id = resolve_authorized_agent_id(context.access, {});
+  auto* store = session_store(agent_id);
+  if (!store) {
+    throw HttpRequestError(404, "Session runtime is not configured.",
+                           Value::object({{"error", "Session runtime is not configured."}}));
+  }
+
+  const auto session_id = context.params.at("sessionId");
+  auto session = store->get(session_id);
+  const std::size_t before_tokens = session->estimated_token_count();
+  try {
+    session->compact();
+  } catch (const ConfigurationError& error) {
+    if (error.details().find("no_compaction_budget") != std::string::npos) {
+      throw HttpRequestError(400, error.what(),
+                             Value::object({
+                                 {"error", error.what()},
+                                 {"code", "no_compaction_budget"},
+                                 {"field", "compaction.compaction_budget"},
+                                 {"sessionId", session_id},
+                             }));
+    }
+    throw;
+  }
+  const auto snapshot = session->snapshot();
+  const std::size_t after_tokens = session->estimated_token_count();
+
+  append_audit(AuditRecord{
+      .type = "session.compacted",
+      .method = context.method,
+      .path = context.path,
+      .agent_id = agent_id,
+      .session_id = session_id,
+      .api_key_id = context.access.api_key ? context.access.api_key->id : std::string{},
+      .request_id = context.access.request_id,
+      .trace_id = context.access.trace_context.trace_id,
+      .status_code = 200,
+  });
+  return send_json(200, Value::object({
+                            {"ok", true},
+                            {"sessionId", snapshot.session_id},
+                            {"tokensBefore", static_cast<long long>(before_tokens)},
+                            {"tokensAfter", static_cast<long long>(after_tokens)},
+                            {"tokenBudget", static_cast<long long>(session->token_budget())},
+                            {"snapshot", session_memory_snapshot_to_value(snapshot)},
+                        }));
+}
+
 HttpResponse AgentServerApp::handle_session_delete(const AgentServerRequestContext& context) {
   const auto agent_id = resolve_authorized_agent_id(context.access, {});
   auto* store = session_store(agent_id);
@@ -57,4 +106,3 @@ HttpResponse AgentServerApp::handle_session_delete(const AgentServerRequestConte
 }
 
 }  // namespace agent
-

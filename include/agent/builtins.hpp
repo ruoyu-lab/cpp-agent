@@ -2,9 +2,14 @@
 
 #include "agent/browser.hpp"
 #include "agent/tools.hpp"
+#include "agent/tool_services_io.hpp"
+#include "agent/tool_services_modules.hpp"
 #include "agent/http.hpp"
+#include "agent/media.hpp"
+#include "agent/media_generation.hpp"
 #include "agent/web.hpp"
-#include "agent/memory.hpp"
+#include "agent/knowledge_runtime.hpp"
+#include "agent/memory_session.hpp"
 #include "agent/workflow.hpp"
 
 #include <mutex>
@@ -17,6 +22,7 @@ struct DeveloperProcessRequest {
   std::vector<std::string> args;
   std::string cwd;
   CancellationToken* cancellation = nullptr;
+  ToolProgressEmitter emit_progress;
   // Effective sandbox request the executor MUST honor when running this
   // process. Set by the framework before dispatch by reading the active
   // `SandboxScope::request()`. Business-layer executors translate the
@@ -83,10 +89,12 @@ std::vector<ToolDefinition> create_web_builtin_tools(WebSearchProviderRegistry* 
                                                      std::string default_search_provider = {},
                                                      NativeWebPageFetcher* fetcher = nullptr);
 std::vector<ToolDefinition> create_agent_builtin_tools(SessionMemory* session = nullptr,
-                                                       KnowledgeBase* knowledge_base = nullptr,
-                                                       KnowledgeBaseManager* knowledge_manager = nullptr);
+                                                       KnowledgeContextProvider* knowledge = nullptr);
 std::vector<ToolDefinition> create_workflow_builtin_tools(WorkflowEngine* engine = nullptr);
 std::vector<ToolDefinition> create_state_builtin_tools();
+std::vector<ToolDefinition> create_media_generation_builtin_tools(
+    MediaGenerationProviderRegistry* registry = nullptr,
+    MediaGenerationToolOptions options = {});
 std::vector<ToolBundleProvider> create_builtin_tool_bundle_providers();
 ToolBundleRegistry create_builtin_tool_bundle_registry();
 std::vector<ToolBundleMetadata> list_builtin_tool_bundle_metadata();

@@ -4,6 +4,12 @@ The native tasks module provides task records, task runs, steps, events,
 checkpoints, in-memory/file-backed stores, queues, workers, and injected
 BullMQ/Postgres-compatible adapters.
 
+Task stores are `runtime-owned` execution state. They track lifecycle,
+idempotency, worker leasing, checkpoints, and audit events so task execution can
+resume or be inspected. In small deployments they may be the canonical task
+store; in host-owned systems the host still owns business payloads, tenant
+authorization, reporting, and domain-side idempotency.
+
 ## Stores
 
 `FileTaskStore` supports NodeJS-style config-object construction:

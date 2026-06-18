@@ -20,6 +20,7 @@ enum class ExecutionTarget {
   Workflow,
   WorkflowNode,
   ChildAgent,
+  Skill,
 };
 
 std::string to_string(ExecutionTarget target);

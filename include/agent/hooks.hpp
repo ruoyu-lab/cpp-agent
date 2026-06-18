@@ -79,6 +79,36 @@ struct ChildAgentHookContext : HookExecutionContext {
   std::string error;
 };
 
+struct SkillActivationHookContext : HookExecutionContext {
+  std::string skill_name;
+  std::string activation_source;
+  std::string arguments_text;
+  int priority = 0;
+  bool auto_selected = false;
+  Value activation = Value::object({});
+  Value manifest = Value::object({});
+  Value skill = Value::object({});
+  std::string rendered_prompt;
+  std::vector<std::string> allowed_tools;
+  std::string model;
+  std::string effort;
+  std::string error;
+};
+
+struct SkillsResolveHookContext : HookExecutionContext {
+  std::string input_text;
+  Value activations = Value::array({});
+  Value available_skills = Value::array({});
+  Value active_skills = Value::array({});
+  Value auto_selected_skills = Value::array({});
+  Value allowed_tools = Value::array({});
+  std::string effective_input_text;
+  Value model_settings_before = Value::object({});
+  Value model_settings_after = Value::object({});
+  Value result = Value::object({});
+  std::string error;
+};
+
 struct HookSet {
   std::function<void(const RunHookContext&)> before_run;
   std::function<void(const RunHookContext&)> after_run;
@@ -110,6 +140,14 @@ struct HookSet {
   std::function<void(const ChildAgentHookContext&)> before_child_agent;
   std::function<void(const ChildAgentHookContext&)> after_child_agent;
   std::function<void(const ChildAgentHookContext&)> on_child_agent_error;
+
+  std::function<void(const SkillActivationHookContext&)> before_skill_activation;
+  std::function<void(const SkillActivationHookContext&)> after_skill_activation;
+  std::function<void(const SkillActivationHookContext&)> on_skill_activation_error;
+
+  std::function<void(const SkillsResolveHookContext&)> before_skills_resolve;
+  std::function<void(const SkillsResolveHookContext&)> after_skills_resolve;
+  std::function<void(const SkillsResolveHookContext&)> on_skills_resolve_error;
 
   // Pre-hook fired by `fs.writeText` (and any other fs-write tool that opts in)
   // immediately before the on-disk write happens. Not default-on; intended for
@@ -143,37 +181,5 @@ using HookLogSink = std::function<void(const HookLogEntry&)>;
 // verbose" convention: successful hook callbacks emit at Trace, failures/blocks
 // emit at Warn (or Error) with the full context attached.
 HookSet default_logging_hook_set(HookLogSink sink = {});
-
-// Out-of-process hook adapter. Spawns an executable, pipes the hook payload
-// (as JSON) to stdin, and reads stdout. Exit code 0 -> allow; exit code 2 ->
-// block with stderr as the reason; other non-zero codes -> allow + warn.
-struct ProcessHookConfig {
-  std::filesystem::path executable;
-  std::vector<std::string> args;
-  std::map<std::string, std::string> env;
-  std::chrono::milliseconds timeout{5000};
-};
-
-enum class ProcessHookDecision {
-  Allow,
-  Block,
-  Warn,
-};
-
-struct ProcessHookResult {
-  ProcessHookDecision decision = ProcessHookDecision::Allow;
-  int exit_code = 0;
-  std::string stdout_text;
-  std::string stderr_text;
-};
-
-// Runs a hook process synchronously given an arbitrary JSON-serialized payload.
-// Returns Allow/Block/Warn. Unix-only (uses fork/exec/pipe).
-ProcessHookResult run_process_hook(const ProcessHookConfig& config, const Value& payload);
-
-// Convenience: returns a `before_tool` ToolHookContext callback that runs the
-// process hook. If the hook blocks, throws ConfigurationError with the stderr
-// as the reason so the executor surfaces it as a tool failure.
-std::function<void(const ToolHookContext&)> make_process_tool_hook(ProcessHookConfig config);
 
 }  // namespace agent

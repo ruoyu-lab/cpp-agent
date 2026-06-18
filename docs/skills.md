@@ -120,6 +120,7 @@ disagree about which model or reasoning-effort budget to use.
 ```cpp
 agent::SkillResolveOptions opts;
 opts.input_text = "/audit src";
+opts.paths = {"src/auth/login.cpp"};
 opts.session_id = "session-1";
 opts.activations = {
     agent::SkillActivation{"audit", "", agent::SkillActivationSource::Host, 0},
@@ -138,6 +139,37 @@ apply the appropriate gating:
 - `source`: `User`, `Host`, or `Model` (see below).
 - `priority`: used by `HighestPriority` conflict policy; ties break on first
   occurrence in the activation list.
+
+### `paths` conditional activation
+
+`SkillManifest::paths` is a host-provided conditional trigger. The resolver does
+not infer file paths from free-form user text. Callers pass known relevant paths
+through `SkillResolveOptions::paths`; any model-invocable skill whose
+`manifest.paths` pattern matches those paths is appended as a `Model`-source
+activation and recorded in `ResolvedSkillsState::auto_selected_skills`.
+
+```cpp
+agent::SkillRegistry registry({agent::SkillDefinition{
+    .manifest = agent::SkillManifest{
+        .name = "ts-review",
+        .description = "Review TypeScript changes",
+        .paths = {"src/**/*.ts"},
+    },
+    .prompt = "Review TypeScript changes.",
+}});
+
+agent::SkillResolveOptions opts;
+opts.paths = {"src/auth/login.ts"};
+auto state = agent::resolve_skills_state(&registry, opts);
+// state.auto_selected_skills == {"ts-review"}
+```
+
+Matching rules:
+
+- exact file paths and directory prefixes match without wildcards
+- `*`, `?`, and `**/` glob syntax are supported
+- `disable_model_invocation` skills are excluded
+- explicit caller/slash activations win and are not duplicated
 
 ### SkillActivationSource
 
@@ -197,6 +229,7 @@ field is empty and the runner falls back to the original input.
 | `/a /b shared text` (a, b user-invocable)         | Two User activations, both args empty, `stripped_input = "shared text"`. |
 | `/a /b-noui shared text` (b-noui not user-invoc.) | Scan stops at b-noui. One activation with args/tail = `"/b-noui shared text"`. |
 | `/a hello world`                                  | One activation with `arguments_text = "hello world"`, `stripped_input = "hello world"`. |
+| `paths = {"src/auth/login.ts"}`, skill `paths: ["src/**/*.ts"]` | Auto-activates the skill as `Model`; records the name in `auto_selected_skills`. |
 | `User` source on non-user-invocable skill         | `ConfigurationError("not user-invocable")`.                   |
 | `Host` source on non-user-invocable skill         | Renders normally (programmatic injection bypass).             |
 | `Error` policy, conflicting models                | `ConfigurationError("conflicting models")`.                   |

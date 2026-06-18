@@ -45,6 +45,13 @@ Helpers:
 - `match_route_pattern` matches route patterns with `:param` segments.
 - `HttpRequestError` carries an HTTP status and JSON error payload.
 
+Internally, `AgentServerApp` now stays a thin facade over private route
+registration modules grouped by responsibility (`core`, `sessions`,
+`approvals`, `tasks`, `autonomous`, `workflows`, `chat`). The public surface
+is unchanged: hosts still compose through `AgentServerApp`, `add_route`, and
+`add_route_module`, while the chat/task/autonomous/workflow/approval logic
+stays behind private implementation fragments.
+
 ## Built-In Routes
 
 Core routes:
@@ -60,6 +67,7 @@ Session routes:
 
 - `GET /sessions`
 - `GET /sessions/:sessionId`
+- `POST /sessions/:sessionId/compact`
 - `DELETE /sessions/:sessionId`
 
 Approval routes:
@@ -188,6 +196,11 @@ app and return `204` when allowed.
 `session_store` can be supplied directly. Config-backed server apps can resolve
 per-agent session stores from the native config. Session delete returns `403`
 when policy disables deletion.
+
+`POST /sessions/:sessionId/compact` manually triggers `SessionMemory::compact()`
+for that session and returns `{ ok, sessionId, tokensBefore, tokensAfter,
+tokenBudget, snapshot }`. If no `compaction_budget` cap is configured, the
+route returns `400` with `code: "no_compaction_budget"`.
 
 ## Approvals
 

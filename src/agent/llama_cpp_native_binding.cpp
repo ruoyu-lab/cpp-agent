@@ -1,4 +1,4 @@
-#include "agent/agent.hpp"
+#include "agent/model_providers.hpp"
 
 #include <ggml-backend.h>
 #include <llama.h>
@@ -855,6 +855,7 @@ bool eval_multimodal_prompt(const RuntimeConfig& config,
                             const LlamaCppNativeChatRequest& request,
                             const std::string& prompt,
                             const std::shared_ptr<CancelToken>& cancel_token,
+                            int& prompt_eval_count,
                             NativeError& error) {
   auto multimodal = load_multimodal_context(config, model, error);
   if (error.has_error) return false;
@@ -922,6 +923,7 @@ bool eval_multimodal_prompt(const RuntimeConfig& config,
     cleanup();
     return false;
   }
+  prompt_eval_count = static_cast<int>(n_pos);
 
   llama_pos n_past = 0;
   const int32_t decoded = g_api.mtmd_helper_eval_chunks_ptr(
@@ -1006,9 +1008,11 @@ LlamaCppNativeChatResult generate_chat_impl(const LlamaCppNativeRuntimeConfig& p
   }
 
   std::vector<llama_token> tokens;
+  int prompt_eval_count = 0;
   if (!has_media) {
     tokens = tokenize(model, prompt, true, error);
     error.throw_if_failed();
+    prompt_eval_count = static_cast<int>(tokens.size());
   }
 
   std::shared_ptr<ContextHandle> session_context;
@@ -1039,7 +1043,8 @@ LlamaCppNativeChatResult generate_chat_impl(const LlamaCppNativeRuntimeConfig& p
   }
 
   if (has_media) {
-    eval_multimodal_prompt(config, model, active_context->ctx, request, prompt, cancel_token, error);
+    eval_multimodal_prompt(config, model, active_context->ctx, request, prompt, cancel_token,
+                           prompt_eval_count, error);
     if (error.has_error) {
       g_api.llama_sampler_free_ptr(sampler);
       error.throw_if_failed();
@@ -1123,6 +1128,8 @@ LlamaCppNativeChatResult generate_chat_impl(const LlamaCppNativeRuntimeConfig& p
           {"model", request.model},
           {"text", text},
           {"finishReason", finish_reason},
+          {"prompt_eval_count", prompt_eval_count},
+          {"eval_count", static_cast<int>(generated_tokens.size())},
       }),
   };
 }

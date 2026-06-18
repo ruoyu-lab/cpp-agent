@@ -117,6 +117,94 @@
   SMOKE_CHECK(skill_state.allowed_tools.front() == "math.eval");
   SMOKE_CHECK(skill_state.model_settings.model == "skill-model");
 
+  std::vector<std::string> skill_hook_calls;
+  std::vector<agent::FrameworkEvent> skill_hook_events;
+  agent::EventBus skill_hook_bus;
+  skill_hook_bus.register_sink([&](const agent::FrameworkEvent& event) {
+    if (event.target == agent::ExecutionTarget::Skill) {
+      skill_hook_events.push_back(event);
+    }
+  });
+  agent::HookSet skill_hooks;
+  skill_hooks.before_skills_resolve = [&](const agent::SkillsResolveHookContext& hook_context) {
+    SMOKE_CHECK(hook_context.target == agent::ExecutionTarget::Skill);
+    SMOKE_CHECK(hook_context.input_text == "/demo alpha beta");
+    SMOKE_CHECK(hook_context.metadata.at("sessionId").as_string() == "session-1");
+    skill_hook_calls.push_back("before-skills-resolve");
+  };
+  skill_hooks.before_skill_activation = [&](const agent::SkillActivationHookContext& hook_context) {
+    SMOKE_CHECK(hook_context.skill_name == "demo");
+    SMOKE_CHECK(hook_context.activation_source == "user");
+    SMOKE_CHECK(hook_context.arguments_text == "alpha beta");
+    SMOKE_CHECK(hook_context.manifest.at("allowedTools").as_array().front().as_string() == "math.eval");
+    skill_hook_calls.push_back("before-skill");
+  };
+  skill_hooks.after_skill_activation = [&](const agent::SkillActivationHookContext& hook_context) {
+    SMOKE_CHECK(hook_context.rendered_prompt.find("alpha beta") != std::string::npos);
+    SMOKE_CHECK(hook_context.model == "skill-model");
+    skill_hook_calls.push_back("after-skill");
+  };
+  skill_hooks.after_skills_resolve = [&](const agent::SkillsResolveHookContext& hook_context) {
+    SMOKE_CHECK(hook_context.active_skills.as_array().size() == 1);
+    SMOKE_CHECK(hook_context.model_settings_after.at("model").as_string() == "skill-model");
+    skill_hook_calls.push_back("after-skills-resolve");
+  };
+  agent::SkillResolveOptions hooked_skill_opts = demo_opts;
+  hooked_skill_opts.hooks = &skill_hooks;
+  hooked_skill_opts.event_bus = &skill_hook_bus;
+  hooked_skill_opts.trace_context = agent::create_trace_context(agent::TraceContext{
+      .trace_id = "skill-trace",
+      .run_id = "skill-run",
+  });
+  hooked_skill_opts.metadata = agent::Value::object({{"sessionId", "session-1"}, {"runId", "skill-run"}});
+  auto hooked_skill_state = agent::resolve_skills_state(&skill_registry, hooked_skill_opts);
+  SMOKE_CHECK(hooked_skill_state.active_skills.size() == 1);
+  SMOKE_CHECK((skill_hook_calls == std::vector<std::string>{
+                                      "before-skills-resolve",
+                                      "before-skill",
+                                      "after-skill",
+                                      "after-skills-resolve",
+                                  }));
+  std::vector<std::string> skill_event_categories;
+  for (const auto& event : skill_hook_events) {
+    skill_event_categories.push_back(event.category);
+  }
+  SMOKE_CHECK(contains_string(skill_event_categories, "skills.resolve.started"));
+  SMOKE_CHECK(contains_string(skill_event_categories, "skill.activation.started"));
+  SMOKE_CHECK(contains_string(skill_event_categories, "skill.activation.completed"));
+  SMOKE_CHECK(contains_string(skill_event_categories, "skills.resolve.completed"));
+
+  std::vector<std::string> blocked_skill_hook_calls;
+  agent::HookSet blocked_skill_hooks;
+  blocked_skill_hooks.before_skill_activation = [&](const agent::SkillActivationHookContext&) {
+    blocked_skill_hook_calls.push_back("before-skill");
+    throw std::runtime_error("blocked skill activation");
+  };
+  blocked_skill_hooks.on_skill_activation_error = [&](const agent::SkillActivationHookContext& hook_context) {
+    SMOKE_CHECK(hook_context.skill_name == "demo");
+    SMOKE_CHECK(hook_context.error.find("blocked skill activation") != std::string::npos);
+    blocked_skill_hook_calls.push_back("on-skill-error");
+  };
+  blocked_skill_hooks.on_skills_resolve_error = [&](const agent::SkillsResolveHookContext& hook_context) {
+    SMOKE_CHECK(hook_context.error.find("blocked skill activation") != std::string::npos);
+    blocked_skill_hook_calls.push_back("on-skills-error");
+  };
+  bool blocked_skill_threw = false;
+  try {
+    agent::SkillResolveOptions blocked_opts = demo_opts;
+    blocked_opts.hooks = &blocked_skill_hooks;
+    (void)agent::resolve_skills_state(&skill_registry, blocked_opts);
+  } catch (const std::runtime_error& error) {
+    blocked_skill_threw = true;
+    SMOKE_CHECK(std::string(error.what()).find("blocked skill activation") != std::string::npos);
+  }
+  SMOKE_CHECK(blocked_skill_threw);
+  SMOKE_CHECK((blocked_skill_hook_calls == std::vector<std::string>{
+                                             "before-skill",
+                                             "on-skill-error",
+                                             "on-skills-error",
+                                         }));
+
   auto migration_skill = agent::parse_anthropic_skill_markdown(
       "---\nname: migration-audit\ndescription: Review database migrations and deployment safety\nallowed-tools: fs.read*\n---\nInspect migration risk.",
       (tmp_dir / "migration-audit" / "SKILL.md").string());
@@ -346,17 +434,18 @@
       "---\nname: audit\ndescription: Audit the project\nuser-invocable: true\nallowed-tools: fs.read*\n---\nAudit $ARGUMENTS.",
       (tmp_dir / "audit" / "SKILL.md").string());
   agent::AgentRunnerConfig skill_runner_config;
-  skill_runner_config.adapter = std::make_shared<SkillRuntimeModel>();
-  skill_runner_config.max_iterations = 3;
-  skill_runner_config.skills = std::make_shared<agent::SkillRegistry>(
+  skill_runner_config.model_runtime.adapter = std::make_shared<SkillRuntimeModel>();
+  skill_runner_config.context_runtime.max_iterations = 3;
+  skill_runner_config.context_runtime.skills = std::make_shared<agent::SkillRegistry>(
       std::vector<agent::SkillDefinition>{runtime_skill});
-  skill_runner_config.permission_policy = [](const agent::PermissionRequest&) {
+  skill_runner_config.tool_runtime.permission_policy = [](const agent::PermissionRequest&) {
     return agent::PermissionDecision{agent::PermissionDecisionKind::Deny, "deny by default"};
   };
   agent::JsonSchema read_schema;
   read_schema.type = agent::JsonSchemaType::Object;
   read_schema.properties["path"].type = agent::JsonSchemaType::String;
-  skill_runner_config.tools.push_back(agent::define_tool(agent::ToolDefinition{
+  skill_runner_config.tool_runtime.definitions = std::vector<agent::ToolDefinition>{};
+  skill_runner_config.tool_runtime.definitions->push_back(agent::define_tool(agent::ToolDefinition{
       .name = "fs.readText",
       .description = "Read a text file.",
       .input_schema = read_schema,
@@ -368,7 +457,7 @@
       },
   }));
   agent::AgentRunner skill_runner(std::move(skill_runner_config));
-  auto skill_run = skill_runner.run("/audit auth module", "skill-session");
+  auto skill_run = skill_runner.execution().run("/audit auth module", "skill-session");
   SMOKE_CHECK(skill_run.text == "skill runtime ok");
   SMOKE_CHECK(agent::extract_text_content(skill_run.messages.front().content) == "auth module");
 
@@ -376,16 +465,21 @@
       "---\nname: fork-audit\ndescription: Fork audit with subagent\nuser-invocable: true\ncontext: fork\nagent: reviewer\nallowed-tools: fork.inspect\n---\nFork audit $ARGUMENTS.",
       (tmp_dir / "fork-audit" / "SKILL.md").string());
   agent::AgentRunner fork_child_runner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<SkillForkChildModel>(),
-      .max_iterations = 1,
+      .model_runtime = {
+          .adapter = std::make_shared<SkillForkChildModel>(),
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
   });
   agent::AgentRunnerConfig fork_runner_config;
-  fork_runner_config.adapter = std::make_shared<SkillForkMainModel>();
-  fork_runner_config.max_iterations = 3;
-  fork_runner_config.skills = std::make_shared<agent::SkillRegistry>(
+  fork_runner_config.model_runtime.adapter = std::make_shared<SkillForkMainModel>();
+  fork_runner_config.context_runtime.max_iterations = 3;
+  fork_runner_config.context_runtime.skills = std::make_shared<agent::SkillRegistry>(
       std::vector<agent::SkillDefinition>{fork_skill});
-  fork_runner_config.skill_subagents["reviewer"] = &fork_child_runner;
-  fork_runner_config.tools.push_back(agent::define_tool(agent::ToolDefinition{
+  fork_runner_config.context_runtime.skill_subagents["reviewer"] = &fork_child_runner;
+  fork_runner_config.tool_runtime.definitions = std::vector<agent::ToolDefinition>{};
+  fork_runner_config.tool_runtime.definitions->push_back(agent::define_tool(agent::ToolDefinition{
       .name = "fork.inspect",
       .description = "Inspect fork skill service state.",
       .execute = [](const agent::Value&, agent::ToolExecutionContext& context) -> agent::ToolInvokeResult {
@@ -399,7 +493,7 @@
       },
   }));
   agent::AgentRunner fork_runner(std::move(fork_runner_config));
-  auto fork_run = fork_runner.run("/fork-audit auth module", "fork-session");
+  auto fork_run = fork_runner.execution().run("/fork-audit auth module", "fork-session");
   SMOKE_CHECK(fork_run.text == "main consumed fork");
 
   agent::Value config_with_skills = agent::Value::object({
@@ -1083,7 +1177,8 @@
   SMOKE_CHECK(workflow_bundle_registry.get("workflow.getRun") != nullptr);
   agent::ToolExecutor workflow_bundle_executor(workflow_bundle_registry);
   agent::ToolExecutionContext workflow_service_context;
-  workflow_service_context.service_refs.workflow_engine = &stored_engine;
+  workflow_service_context.service_refs.service_container.set(agent::kToolServiceWorkflowEngine,
+                                                              &stored_engine);
   auto service_workflow_get = workflow_bundle_executor.execute_tool_call(agent::ToolCall{
       .id = "workflow_service_get_1",
       .name = "workflow.getRun",
@@ -1096,11 +1191,16 @@
   auto workflow_context_tool = agent::define_tool(agent::ToolDefinition{
       .name = "workflow.context",
       .description = "Inspect workflow tool context services.",
+      .service_requirements = {
+          agent::tool_service_requirement(agent::kToolServiceWorkflowEngine),
+          agent::tool_service_requirement(agent::kToolServiceWorkflowDefinition),
+      },
       .execute = [&](const agent::Value&, agent::ToolExecutionContext& context) -> agent::ToolInvokeResult {
         saw_workflow_tool_context = true;
-        SMOKE_CHECK(context.service_refs.workflow_engine != nullptr);
-        SMOKE_CHECK(context.service_refs.workflow_definition != nullptr);
-        SMOKE_CHECK(context.service_refs.workflow_definition->id == "wf_context_services");
+        SMOKE_CHECK(context.service_refs.service_view.get(agent::kToolServiceWorkflowEngine) != nullptr);
+        const auto* definition = context.service_refs.service_view.get(agent::kToolServiceWorkflowDefinition);
+        SMOKE_CHECK(definition != nullptr);
+        SMOKE_CHECK(definition->id == "wf_context_services");
         SMOKE_CHECK(context.services.at("workflow").at("configured").as_string() == "yes");
         SMOKE_CHECK(context.services.at("workflow").at("workflowId").as_string() == "wf_context_services");
         SMOKE_CHECK(context.services.at("workflow").at("nodeId").as_string() == "inspect");
@@ -1355,9 +1455,10 @@
   auto child_context_tool = agent::define_tool(agent::ToolDefinition{
       .name = "child.context",
       .description = "Inspect workflow child runner context.",
+      .service_requirements = {agent::tool_service_requirement(agent::kToolServiceSessionMemory)},
       .execute = [&](const agent::Value&, agent::ToolExecutionContext& context) -> agent::ToolInvokeResult {
         saw_runner_child_context = true;
-        SMOKE_CHECK(context.service_refs.session != nullptr);
+        SMOKE_CHECK(context.service_refs.service_view.get(agent::kToolServiceSessionMemory) != nullptr);
         SMOKE_CHECK(context.services.at("context").at("workflowId").as_string() == "wf_runner_agent");
         SMOKE_CHECK(!context.services.at("context").at("workflowRunId").as_string().empty());
         SMOKE_CHECK(context.services.at("context").at("nodeId").as_string() == "runner-node");
@@ -1367,9 +1468,15 @@
       },
   });
   auto workflow_child_runner = std::make_shared<agent::AgentRunner>(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<WorkflowChildAgentModel>(),
-      .tools = {child_context_tool},
-      .max_iterations = 3,
+      .model_runtime = {
+          .adapter = std::make_shared<WorkflowChildAgentModel>(),
+      },
+      .tool_runtime = {
+          .definitions = std::vector<agent::ToolDefinition>{child_context_tool},
+      },
+      .context_runtime = {
+          .max_iterations = 3,
+      },
   });
   std::vector<std::string> workflow_hook_calls;
   agent::HookSet workflow_hooks;
@@ -1527,23 +1634,33 @@
     retrieval_hook_calls.push_back("after-retrieval");
   };
   agent::AgentRunner runner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<ToolCallingModel>(),
-      .tools = tools,
-      .system_prompt = "You are a test agent.",
-      .max_iterations = 4,
-      .long_term_memory = memory,
-      .retrieval_options = agent::RunnerRetrievalOptions{.enabled = true, .top_k = 2, .min_score = 0.0},
-      .writeback_options = agent::RunnerWritebackOptions{.enabled = true},
-      .hooks = retrieval_hooks,
+      .model_runtime = {
+          .adapter = std::make_shared<ToolCallingModel>(),
+      },
+      .tool_runtime = {
+          .definitions = tools,
+      },
+      .context_runtime = {
+          .system_prompt = "You are a test agent.",
+          .max_iterations = 4,
+      },
+      .memory_runtime = {
+          .long_term_memory = memory,
+          .retrieval_options = agent::RunnerRetrievalOptions{.enabled = true, .top_k = 2, .min_score = 0.0},
+          .writeback_options = agent::RunnerWritebackOptions{.enabled = true},
+      },
+      .observability = {
+          .hooks = retrieval_hooks,
+      },
   });
   std::vector<std::string> retrieval_events;
-  const auto retrieval_sink_id = runner.register_event_sink([&](const agent::FrameworkEvent& event) {
+  const auto retrieval_sink_id = runner.events().register_sink([&](const agent::FrameworkEvent& event) {
     if (event.target == agent::ExecutionTarget::Retrieval) {
       retrieval_events.push_back(event.category);
     }
   });
 
-  auto run = runner.run("evaluate a tool expression");
+  auto run = runner.execution().run("evaluate a tool expression");
   SMOKE_CHECK(run.termination_reason == agent::AgentLoopTerminationReason::Completed);
   SMOKE_CHECK(run.text.find("tool result") != std::string::npos);
   SMOKE_CHECK(!run.memory_hits.empty());
@@ -1551,24 +1668,32 @@
   SMOKE_CHECK(contains_string(retrieval_hook_calls, "after-retrieval"));
   SMOKE_CHECK(contains_string(retrieval_events, "retrieval.started"));
   SMOKE_CHECK(contains_string(retrieval_events, "retrieval.completed"));
-  runner.unregister_event_sink(retrieval_sink_id);
+  runner.events().unregister_sink(retrieval_sink_id);
 
   auto default_retrieval_memory = std::make_shared<agent::LongTermMemory>();
   default_retrieval_memory->remember("Default runner retrieval should find this memory context.");
   agent::AgentRunner default_retrieval_runner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<StreamingFixtureModel>(),
-      .long_term_memory = default_retrieval_memory,
+      .model_runtime = {
+          .adapter = std::make_shared<StreamingFixtureModel>(),
+      },
+      .memory_runtime = {
+          .long_term_memory = default_retrieval_memory,
+      },
   });
-  auto default_retrieval_run = default_retrieval_runner.run("find default runner retrieval",
+  auto default_retrieval_run = default_retrieval_runner.execution().run("find default runner retrieval",
                                                            "default-retrieval-session");
   SMOKE_CHECK(!default_retrieval_run.memory_hits.empty());
 
   auto default_writeback_memory = std::make_shared<agent::LongTermMemory>();
   agent::AgentRunner default_writeback_runner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<StreamingFixtureModel>(),
-      .long_term_memory = default_writeback_memory,
+      .model_runtime = {
+          .adapter = std::make_shared<StreamingFixtureModel>(),
+      },
+      .memory_runtime = {
+          .long_term_memory = default_writeback_memory,
+      },
   });
-  auto default_writeback_run = default_writeback_runner.run("default writeback memory turn",
+  auto default_writeback_run = default_writeback_runner.execution().run("default writeback memory turn",
                                                            "default-writeback-session");
   SMOKE_CHECK(default_writeback_run.text == "stream text");
   auto default_writeback_hits =
@@ -1581,11 +1706,15 @@
 
   auto disabled_writeback_memory = std::make_shared<agent::LongTermMemory>();
   agent::AgentRunner disabled_writeback_runner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<StreamingFixtureModel>(),
-      .long_term_memory = disabled_writeback_memory,
-      .writeback_options = agent::RunnerWritebackOptions{.enabled = false},
+      .model_runtime = {
+          .adapter = std::make_shared<StreamingFixtureModel>(),
+      },
+      .memory_runtime = {
+          .long_term_memory = disabled_writeback_memory,
+          .writeback_options = agent::RunnerWritebackOptions{.enabled = false},
+      },
   });
-  auto disabled_writeback_run = disabled_writeback_runner.run("disabled writeback memory turn",
+  auto disabled_writeback_run = disabled_writeback_runner.execution().run("disabled writeback memory turn",
                                                              "disabled-writeback-session");
   SMOKE_CHECK(disabled_writeback_run.text == "stream text");
   SMOKE_CHECK(disabled_writeback_memory->search("disabled writeback memory turn stream text", 2, 0.0).empty());
@@ -1598,10 +1727,14 @@
       0.0,
       false);
   agent::AgentRunner forced_writeback_runner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<StreamingFixtureModel>(),
-      .long_term_memory = forced_writeback_memory,
+      .model_runtime = {
+          .adapter = std::make_shared<StreamingFixtureModel>(),
+      },
+      .memory_runtime = {
+          .long_term_memory = forced_writeback_memory,
+      },
   });
-  auto forced_writeback_run = forced_writeback_runner.run(
+  auto forced_writeback_run = forced_writeback_runner.execution().run(
       "forced writeback memory turn",
       "forced-writeback-session",
       agent::ModelSettings{},
@@ -1632,11 +1765,17 @@
       },
   });
   agent::AgentRunner planned_writeback_runner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<StreamingFixtureModel>(),
-      .long_term_memory = planned_writeback_memory,
-      .planner = planned_writeback_planner,
+      .model_runtime = {
+          .adapter = std::make_shared<StreamingFixtureModel>(),
+      },
+      .memory_runtime = {
+          .long_term_memory = planned_writeback_memory,
+      },
+      .governance = {
+          .planner = planned_writeback_planner,
+      },
   });
-  auto planned_writeback_run = planned_writeback_runner.run("planned writeback memory turn",
+  auto planned_writeback_run = planned_writeback_runner.execution().run("planned writeback memory turn",
                                                            "planned-writeback-session");
   SMOKE_CHECK(planned_writeback_run.plan);
   auto planned_writeback_hits = planned_writeback_memory->search(
@@ -1656,11 +1795,17 @@
   SMOKE_CHECK(!coordinated.text.empty());
   SMOKE_CHECK(artifacts.get("round:1"));
 
-  auto replan_model = std::make_shared<SequentialTextModel>(
-      std::vector<std::string>{"draft needs revision", "approved final"});
+  auto replan_model = std::make_shared<SequentialTextModel>(std::vector<std::string>{
+      "Thought: draft is not ready.\nFinal Answer: draft needs revision",
+      "Thought: revision is approved.\nFinal Answer: approved final",
+  });
   agent::AgentRunner replan_runner(agent::AgentRunnerConfig{
-      .adapter = replan_model,
-      .max_iterations = 1,
+      .model_runtime = {
+          .adapter = replan_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
   });
   agent::InMemoryArtifactStore replan_artifacts;
   agent::InMemorySharedStateStore replan_state;
@@ -1687,11 +1832,17 @@
   SMOKE_CHECK(replan_state.get("plan-act-observe")->value.at("lastRound").as_integer() == 2);
   SMOKE_CHECK(replan_context.state.output.as_string() == "approved final");
 
-  auto evaluator_model = std::make_shared<SequentialTextModel>(
-      std::vector<std::string>{"missing approval", "approved evaluator output"});
+  auto evaluator_model = std::make_shared<SequentialTextModel>(std::vector<std::string>{
+      "Thought: first answer misses the keyword.\nFinal Answer: missing approval",
+      "Thought: include the required keyword.\nFinal Answer: approved evaluator output",
+  });
   agent::AgentRunner evaluator_runner(agent::AgentRunnerConfig{
-      .adapter = evaluator_model,
-      .max_iterations = 1,
+      .model_runtime = {
+          .adapter = evaluator_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
   });
   agent::InMemoryArtifactStore evaluator_artifacts;
   agent::CoordinatorContext evaluator_context;
@@ -1717,10 +1868,14 @@
   SMOKE_CHECK(evaluator_context.state.output.as_string() == "approved evaluator output");
 
   auto supervisor_worker_model = std::make_shared<SequentialTextModel>(
-      std::vector<std::string>{"worker completed assignment"});
+      std::vector<std::string>{"Thought: complete the assignment.\nFinal Answer: worker completed assignment"});
   agent::AgentRunner supervisor_worker_agent(agent::AgentRunnerConfig{
-      .adapter = supervisor_worker_model,
-      .max_iterations = 1,
+      .model_runtime = {
+          .adapter = supervisor_worker_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
   });
   agent::InMemoryArtifactStore supervisor_artifacts;
   agent::InMemorySharedStateStore supervisor_state;
@@ -1761,11 +1916,17 @@
       .channel = agent::DEFAULT_SUPERVISOR_INBOX_CHANNEL,
   }).empty());
 
-  auto supervisor_eval_model = std::make_shared<SequentialTextModel>(
-      std::vector<std::string>{"needs another pass", "approved supervised output"});
+  auto supervisor_eval_model = std::make_shared<SequentialTextModel>(std::vector<std::string>{
+      "Thought: first supervised output needs another pass.\nFinal Answer: needs another pass",
+      "Thought: supervised output is approved.\nFinal Answer: approved supervised output",
+  });
   agent::AgentRunner supervisor_eval_worker(agent::AgentRunnerConfig{
-      .adapter = supervisor_eval_model,
-      .max_iterations = 1,
+      .model_runtime = {
+          .adapter = supervisor_eval_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
   });
   agent::InMemoryArtifactStore supervisor_eval_artifacts;
   agent::CoordinatorContext supervisor_eval_context;
@@ -1827,10 +1988,14 @@
                                             .sequence({"start", "shape", "end"})
                                             .build();
   auto supervisor_workflow_model = std::make_shared<SequentialTextModel>(
-      std::vector<std::string>{"workflow worker output"});
+      std::vector<std::string>{"Thought: produce workflow output.\nFinal Answer: workflow worker output"});
   agent::AgentRunner supervisor_workflow_worker(agent::AgentRunnerConfig{
-      .adapter = supervisor_workflow_model,
-      .max_iterations = 1,
+      .model_runtime = {
+          .adapter = supervisor_workflow_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
   });
   agent::InMemoryWorkflowStore supervisor_workflow_store;
   agent::WorkflowEngine supervisor_workflow_engine(nullptr, nullptr, &supervisor_workflow_store);
@@ -2008,8 +2173,12 @@
          *roundtripped_settings_suite.cases.front().model_settings.temperature == 0.42);
   auto settings_model = std::make_shared<EvalSettingsModel>();
   agent::AgentRunner settings_eval_runner(agent::AgentRunnerConfig{
-      .adapter = settings_model,
-      .max_iterations = 1,
+      .model_runtime = {
+          .adapter = settings_model,
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
   });
   auto settings_report = agent::run_eval_suite(roundtripped_settings_suite, settings_eval_runner);
   SMOKE_CHECK(settings_report.passed_cases == 1);
@@ -2068,7 +2237,7 @@
         SMOKE_CHECK(test_case.id == "message-input-case");
         ++message_runner_factory_calls;
         agent::AgentRunnerConfig config;
-        config.adapter = message_eval_model;
+        config.model_runtime.adapter = message_eval_model;
         return std::make_shared<agent::AgentRunner>(std::move(config));
       },
   });
@@ -2175,12 +2344,18 @@
       },
       .config = provider_eval_config,
       .agent = "providerEval",
+      .provider_transport = [&](const agent::NativeProviderRequest& request) {
+        (void)request;
+        SMOKE_CHECK(false);
+        return agent::Value::object({});
+      },
       .provider_stream_transport = [&](const agent::NativeProviderRequest& request) {
         ++eval_provider_stream_calls;
         SMOKE_CHECK(request.provider == "openai");
         SMOKE_CHECK(request.headers.at("authorization") == "Bearer eval-key");
         return std::vector<std::string>{
-            "data: {\"id\":\"chatcmpl-eval\",\"model\":\"gpt-eval\",\"choices\":[{\"delta\":{\"content\":\"provider transport eval\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl-eval\",\"model\":\"gpt-eval\",\"choices\":[{\"delta\":{\"content\":\"Thought: Produce the eval output\\nFinal \"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl-eval\",\"model\":\"gpt-eval\",\"choices\":[{\"delta\":{\"content\":\"Answer: provider transport eval\"}}]}\n\n",
             "data: {\"id\":\"chatcmpl-eval\",\"model\":\"gpt-eval\",\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}]}\n\n",
             "data: [DONE]\n\n",
         };
@@ -2203,8 +2378,31 @@
       .update_baseline = true,
   });
   SMOKE_CHECK(report.total_cases == 1);
-  SMOKE_CHECK(report.passed_cases == 1);
   SMOKE_CHECK(report.metadata.is_object());
+  auto eval_assertion_passed = [&](const std::string& name) {
+    return std::any_of(report.results.front().assertions.begin(),
+                       report.results.front().assertions.end(),
+                       [&](const agent::EvalAssertionResult& assertion) {
+                         return assertion.name == name && assertion.passed;
+                       });
+  };
+  SMOKE_CHECK(eval_assertion_passed("contains:tool result"));
+  SMOKE_CHECK(eval_assertion_passed("contains:/tool result/i"));
+  SMOKE_CHECK(eval_assertion_passed("not-contains:not-present-in-output"));
+  SMOKE_CHECK(eval_assertion_passed("not-contains:/forbidden\\s+phrase/i"));
+  SMOKE_CHECK(eval_assertion_passed("min-output-length"));
+  SMOKE_CHECK(eval_assertion_passed("outputContains(/tool result/i)"));
+  SMOKE_CHECK(eval_assertion_passed("outputNotContains(/forbidden/i)"));
+  SMOKE_CHECK(eval_assertion_passed("toolCalled(math.eval)"));
+  SMOKE_CHECK(eval_assertion_passed("toolCallCount(math.eval, 1)"));
+  SMOKE_CHECK(eval_assertion_passed("statusStageSeen(model)"));
+  SMOKE_CHECK(eval_assertion_passed("statusStageSeen(tool)"));
+  SMOKE_CHECK(eval_assertion_passed("tokenUnder(100)"));
+  SMOKE_CHECK(eval_assertion_passed("costUnder(0.001)"));
+  SMOKE_CHECK(eval_assertion_passed("latencyUnder(10000)"));
+  SMOKE_CHECK(eval_assertion_passed("citationCountAtLeast(1)"));
+  SMOKE_CHECK(eval_assertion_passed("custom-output-check"));
+  SMOKE_CHECK(report.passed_cases == 1);
   SMOKE_CHECK(report.results.front().tool_calls.size() == 1);
   SMOKE_CHECK(report.results.front().tool_calls.front() == "math.eval");
   SMOKE_CHECK(std::find(report.results.front().status_stages.begin(), report.results.front().status_stages.end(),
@@ -2262,8 +2460,12 @@
   SMOKE_CHECK(roundtripped_schema_suite.cases.front().expect.front().name == "jsonSchema");
   SMOKE_CHECK(roundtripped_schema_suite.cases.front().expect.front().evaluate);
   agent::AgentRunner schema_eval_runner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<GovernanceModel>(),
-      .max_iterations = 1,
+      .model_runtime = {
+          .adapter = std::make_shared<GovernanceModel>(),
+      },
+      .context_runtime = {
+          .max_iterations = 1,
+      },
   });
   auto schema_eval_report = agent::run_eval_suite(roundtripped_schema_suite, schema_eval_runner);
   SMOKE_CHECK(schema_eval_report.total_cases == 1);
@@ -2273,9 +2475,15 @@
 
   auto pre_cancel_eval_model = std::make_shared<ToolCallingModel>();
   agent::AgentRunner pre_cancel_eval_runner(agent::AgentRunnerConfig{
-      .adapter = pre_cancel_eval_model,
-      .tools = tools,
-      .max_iterations = 2,
+      .model_runtime = {
+          .adapter = pre_cancel_eval_model,
+      },
+      .tool_runtime = {
+          .definitions = tools,
+      },
+      .context_runtime = {
+          .max_iterations = 2,
+      },
   });
   agent::EvalSuite pre_cancel_eval_suite{
       .cases = {agent::EvalCase{.id = "pre-cancel", .input = "should not run"}},
@@ -2307,9 +2515,15 @@
   auto eval_cancel_tools = tools;
   eval_cancel_tools.push_back(eval_cancel_tool);
   agent::AgentRunner eval_cancel_runner(agent::AgentRunnerConfig{
-      .adapter = eval_cancel_model,
-      .tools = eval_cancel_tools,
-      .max_iterations = 3,
+      .model_runtime = {
+          .adapter = eval_cancel_model,
+      },
+      .tool_runtime = {
+          .definitions = eval_cancel_tools,
+      },
+      .context_runtime = {
+          .max_iterations = 3,
+      },
   });
   agent::EvalSuite active_cancel_eval_suite{
       .cases = {agent::EvalCase{.id = "active-cancel", .input = "cancel eval"}},
@@ -2328,14 +2542,20 @@
   SMOKE_CHECK(eval_cancel_model->generate_calls() == 1);
 
   agent::AgentRunner permission_eval_runner(agent::AgentRunnerConfig{
-      .adapter = std::make_shared<ToolCallingModel>(),
-      .tools = tools,
-      .max_iterations = 3,
-      .permission_policy = [](const agent::PermissionRequest&) {
+      .model_runtime = {
+          .adapter = std::make_shared<ToolCallingModel>(),
+      },
+      .tool_runtime = {
+          .definitions = tools,
+          .permission_policy = [](const agent::PermissionRequest&) {
         return agent::PermissionDecision{agent::PermissionDecisionKind::Ask, "approval required"};
       },
-      .approval_handler = agent::create_static_approval_handler(
+          .approval_handler = agent::create_static_approval_handler(
           agent::PermissionDecision{agent::PermissionDecisionKind::Deny, "eval denied"}),
+      },
+      .context_runtime = {
+          .max_iterations = 3,
+      },
   });
   agent::EvalSuite permission_eval_suite{
       .cases = {agent::EvalCase{.id = "permission-case", .input = "permission eval"}},

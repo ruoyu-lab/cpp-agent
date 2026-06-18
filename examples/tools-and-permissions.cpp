@@ -2,7 +2,7 @@
 //
 // Demonstrates:
 //   - Defining a tool with an input schema and an inline execute lambda.
-//   - Wiring it onto AgentRunnerConfig.tools.
+//   - Wiring it onto AgentRunnerConfig::tool_runtime.definitions.
 //   - Constructing a capability-based permission policy and observing how
 //     the executor wraps denials in a failed ToolExecutionResult.
 //   - Driving a tool call directly through the runner's ToolExecutor.
@@ -30,9 +30,9 @@ int main() {
   });
 
   agent::AgentRunnerConfig config;
-  config.adapter = std::make_shared<agent::EchoChatModelAdapter>();
-  config.tools = {echo_tool};
-  config.permission_policy = agent::create_capability_policy(
+  config.model_runtime.adapter = std::make_shared<agent::EchoChatModelAdapter>();
+  config.tool_runtime.definitions = std::vector<agent::ToolDefinition>{echo_tool};
+  config.tool_runtime.permission_policy = agent::create_capability_policy(
       agent::CapabilityPermissionPolicyConfig{
           .allow = {"demo.echo"},
           .deny = {"shell.*"},
@@ -67,7 +67,7 @@ int main() {
 
   // The runner itself is unchanged — the permission policy is enforced by the
   // executor that the runner constructs internally too.
-  auto result = runner.run("Plan whatever you like.", "tools-session");
+  auto result = runner.execution().run("Plan whatever you like.", "tools-session");
   std::cout << "[runner] " << result.text << "\n";
   return 0;
 }

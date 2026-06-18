@@ -76,11 +76,10 @@ auto tools = agent::create_browser_builtin_tools(&renderer);
 agent::ToolExecutor executor(agent::ToolRegistry(tools));
 ```
 
-The tools can also resolve the renderer from
-`ToolExecutionContext::service_refs.browser_renderer`, which is how configured
-apps and runners inject browser services at execution time. The tool
-cancellation token is copied into `BrowserRenderRequest::cancellation` so host
-renderers can abort browser work.
+The tools can also resolve the renderer from `kToolServiceBrowserRenderer`
+when configured apps and runners inject browser services at execution time.
+The tool cancellation token is copied into `BrowserRenderRequest::cancellation`
+so host renderers can abort browser work.
 
 ## Web And Knowledge Integration
 

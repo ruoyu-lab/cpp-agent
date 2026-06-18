@@ -45,6 +45,192 @@
   });
   assert(out_of_range_array_query.ok);
   assert(out_of_range_array_query.output.find("null") != std::string::npos);
+
+  // Generic ToolRun / BackgroundTask manager: custom tools can return a handle
+  // immediately, while the framework owns read/status/list/cancel/wait state.
+  {
+    agent::InMemoryToolRunManager tool_runs;
+    std::atomic<bool> cancel_callback_called{false};
+    std::string captured_run_id;
+    auto background_tool = agent::define_tool(agent::ToolDefinition{
+        .name = "custom.background.start",
+        .description = "Start a custom background run and return its handle.",
+        .input_schema = agent::JsonSchema{
+            .type = agent::JsonSchemaType::Object,
+            .additional_properties = true,
+        },
+        .service_requirements = {agent::tool_service_requirement(agent::kToolServiceToolRunManager)},
+        .long_running = true,
+        .execute = [&](const agent::Value& input, agent::ToolExecutionContext& context) -> agent::ToolInvokeResult {
+          auto* tool_runs = context.service_refs.service_view.get(agent::kToolServiceToolRunManager);
+          assert(tool_runs != nullptr);
+          auto snapshot = tool_runs->start(agent::ToolRunStartOptions{
+              .run_id = input.at("runId").as_string(),
+              .tool_call_id = context.tool_call ? context.tool_call->id : std::string{},
+              .tool_name = context.tool_call ? context.tool_call->name : std::string{"custom.background.start"},
+              .kind = "custom",
+              .label = "fixture custom run",
+              .metadata = agent::Value::object({{"source", "smoke"}}),
+              .cancel = [&](const std::string&) {
+                cancel_callback_called = true;
+              },
+          });
+          captured_run_id = snapshot.run_id;
+          tool_runs->append_log(snapshot.run_id, "stdout", "custom run booted");
+          return agent::Value::object({{"toolRun", agent::tool_run_snapshot_to_value(snapshot)}});
+        },
+    });
+    auto scoped_visibility_tool = agent::define_tool(agent::ToolDefinition{
+        .name = "custom.serviceVisibility",
+        .description = "Verify undeclared services are not visible to custom tools.",
+        .execute = [](const agent::Value&, agent::ToolExecutionContext& context) -> agent::ToolInvokeResult {
+          assert(context.service_refs.service_view.get(agent::kToolServiceToolRunManager) == nullptr);
+          assert(context.service_refs.service_container.get(agent::kToolServiceToolRunManager) == nullptr);
+          bool threw_missing_service = false;
+          try {
+            (void)context.service_refs.service_view.require(agent::kToolServiceToolRunManager);
+          } catch (const agent::ConfigurationError& error) {
+            threw_missing_service =
+                std::string(error.what()).find("tool_runs.manager") != std::string::npos;
+          }
+          assert(threw_missing_service);
+          return agent::Value::object({{"ok", true}});
+        },
+    });
+    agent::ToolRegistry background_registry({background_tool, scoped_visibility_tool});
+    agent::ToolExecutor background_executor(background_registry);
+    agent::ToolExecutionContext background_context;
+    background_context.service_refs.service_container.set(agent::kToolServiceToolRunManager, &tool_runs);
+    auto background_result = background_executor.execute_tool_call(agent::ToolCall{
+        .id = "custom_run_call",
+        .name = "custom.background.start",
+        .arguments = agent::Value::object({{"runId", "custom-run-1"}}),
+    }, background_context);
+    assert(background_result.ok);
+    assert(background_result.output.find("custom-run-1") != std::string::npos);
+    assert(captured_run_id == "custom-run-1");
+    auto visibility_result = background_executor.execute_tool_call(agent::ToolCall{
+        .id = "custom_visibility_call",
+        .name = "custom.serviceVisibility",
+        .arguments = agent::Value::object({}),
+    }, background_context);
+    assert(visibility_result.ok);
+
+    auto snapshot = tool_runs.get("custom-run-1");
+    assert(snapshot);
+    assert(snapshot->status == agent::ToolRunStatus::Running);
+    assert(snapshot->tool_call_id == "custom_run_call");
+    assert(snapshot->tool_name == "custom.background.start");
+    assert(snapshot->kind == "custom");
+    assert(snapshot->metadata.at("source").as_string() == "smoke");
+
+    const auto initial_read = tool_runs.read("custom-run-1", agent::ToolRunReadOptions{.cursor = 0, .limit = 10});
+    assert(!initial_read.events.empty());
+    assert(initial_read.next_cursor >= 1);
+    bool saw_log = false;
+    for (const auto& event : initial_read.events) {
+      if (event.type == "log" && event.stream == "stdout" && event.text == "custom run booted") {
+        saw_log = true;
+      }
+    }
+    assert(saw_log);
+
+    const auto waiting_snapshot = tool_runs.update("custom-run-1", agent::ToolRunUpdate{
+        .status = agent::ToolRunStatus::Waiting,
+    });
+    assert(waiting_snapshot.status == agent::ToolRunStatus::Waiting);
+    const auto ready_snapshot = tool_runs.update("custom-run-1", agent::ToolRunUpdate{
+        .status = agent::ToolRunStatus::Running,
+        .ready = true,
+        .metadata = agent::Value::object({{"url", "http://localhost:5173"}}),
+    });
+    assert(ready_snapshot.ready);
+    assert(ready_snapshot.metadata.at("url").as_string() == "http://localhost:5173");
+    auto waited_ready = tool_runs.wait("custom-run-1", agent::ToolRunWaitOptions{
+                                                           .until = agent::ToolRunWaitUntil::Ready,
+                                                           .timeout_ms = 10,
+                                                       });
+    assert(waited_ready);
+    assert(waited_ready->ready);
+
+    agent::ToolRegistry run_builtin_registry(agent::create_core_builtin_tools());
+    agent::ToolExecutor run_builtin_executor(run_builtin_registry);
+    agent::ToolExecutionContext run_builtin_context;
+    run_builtin_context.service_refs.service_container.set(agent::kToolServiceToolRunManager, &tool_runs);
+    auto status_result = run_builtin_executor.execute_tool_call(agent::ToolCall{
+        .id = "tool_run_status_call",
+        .name = "tool.run.status",
+        .arguments = agent::Value::object({{"runId", "custom-run-1"}}),
+    }, run_builtin_context);
+    assert(status_result.ok);
+    auto status_json = agent::parse_json(status_result.output);
+    assert(status_json.at("found").as_bool());
+    assert(status_json.at("run").at("status").as_string() == "running");
+
+    auto read_result = run_builtin_executor.execute_tool_call(agent::ToolCall{
+        .id = "tool_run_read_call",
+        .name = "tool.run.read",
+        .arguments = agent::Value::object({
+            {"runId", "custom-run-1"},
+            {"tail", 1LL},
+            {"includeEvents", false},
+        }),
+    }, run_builtin_context);
+    assert(read_result.ok);
+    auto read_json = agent::parse_json(read_result.output);
+    assert(read_json.at("found").as_bool());
+    assert(read_json.at("logs").as_array().size() == 1);
+    assert(read_json.at("logs").as_array().front().at("text").as_string() == "custom run booted");
+
+    auto wait_result = run_builtin_executor.execute_tool_call(agent::ToolCall{
+        .id = "tool_run_wait_call",
+        .name = "tool.run.wait",
+        .arguments = agent::Value::object({
+            {"runId", "custom-run-1"},
+            {"ready", true},
+            {"timeoutMs", 10LL},
+        }),
+    }, run_builtin_context);
+    assert(wait_result.ok);
+    auto wait_json = agent::parse_json(wait_result.output);
+    assert(wait_json.at("found").as_bool());
+    assert(wait_json.at("run").at("ready").as_bool());
+
+    const auto all_custom = tool_runs.list(agent::ToolRunListOptions{.kind = "custom"});
+    assert(all_custom.size() == 1);
+    auto list_result = run_builtin_executor.execute_tool_call(agent::ToolCall{
+        .id = "tool_run_list_call",
+        .name = "tool.run.list",
+        .arguments = agent::Value::object({
+            {"kind", "custom"},
+            {"activeOnly", true},
+        }),
+    }, run_builtin_context);
+    assert(list_result.ok);
+    auto list_json = agent::parse_json(list_result.output);
+    assert(list_json.at("runs").as_array().size() == 1);
+
+    auto cancel_result = run_builtin_executor.execute_tool_call(agent::ToolCall{
+        .id = "tool_run_cancel_call",
+        .name = "tool.run.cancel",
+        .arguments = agent::Value::object({
+            {"runId", "custom-run-1"},
+            {"reason", "smoke cancel"},
+        }),
+    }, run_builtin_context);
+    assert(cancel_result.ok);
+    auto cancel_json = agent::parse_json(cancel_result.output);
+    assert(cancel_json.at("found").as_bool());
+    assert(cancel_json.at("run").at("status").as_string() == "cancelled");
+    assert(cancel_json.at("run").at("error").as_string() == "smoke cancel");
+    assert(cancel_callback_called);
+    auto waited_terminal = tool_runs.wait("custom-run-1", agent::ToolRunWaitOptions{.timeout_ms = 10});
+    assert(waited_terminal);
+    assert(waited_terminal->status == agent::ToolRunStatus::Cancelled);
+    const auto cancelled_only = tool_runs.list(agent::ToolRunListOptions{.status = agent::ToolRunStatus::Cancelled});
+    assert(cancelled_only.size() == 1);
+  }
+
   // JSON \uXXXX unicode escape decoding (regression: used to emit literal '?').
   // Raw-string literals so the backslash-u sequences reach parse_json verbatim.
   {
@@ -126,7 +312,8 @@
                 {"usage", agent::Value::object({{"prompt_tokens", 12}, {"completion_tokens", 2}})},
             });
           },
-          "/v1/chat/completions", "https://api.openai.test", "openai-key");
+          "/v1/chat/completions", "https://api.openai.test", "openai-key",
+          {}, {}, {}, agent::ProviderReasoningMode::None, openai_smoke_runtime_options());
       (void)openai_default.generate(agent::GenerateParams{
           .messages = cache_messages,
           .tools = cache_tools,
@@ -208,7 +395,8 @@
                 })},
             });
           },
-          "/v1/chat/completions", "https://api.openai.test", "openai-key");
+          "/v1/chat/completions", "https://api.openai.test", "openai-key",
+          {}, {}, {}, agent::ProviderReasoningMode::None, openai_smoke_runtime_options());
       auto response = openai_explicit.generate(agent::GenerateParams{
           .messages = cache_messages,
           .tools = cache_tools,
@@ -244,7 +432,8 @@
                 {"usage", agent::Value::object({{"prompt_tokens", 7}, {"completion_tokens", 1}})},
             });
           },
-          "/v1/chat/completions", "https://api.openai.test", "openai-key");
+          "/v1/chat/completions", "https://api.openai.test", "openai-key",
+          {}, {}, {}, agent::ProviderReasoningMode::None, openai_smoke_runtime_options());
       (void)openai_custom_key.generate(agent::GenerateParams{
           .messages = cache_messages,
           .tools = cache_tools,
@@ -261,8 +450,8 @@
       class CacheStatsModel final : public agent::ChatModelAdapter {
        public:
         CacheStatsModel() : ChatModelAdapter("openai", "gpt-stats", 0.0, 64) {}
-        agent::ModelResponse generate(const agent::GenerateParams&) override {
-          agent::ModelResponse response;
+        agent::AgentOutput generate(const agent::GenerateParams&) override {
+          agent::AgentOutput response;
           response.provider = "openai";
           response.model = "gpt-stats";
           response.text = "stats ok";
@@ -273,7 +462,7 @@
                   {"prompt_tokens_details", agent::Value::object({{"cached_tokens", 100}})},
               })},
           });
-          return build_response(std::move(response));
+          return build_output(std::move(response));
         }
       };
 
@@ -295,7 +484,7 @@
       session_options.storage.session_id = "cache-stats";
       auto session = std::make_shared<agent::SessionMemory>(std::move(session_options));
 
-      agent::AgentLoop stats_loop(agent::AgentLoopConfig{
+      agent::internal::AgentLoop stats_loop(agent::internal::AgentLoopConfig{
           .model = stats_model,
           .tool_registry = &stats_registry,
           .tool_executor = &stats_executor,
@@ -406,8 +595,8 @@
     agent::SessionMemory session(agent::SessionMemoryOptions{.storage = {.session_id = "smoke-state-session"}});
     agent::InMemoryScratchStore scratch_store;
     agent::ToolExecutionContext base_ctx;
-    base_ctx.service_refs.session = &session;
-    base_ctx.service_refs.scratch_store = &scratch_store;
+    base_ctx.service_refs.service_container.set(agent::kToolServiceSessionMemory, &session);
+    base_ctx.service_refs.service_container.set(agent::kToolServiceScratchStore, &scratch_store);
 
     auto run_tool = [&](const std::string& name, agent::Value arguments) {
       return feature_executor.execute_tool_call(
@@ -575,8 +764,8 @@
       MockScratchStore mock;
       agent::SessionMemory mock_session(agent::SessionMemoryOptions{.storage = {.session_id = "mock-scratch-session"}});
       agent::ToolExecutionContext mock_ctx;
-      mock_ctx.service_refs.session = &mock_session;
-      mock_ctx.service_refs.scratch_store = &mock;
+      mock_ctx.service_refs.service_container.set(agent::kToolServiceSessionMemory, &mock_session);
+      mock_ctx.service_refs.service_container.set(agent::kToolServiceScratchStore, &mock);
 
       auto set_call = feature_executor.execute_tool_call(
           agent::ToolCall{.id = "scratch.set:mock", .name = "scratch.set",
@@ -606,8 +795,8 @@
         agent::FileScratchStore file_store(temp_dir);
         agent::SessionMemory file_session(agent::SessionMemoryOptions{.storage = {.session_id = "file-scratch-session"}});
         agent::ToolExecutionContext file_ctx;
-        file_ctx.service_refs.session = &file_session;
-        file_ctx.service_refs.scratch_store = &file_store;
+        file_ctx.service_refs.service_container.set(agent::kToolServiceSessionMemory, &file_session);
+        file_ctx.service_refs.service_container.set(agent::kToolServiceScratchStore, &file_store);
 
         auto stored = feature_executor.execute_tool_call(
             agent::ToolCall{.id = "scratch.set:file", .name = "scratch.set",
@@ -622,8 +811,8 @@
         agent::FileScratchStore file_store2(temp_dir);
         agent::SessionMemory file_session(agent::SessionMemoryOptions{.storage = {.session_id = "file-scratch-session"}});
         agent::ToolExecutionContext file_ctx2;
-        file_ctx2.service_refs.session = &file_session;
-        file_ctx2.service_refs.scratch_store = &file_store2;
+        file_ctx2.service_refs.service_container.set(agent::kToolServiceSessionMemory, &file_session);
+        file_ctx2.service_refs.service_container.set(agent::kToolServiceScratchStore, &file_store2);
 
         auto reread = feature_executor.execute_tool_call(
             agent::ToolCall{.id = "scratch.get:file", .name = "scratch.get",
@@ -643,7 +832,7 @@
     {
       agent::SessionMemory bare_session(agent::SessionMemoryOptions{.storage = {.session_id = "bare-session"}});
       agent::ToolExecutionContext bare_ctx;
-      bare_ctx.service_refs.session = &bare_session;
+      bare_ctx.service_refs.service_container.set(agent::kToolServiceSessionMemory, &bare_session);
       // Deliberately no scratch_store.
 
       auto failed = feature_executor.execute_tool_call(
@@ -652,10 +841,10 @@
           bare_ctx);
       assert(!failed.ok);
       // The exception message is preserved in the structured output payload;
-      // verify both grep-able tokens land there for users diagnosing missing
-      // injection.
-      assert(failed.output.find("Scratch") != std::string::npos);
-      assert(failed.output.find("scratch_store") != std::string::npos);
+      // verify the token name lands there for users diagnosing missing
+      // service registration.
+      assert(failed.output.find("Tool service") != std::string::npos);
+      assert(failed.output.find("state.scratch") != std::string::npos);
     }
 
     // --- fs.* tools are confined to allowed roots (secure by default) ---
@@ -800,12 +989,157 @@
   assert(contains_string(envelope_audit_lifecycles, "approved"));
   assert(contains_string(envelope_audit_lifecycles, "started"));
   assert(contains_string(envelope_audit_lifecycles, "completed"));
+  const auto envelope_tool_started = std::find_if(
+      envelope_published_events.begin(), envelope_published_events.end(),
+      [](const agent::FrameworkEvent& event) { return event.category == "tool.started"; });
+  assert(envelope_tool_started != envelope_published_events.end());
+  assert(envelope_tool_started->payload.at("phase").as_string() == "started");
+  assert(envelope_tool_started->payload.at("toolName").as_string() == "envelope.result");
+  assert(envelope_tool_started->payload.at("toolCallId").as_string() == "envelope_1");
+  assert(envelope_tool_started->payload.at("iteration").as_integer() == 0);
+  assert(envelope_tool_started->payload.at("arguments").is_object());
+  assert(!envelope_tool_started->payload.at("startedAt").as_string().empty());
   const auto envelope_tool_completed = std::find_if(
       envelope_published_events.begin(), envelope_published_events.end(),
       [](const agent::FrameworkEvent& event) { return event.category == "tool.completed"; });
   assert(envelope_tool_completed != envelope_published_events.end());
   assert(!envelope_tool_completed->trace.trace_id.empty());
   assert(!envelope_tool_completed->trace.span_id.empty());
+  assert(envelope_tool_completed->payload.at("phase").as_string() == "completed");
+  assert(envelope_tool_completed->payload.at("toolName").as_string() == "envelope.result");
+  assert(envelope_tool_completed->payload.at("toolCallId").as_string() == "envelope_1");
+  assert(envelope_tool_completed->payload.at("iteration").as_integer() == 0);
+  assert(envelope_tool_completed->payload.at("arguments").is_object());
+  assert(envelope_tool_completed->payload.at("ok").as_bool());
+  assert(envelope_tool_completed->payload.at("result").at("hidden").as_bool());
+  assert(envelope_tool_completed->payload.at("metadata").at("source").as_string() == "envelope");
+  assert(envelope_tool_completed->payload.at("output").as_string().find("\"hidden\": true") != std::string::npos);
+  assert(envelope_tool_completed->payload.at("durationMs").as_integer() >= 0);
+  assert(!envelope_tool_completed->payload.at("completedAt").as_string().empty());
+  assert(envelope_tool_completed->payload.at("content").as_array().size() == 1);
+  {
+    bool tool_returned = false;
+    std::vector<agent::FrameworkEvent> progress_events;
+    std::vector<bool> seen_before_return;
+    std::vector<std::string> progress_categories;
+    agent::EventBus progress_bus;
+    progress_bus.register_sink([&](const agent::FrameworkEvent& event) {
+      progress_categories.push_back(event.category);
+      if (event.category == "tool.progress") {
+        progress_events.push_back(event);
+        seen_before_return.push_back(!tool_returned);
+      }
+    });
+    auto progress_tool = agent::define_tool(agent::ToolDefinition{
+        .name = "progress.tool",
+        .description = "Emit tool progress events.",
+        .input_schema = envelope_schema,
+        .execute = [&](const agent::Value&, agent::ToolExecutionContext& context) -> agent::ToolInvokeResult {
+          agent::emit_tool_progress(context, "tool.progress",
+                                    agent::Value::object({{"message", "step 1"},
+                                                          {"current", 1},
+                                                          {"total", 2},
+                                                          {"unit", "step"}}));
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          agent::emit_tool_progress(context, "tool.message",
+                                    agent::Value::object({{"message", "step 2"}}));
+          tool_returned = true;
+          return agent::Value::object({{"ok", true}});
+        },
+    });
+    agent::ToolRegistry progress_registry({progress_tool});
+    agent::ToolExecutor progress_executor(progress_registry, {}, {}, &progress_bus);
+    agent::ToolExecutionContext progress_context;
+    progress_context.iteration = 7;
+    progress_context.trace_context.trace_id = "tool-progress-trace";
+    progress_context.trace_context.run_id = "tool-progress-run";
+    auto progress_result = progress_executor.execute_tool_call(agent::ToolCall{
+        .id = "progress_call_1",
+        .name = "progress.tool",
+        .arguments = agent::Value::object({}),
+    }, progress_context);
+    assert(progress_result.ok);
+    assert(progress_events.size() == 2);
+    assert(seen_before_return.size() == 2);
+    assert(std::all_of(seen_before_return.begin(), seen_before_return.end(), [](bool seen) { return seen; }));
+    assert(progress_events[0].payload.at("toolCallId").as_string() == "progress_call_1");
+    assert(progress_events[0].payload.at("toolName").as_string() == "progress.tool");
+    assert(progress_events[0].payload.at("iteration").as_integer() == 7);
+    assert(progress_events[0].payload.at("sequence").as_integer() == 0);
+    assert(progress_events[0].payload.at("kind").as_string() == "tool.progress");
+    assert(progress_events[0].payload.at("payload").at("message").as_string() == "step 1");
+    assert(progress_events[1].payload.at("sequence").as_integer() == 1);
+    assert(progress_events[1].payload.at("kind").as_string() == "tool.message");
+    assert(contains_string(progress_categories, "tool.started"));
+    assert(contains_string(progress_categories, "tool.completed"));
+    const auto progress_started = std::find_if(
+        progress_categories.begin(), progress_categories.end(),
+        [](const std::string& category) { return category == "tool.started"; });
+    assert(progress_started != progress_categories.end());
+  }
+  {
+    std::vector<agent::FrameworkEvent> high_frequency_events;
+    std::vector<std::string> high_frequency_categories;
+    agent::EventBus high_frequency_bus;
+    high_frequency_bus.register_sink([&](const agent::FrameworkEvent& event) {
+      high_frequency_categories.push_back(event.category);
+      if (event.category == "tool.progress" || event.category == "tool.delta") {
+        high_frequency_events.push_back(event);
+      }
+    });
+    auto high_frequency_tool = agent::define_tool(agent::ToolDefinition{
+        .name = "high.frequency.tool",
+        .description = "Emit high-frequency progress and delta events.",
+        .input_schema = envelope_schema,
+        .execute = [&](const agent::Value&, agent::ToolExecutionContext& context) -> agent::ToolInvokeResult {
+          for (int index = 0; index < 100; ++index) {
+            agent::emit_tool_progress(context, "tool.progress",
+                                      agent::Value::object({{"index", index}}));
+            agent::emit_tool_progress(context, "tool.delta.stdout",
+                                      agent::Value::object({{"chunk", "chunk-" + std::to_string(index)}}));
+          }
+          return agent::Value::object({{"ok", true}});
+        },
+    });
+    agent::ToolRegistry high_frequency_registry({high_frequency_tool});
+    agent::ToolExecutor high_frequency_executor(high_frequency_registry, {}, {}, &high_frequency_bus);
+    agent::ToolExecutionContext high_frequency_context;
+    high_frequency_context.iteration = 9;
+    const auto high_frequency_result = high_frequency_executor.execute_tool_call(agent::ToolCall{
+        .id = "high_frequency_call",
+        .name = "high.frequency.tool",
+        .arguments = agent::Value::object({}),
+    }, high_frequency_context);
+    assert(high_frequency_result.ok);
+    assert(high_frequency_events.size() == 200);
+    for (std::size_t index = 0; index < high_frequency_events.size(); ++index) {
+      const auto& event = high_frequency_events[index];
+      assert(event.payload.at("sequence").as_integer() == static_cast<long long>(index));
+      assert(event.payload.at("toolCallId").as_string() == "high_frequency_call");
+      assert(event.payload.at("iteration").as_integer() == 9);
+      if (index % 2 == 0) {
+        assert(event.category == "tool.progress");
+        assert(event.payload.at("kind").as_string() == "tool.progress");
+      } else {
+        assert(event.category == "tool.delta");
+        assert(event.payload.at("kind").as_string() == "tool.delta.stdout");
+      }
+    }
+    const auto completed_it = std::find(high_frequency_categories.begin(),
+                                        high_frequency_categories.end(),
+                                        "tool.completed");
+    assert(completed_it != high_frequency_categories.end());
+    const auto last_delta_it = std::find(high_frequency_categories.rbegin(),
+                                         high_frequency_categories.rend(),
+                                         "tool.delta");
+    assert(last_delta_it != high_frequency_categories.rend());
+    const auto last_delta_index = static_cast<std::size_t>(
+        high_frequency_categories.size() - 1 -
+        std::distance(high_frequency_categories.rbegin(), last_delta_it));
+    const auto completed_index = static_cast<std::size_t>(
+        std::distance(high_frequency_categories.begin(), completed_it));
+    assert(last_delta_index < completed_index);
+  }
   auto unknown_envelope_result = envelope_executor.execute_tool_call(agent::ToolCall{
       .id = "envelope_unknown",
       .name = "envelope.missing",
@@ -816,6 +1150,13 @@
 
   agent::CancellationToken developer_tool_cancellation;
   bool developer_exec_called = false;
+  std::vector<agent::FrameworkEvent> developer_progress_events;
+  agent::EventBus developer_progress_bus;
+  developer_progress_bus.register_sink([&](const agent::FrameworkEvent& event) {
+    if (event.category == "tool.progress") {
+      developer_progress_events.push_back(event);
+    }
+  });
   agent::ToolRegistry developer_registry(agent::create_developer_builtin_tools(
       [&](const agent::DeveloperProcessRequest& request) {
         developer_exec_called = true;
@@ -823,13 +1164,27 @@
         assert((request.args == std::vector<std::string>{"one", "two"}));
         assert(request.cwd == "/tmp");
         assert(request.cancellation == &developer_tool_cancellation);
+        assert(static_cast<bool>(request.emit_progress));
+        assert(std::find(request.sandbox_request.allowed_subcommands.begin(),
+                         request.sandbox_request.allowed_subcommands.end(),
+                         "fixture-command") != request.sandbox_request.allowed_subcommands.end());
+        request.emit_progress(agent::ToolProgressEvent{
+            .kind = "terminal.stdout",
+            .payload = agent::Value::object({{"chunk", "developer stdout chunk"},
+                                             {"stream", "stdout"}}),
+        });
+        request.emit_progress(agent::ToolProgressEvent{
+            .kind = "terminal.stderr",
+            .payload = agent::Value::object({{"chunk", "developer stderr chunk"},
+                                             {"stream", "stderr"}}),
+        });
         return agent::DeveloperProcessResult{
             .stdout_text = "developer stdout",
             .stderr_text = "developer stderr",
             .exit_code = 0,
         };
       }));
-  agent::ToolExecutor developer_executor(developer_registry);
+  agent::ToolExecutor developer_executor(developer_registry, {}, {}, &developer_progress_bus);
   // shell.exec declares a sandbox policy whose required capabilities include
   // ProcessAccess::ChildOnly. Install a permissive test sandbox so the
   // existing developer flow can run; the dedicated sandbox-contract block
@@ -856,7 +1211,7 @@
   PermissiveTestSandbox permissive_sandbox;
   agent::ToolExecutionContext developer_shell_context;
   developer_shell_context.cancellation = &developer_tool_cancellation;
-  developer_shell_context.service_refs.sandbox = &permissive_sandbox;
+  developer_shell_context.service_refs.service_container.set(agent::kToolServiceSandbox, &permissive_sandbox);
   auto developer_shell = developer_executor.execute_tool_call(agent::ToolCall{
       .id = "developer_shell_1",
       .name = "shell.exec",
@@ -870,12 +1225,30 @@
   assert(developer_shell.ok);
   assert(developer_shell.output.find("developer stdout") != std::string::npos);
   assert(developer_shell.output.find("developer stderr") != std::string::npos);
+  assert(std::any_of(
+      developer_progress_events.begin(), developer_progress_events.end(),
+      [](const agent::FrameworkEvent& event) {
+        return event.payload.at("kind").as_string() == "terminal.stdout"
+               && event.payload.at("payload").at("chunk").as_string() == "developer stdout chunk";
+      }));
+  assert(std::any_of(
+      developer_progress_events.begin(), developer_progress_events.end(),
+      [](const agent::FrameworkEvent& event) {
+        return event.payload.at("kind").as_string() == "terminal.stderr"
+               && event.payload.at("payload").at("chunk").as_string() == "developer stderr chunk";
+      }));
+  assert(std::any_of(
+      developer_progress_events.begin(), developer_progress_events.end(),
+      [](const agent::FrameworkEvent& event) {
+        return event.payload.at("kind").as_string() == "terminal.exit"
+               && event.payload.at("payload").at("exitCode").as_integer() == 0;
+      }));
   agent::ToolRegistry developer_bundle_registry(agent::create_builtin_tools({"developer"}));
   assert(developer_bundle_registry.get("shell.exec") != nullptr);
   agent::ToolExecutor developer_bundle_executor(developer_bundle_registry);
   agent::ToolExecutionContext missing_executor_context;
   // Same trick — install permissive sandbox so we reach the executor check.
-  missing_executor_context.service_refs.sandbox = &permissive_sandbox;
+  missing_executor_context.service_refs.service_container.set(agent::kToolServiceSandbox, &permissive_sandbox);
   auto missing_developer_executor = developer_bundle_executor.execute_tool_call(agent::ToolCall{
       .id = "developer_shell_missing_1",
       .name = "shell.exec",
@@ -944,7 +1317,7 @@
       assert(caps.process == agent::ProcessAccess::None);
     }
     agent::ToolExecutionContext noop_ctx;
-    noop_ctx.service_refs.sandbox = &noop_sandbox;
+    noop_ctx.service_refs.service_container.set(agent::kToolServiceSandbox, &noop_sandbox);
     auto noop_result = sandbox_audited_executor.execute_tool_call(agent::ToolCall{
         .id = "sandbox_contract_noop",
         .name = "shell.exec",
@@ -959,7 +1332,7 @@
     sandbox_events.clear();
     agent::ToolExecutionContext permissive_ctx;
     permissive_ctx.cancellation = &developer_tool_cancellation;
-    permissive_ctx.service_refs.sandbox = &permissive_sandbox;
+    permissive_ctx.service_refs.service_container.set(agent::kToolServiceSandbox, &permissive_sandbox);
     developer_exec_called = false;
     auto permissive_result = sandbox_audited_executor.execute_tool_call(agent::ToolCall{
         .id = "sandbox_contract_permissive",
@@ -1000,7 +1373,7 @@
     developer_exec_called = false;
     agent::ToolExecutionContext live_permissive_ctx;
     live_permissive_ctx.cancellation = &developer_tool_cancellation;
-    live_permissive_ctx.service_refs.sandbox = &permissive_sandbox;
+    live_permissive_ctx.service_refs.service_container.set(agent::kToolServiceSandbox, &permissive_sandbox);
     auto live_permissive_result = developer_executor.execute_tool_call(agent::ToolCall{
         .id = "sandbox_contract_live_permissive",
         .name = "shell.exec",
@@ -1100,6 +1473,57 @@
     assert(agent::syscall_access_from_string("standard") == agent::SyscallAccess::Standard);
     assert(agent::syscall_access_from_string("garbled", agent::SyscallAccess::Unrestricted) ==
            agent::SyscallAccess::Unrestricted);
+
+    // (8) Permission resources adapt to SandboxRequest without naming any
+    // platform-specific sandbox implementation.
+    std::vector<agent::PermissionResource> permission_resources;
+    permission_resources.push_back(agent::PermissionResource{
+        .kind = agent::PermissionResourceKind::Filesystem,
+        .id = "/workspace/src",
+        .actions = {agent::PermissionAction::FilesystemRead},
+        .boundary = agent::PermissionResourceBoundary{.path_prefix = "/workspace/src"},
+    });
+    permission_resources.push_back(agent::PermissionResource{
+        .kind = agent::PermissionResourceKind::Filesystem,
+        .id = "/workspace/out",
+        .actions = {agent::PermissionAction::FilesystemWrite},
+        .boundary = agent::PermissionResourceBoundary{.path = "/workspace/out"},
+    });
+    permission_resources.push_back(agent::PermissionResource{
+        .kind = agent::PermissionResourceKind::Network,
+        .id = "api.example.com",
+        .actions = {agent::PermissionAction::NetworkConnect},
+        .boundary = agent::PermissionResourceBoundary{.host = "api.example.com"},
+    });
+    permission_resources.push_back(agent::PermissionResource{
+        .kind = agent::PermissionResourceKind::Process,
+        .id = "git",
+        .actions = {agent::PermissionAction::ProcessExecute},
+        .boundary = agent::PermissionResourceBoundary{.command = "git"},
+    });
+    auto permission_sandbox = agent::sandbox_request_from_permission_resources(permission_resources);
+    assert(permission_sandbox.capabilities.fs == agent::FsAccess::ReadWrite);
+    assert(permission_sandbox.capabilities.net == agent::NetAccess::Allowlist);
+    assert(permission_sandbox.capabilities.process == agent::ProcessAccess::ChildOnly);
+    assert(permission_sandbox.fs_read_paths == std::vector<std::filesystem::path>{"/workspace/src"});
+    assert(permission_sandbox.fs_write_paths == std::vector<std::filesystem::path>{"/workspace/out"});
+    assert(permission_sandbox.net_hosts == std::vector<std::string>{"api.example.com"});
+    assert(permission_sandbox.allowed_subcommands == std::vector<std::string>{"git"});
+
+    // (9) Shell classification is AST-backed and reports structured risk.
+    auto shell_classification = agent::classify_shell_command("cat ./README.md | grep agent > ./out.txt");
+    assert((shell_classification.commands == std::vector<std::string>{"cat", "grep"}));
+    assert(shell_classification.risk_level == "medium");
+    assert(std::find(shell_classification.actions.begin(), shell_classification.actions.end(),
+                     agent::PermissionAction::FilesystemRead) != shell_classification.actions.end());
+    assert(std::find(shell_classification.actions.begin(), shell_classification.actions.end(),
+                     agent::PermissionAction::FilesystemWrite) != shell_classification.actions.end());
+    auto destructive_shell = agent::classify_shell_command("rm -rf $(pwd)/build");
+    assert(destructive_shell.risk_level == "high");
+    assert(std::any_of(destructive_shell.findings.begin(), destructive_shell.findings.end(),
+                       [](const agent::ShellCommandFinding& finding) {
+                         return finding.category == "dynamic-shell";
+                       }));
   }
 
   agent::CancellationToken browser_tool_cancellation;
@@ -1171,7 +1595,7 @@
   assert(missing_browser_renderer.error == "Tool \"browser.render\" failed.");
   assert(missing_browser_renderer.output.find("Browser renderer is not configured") != std::string::npos);
   agent::ToolExecutionContext browser_service_context;
-  browser_service_context.service_refs.browser_renderer = &browser_renderer;
+  browser_service_context.service_refs.service_container.set(agent::kToolServiceBrowserRenderer, &browser_renderer);
   auto browser_service_render = browser_bundle_executor.execute_tool_call(agent::ToolCall{
       .id = "browser_service_1",
       .name = "browser.render",
@@ -1674,6 +2098,51 @@
   });
   assert(rule_decision.decision == agent::PermissionDecisionKind::Ask);
 
+  auto fine_policy = agent::create_fine_grained_permission_policy(agent::FineGrainedPermissionPolicyConfig{
+      .rules = {
+          agent::FineGrainedPermissionRule{
+              .id = "default-process-ask",
+              .priority = -1,
+              .match = agent::FineGrainedPermissionMatcher{
+                  .actions = {agent::PermissionAction::ProcessExecute},
+              },
+              .decision = agent::PermissionDecisionKind::Ask,
+          },
+          agent::FineGrainedPermissionRule{
+              .id = "allow-git-status",
+              .priority = 10,
+              .match = agent::FineGrainedPermissionMatcher{
+                  .tool_names = {"shell.exec"},
+                  .resource_matchers = {agent::PermissionResourceMatcher{
+                      .kinds = {agent::PermissionResourceKind::Process},
+                      .commands = {"git"},
+                  }},
+              },
+              .decision = agent::PermissionDecisionKind::Allow,
+          },
+      },
+  });
+  auto fine_decision = fine_policy(agent::PermissionRequest{
+      .tool_name = "shell.exec",
+      .capabilities = {"process.exec"},
+      .risk_level = agent::ToolRiskLevel::Low,
+      .actions = {agent::PermissionAction::ToolInvoke, agent::PermissionAction::ProcessExecute},
+      .resources = {agent::PermissionResource{
+          .kind = agent::PermissionResourceKind::Process,
+          .id = "git",
+          .actions = {agent::PermissionAction::ProcessExecute},
+          .boundary = agent::PermissionResourceBoundary{.command = "git"},
+      }},
+      .tool_call = agent::ToolCall{
+          .id = "permission_4",
+          .name = "shell.exec",
+          .arguments = agent::Value::object({{"command", "git status"}}),
+      },
+  });
+  assert(fine_decision.decision == agent::PermissionDecisionKind::Allow);
+  assert(fine_decision.rule_id == "allow-git-status");
+  assert(fine_decision.priority == 10);
+
   std::istringstream cli_approval_input("yes\n");
   std::ostringstream cli_approval_output;
   auto cli_approval = agent::create_cli_approval_handler(agent::CliApprovalHandlerConfig{
@@ -1711,7 +2180,18 @@
       exploding_events.begin(), exploding_events.end(),
       [](const agent::FrameworkEvent& event) { return event.category == "tool.failed"; });
   assert(exploding_failed_event != exploding_events.end());
-  assert(exploding_failed_event->payload.at("error").as_string() == "Tool \"explode.direct\" failed.");
+  assert(exploding_failed_event->payload.at("phase").as_string() == "failed");
+  assert(exploding_failed_event->payload.at("toolName").as_string() == "explode.direct");
+  assert(exploding_failed_event->payload.at("toolCallId").as_string() == "explode_direct_1");
+  assert(exploding_failed_event->payload.at("arguments").is_object());
+  assert(!exploding_failed_event->payload.at("ok").as_bool());
+  assert(exploding_failed_event->payload.at("error").at("message").as_string() == "direct boom");
+  assert(exploding_failed_event->payload.at("error").at("type").as_string() == "std::exception");
+  assert(exploding_failed_event->payload.at("error").at("lifecycleMessage").as_string() ==
+         "Tool \"explode.direct\" failed.");
+  assert(exploding_failed_event->payload.at("output").as_string().find("direct boom") != std::string::npos);
+  assert(exploding_failed_event->payload.at("durationMs").as_integer() >= 0);
+  assert(!exploding_failed_event->payload.at("failedAt").as_string().empty());
 
   auto parsed = agent::parse_json("{\"a\":[1,true,\"x\"],\"b\":{\"c\":2}}");
   assert(parsed.at("a").as_array().size() == 3);
@@ -1789,8 +2269,11 @@
 
   auto server_model = std::make_shared<ServerRuntimeModel>();
   agent::AgentRunner server_runner(agent::AgentRunnerConfig{
-      .adapter = server_model,
-      .contexts = {
+      .model_runtime = {
+          .adapter = server_model,
+      },
+      .context_runtime = {
+          .sources = std::vector<agent::ContextSource>{
           agent::ContextSource{
               .id = "server-runtime",
               .title = "Server Runtime",
@@ -1808,7 +2291,8 @@
               },
           },
       },
-      .max_iterations = 2,
+          .max_iterations = 2,
+      },
   });
   const auto server_audit_file = smoke_artifacts_root() / "server-audit.jsonl";
   const auto server_replay_dir = smoke_artifacts_root() / "server-replays";
@@ -2056,8 +2540,11 @@
 
   auto factory_model = std::make_shared<ServerRuntimeModel>();
   auto factory_runner = std::make_shared<agent::AgentRunner>(agent::AgentRunnerConfig{
-      .adapter = factory_model,
-      .contexts = {
+      .model_runtime = {
+          .adapter = factory_model,
+      },
+      .context_runtime = {
+          .sources = std::vector<agent::ContextSource>{
           agent::ContextSource{
               .id = "server-runtime",
               .title = "Server Runtime",
@@ -2075,7 +2562,8 @@
               },
           },
       },
-      .max_iterations = 1,
+          .max_iterations = 1,
+      },
   });
   int factory_runner_calls = 0;
   agent::AgentServerApp factory_server_app(agent::AgentServerOptions{.allow_unauthenticated = true,

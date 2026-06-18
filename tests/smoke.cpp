@@ -1,5 +1,8 @@
-#include "agent/agent.hpp"
+#include "agent/full.hpp"
+#include "agent/providers/reasoning.hpp"
+#include "agent/react.hpp"
 #include "../src/agent/detail/helpers.hpp"
+#include "../src/agent/function_calling_loop.hpp"
 
 #include <cassert>
 #include <cstdlib>
@@ -9,10 +12,12 @@
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <utility>
 #include <variant>
 
 #ifndef _WIN32
@@ -32,6 +37,29 @@
 
 namespace {
 
+agent::NativeAgentAppResolveOptions native_resolve_options(
+    std::string agent_id,
+    agent::NativeProviderTransport provider_transport = {},
+    agent::NativeMCPTransportFactory mcp_transport_factory = {},
+    agent::NativeWebAdapters web_adapters = {},
+    agent::NativeDeveloperAdapters developer_adapters = {},
+    agent::NativeBrowserAdapters browser_adapters = {},
+    agent::NativeProviderStreamTransport provider_stream_transport = {},
+    agent::NativeLlamaCppAdapters llama_adapters = {},
+    agent::NativeProviderStreamingTransport provider_streaming_transport = {}) {
+  agent::NativeAgentAppResolveOptions options;
+  options.requested_agent_id = std::move(agent_id);
+  options.provider_transport = std::move(provider_transport);
+  options.provider_stream_transport = std::move(provider_stream_transport);
+  options.provider_streaming_transport = std::move(provider_streaming_transport);
+  options.mcp_transport_factory = std::move(mcp_transport_factory);
+  options.web_adapters = std::move(web_adapters);
+  options.developer_adapters = std::move(developer_adapters);
+  options.browser_adapters = std::move(browser_adapters);
+  options.llama_adapters = std::move(llama_adapters);
+  return options;
+}
+
 // Resolve the on-disk root used by smoke fixtures (skill projects, knowledge
 // dirs, native stores, audit logs, replays). Uses the OS-provided temp
 // directory so artifacts never touch the source tree regardless of how the
@@ -40,6 +68,19 @@ namespace {
 // fixture uses `temp_directory_path() / "agent_native_smoke_stale"`).
 std::filesystem::path smoke_artifacts_root() {
   return std::filesystem::temp_directory_path() / "agent_native_smoke_artifacts";
+}
+
+agent::OpenAICompatibleRuntimeOptions openai_smoke_runtime_options() {
+  return agent::OpenAICompatibleRuntimeOptions{
+      .service_name = "OpenAI",
+      .api_key_env_name = "OPENAI_API_KEY",
+      .require_api_key = true,
+      .supports_responses_api = true,
+      .supports_prompt_cache_key = true,
+      .capabilities = {"input.text", "input.image", "input.file", "input.audio", "input.video",
+                       "output.structuredContent", "transport.inline", "transport.reference",
+                       "reasoning", "reasoning.budget", "reasoning.includeThoughts"},
+  };
 }
 
 #ifndef _WIN32
@@ -83,6 +124,58 @@ std::string http_body(const std::string& response) {
 
 bool contains_string(const std::vector<std::string>& values, const std::string& value) {
   return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+struct CapturedRunnerStream {
+  std::vector<agent::AgentRunnerStreamEvent> events;
+  agent::AgentRunnerRunResult result;
+};
+
+template <typename Input, typename... Args>
+CapturedRunnerStream capture_runner_stream(agent::AgentRunner& runner, Input&& input, Args&&... args) {
+  CapturedRunnerStream captured;
+  auto stream = runner.streaming().stream(std::forward<Input>(input),
+                              [&](const agent::AgentRunnerStreamEvent& event) {
+                                captured.events.push_back(event);
+                              },
+                              std::forward<Args>(args)...);
+  captured.result = std::move(stream.result);
+  return captured;
+}
+
+template <typename Input, typename... Args>
+CapturedRunnerStream capture_runner_stream(agent::AgentRunner&& runner, Input&& input, Args&&... args) {
+  return capture_runner_stream(runner, std::forward<Input>(input), std::forward<Args>(args)...);
+}
+
+struct CapturedLoopStream {
+  std::vector<agent::AgentLoopStreamEvent> events;
+  agent::AgentLoopRunResult result;
+};
+
+template <typename Loop, typename Input, typename... Args>
+CapturedLoopStream capture_loop_stream(Loop& loop,
+                                       agent::SessionMemory& session,
+                                       Input&& input,
+                                       Args&&... args) {
+  CapturedLoopStream captured;
+  auto stream = loop.stream(session,
+                            std::forward<Input>(input),
+                            [&](const agent::AgentLoopStreamEvent& event) {
+                              captured.events.push_back(event);
+                            },
+                            std::forward<Args>(args)...);
+  captured.result = std::move(stream.result);
+  return captured;
+}
+
+std::vector<agent::ModelStreamEvent> capture_model_stream(agent::ChatModelAdapter& model,
+                                                          agent::GenerateParams params) {
+  std::vector<agent::ModelStreamEvent> events;
+  model.stream(std::move(params), [&](const agent::ModelStreamEvent& event) {
+    events.push_back(event);
+  });
+  return events;
 }
 
 class FixedSearchEmbeddingAdapter final : public agent::TextEmbeddingAdapter {
@@ -703,12 +796,16 @@ class ToolCallingModel final : public agent::ChatModelAdapter {
  public:
   ToolCallingModel() : ChatModelAdapter("test", "tool-caller", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     ++generate_calls_;
     for (const auto& message : params.messages) {
-      if (message.role == agent::MessageRole::Tool && message.name == "math.eval") {
-        agent::ModelResponse response;
-        response.text = "tool result: " + agent::extract_text_content(message.content);
+      const auto message_text = agent::extract_text_content(message.content);
+      if (message_text.find("Observation:") != std::string::npos &&
+          message.metadata.at("observation").as_bool(false) &&
+          message_text.find("math.eval") != std::string::npos) {
+        agent::AgentOutput response;
+        response.text = "Thought: answer from the observation.\nFinal Answer: tool result: " +
+            message_text;
         response.raw = agent::Value::object({
             {"usage", agent::Value::object({
                 {"prompt_tokens", 20},
@@ -719,20 +816,17 @@ class ToolCallingModel final : public agent::ChatModelAdapter {
                 agent::Value::object({{"id", "tool-citation"}, {"uri", "memory://tool"}}),
             })},
         });
-        return build_response(std::move(response));
+        return build_output(std::move(response));
       }
     }
 
-    agent::ModelResponse response;
+    agent::AgentOutput response;
     response.provider = provider();
     response.model = model();
-    response.finish_reason = "tool_calls";
-    response.tool_calls.push_back(agent::ToolCall{
-        .id = "call_1",
-        .name = "math.eval",
-        .arguments = agent::Value::object({{"expression", "1+2"}}),
-    });
-    return build_response(response);
+    response.finish_reason = "stop";
+    response.text = "Thought: evaluate the expression.\nActions:\n"
+                    "[{\"tool\":\"math.eval\",\"input\":{\"expression\":\"1+2\"}}]";
+    return build_output(response);
   }
 
   [[nodiscard]] int generate_calls() const noexcept { return generate_calls_; }
@@ -741,27 +835,71 @@ class ToolCallingModel final : public agent::ChatModelAdapter {
   int generate_calls_ = 0;
 };
 
+class NativeToolCallingRunnerModel final : public agent::ChatModelAdapter {
+ public:
+  NativeToolCallingRunnerModel() : ChatModelAdapter("fixture", "native-tool-runner", 0.0, 256, {"input.text"}) {}
+
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
+    ++generate_calls_;
+    saw_native_tool_descriptors_ =
+        saw_native_tool_descriptors_ ||
+        std::any_of(params.tools.begin(), params.tools.end(), [](const agent::ChatToolDescriptor& tool) {
+          return tool.name == "math.eval";
+        });
+    for (const auto& message : params.messages) {
+      if (message.role != agent::MessageRole::Tool || message.name != "math.eval") {
+        continue;
+      }
+      const auto text = agent::extract_text_content(message.content);
+      return build_output(agent::AgentOutput{
+          .provider = provider(),
+          .model = model(),
+          .text = "native tool result: " + text,
+      });
+    }
+    agent::AgentOutput response;
+    response.provider = provider();
+    response.model = model();
+    response.finish_reason = "tool_calls";
+    response.tool_calls = {agent::ToolCall{
+        .id = "call_native_math",
+        .name = "math.eval",
+        .arguments = agent::Value::object({{"expression", "1+2"}}),
+    }};
+    return build_output(std::move(response));
+  }
+
+  [[nodiscard]] int generate_calls() const noexcept { return generate_calls_; }
+  [[nodiscard]] bool saw_native_tool_descriptors() const noexcept { return saw_native_tool_descriptors_; }
+
+ private:
+  int generate_calls_ = 0;
+  bool saw_native_tool_descriptors_ = false;
+};
+
 class ThrowingToolRecoveryModel final : public agent::ChatModelAdapter {
  public:
   ThrowingToolRecoveryModel() : ChatModelAdapter("fixture", "throwing-tool-recovery", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     ++generate_calls_;
     for (const auto& message : params.messages) {
-      if (message.role == agent::MessageRole::Tool && message.name == "explode") {
-        saw_failed_tool_message_ = agent::extract_text_content(message.content).find("boom") != std::string::npos;
-        return build_response(agent::ModelResponse{.text = "recovered after tool failure"});
+      const auto text = agent::extract_text_content(message.content);
+      if (text.find("Observation:") != std::string::npos &&
+          message.metadata.at("observation").as_bool(false) &&
+          text.find("explode") != std::string::npos) {
+        saw_failed_tool_message_ = text.find("boom") != std::string::npos;
+        return build_output(agent::AgentOutput{
+            .text = "Thought: recover from the failed tool.\nFinal Answer: recovered after tool failure",
+        });
       }
     }
 
-    agent::ModelResponse response;
-    response.finish_reason = "tool_calls";
-    response.tool_calls.push_back(agent::ToolCall{
-        .id = "explode_call_1",
-        .name = "explode",
-        .arguments = agent::Value::object({}),
-    });
-    return build_response(response);
+    agent::AgentOutput response;
+    response.finish_reason = "stop";
+    response.text = "Thought: run the failing tool.\nActions:\n"
+                    "[{\"tool\":\"explode\",\"input\":{}}]";
+    return build_output(response);
   }
 
   [[nodiscard]] int generate_calls() const noexcept { return generate_calls_; }
@@ -776,26 +914,27 @@ class ExecutorFailureRecoveryModel final : public agent::ChatModelAdapter {
  public:
   ExecutorFailureRecoveryModel() : ChatModelAdapter("fixture", "executor-failure-recovery", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     ++generate_calls_;
     for (const auto& message : params.messages) {
-      if (message.role == agent::MessageRole::Tool && message.name == "permission.gated") {
-        const auto text = agent::extract_text_content(message.content);
+      const auto text = agent::extract_text_content(message.content);
+      if (text.find("Observation:") != std::string::npos &&
+          message.metadata.at("observation").as_bool(false) &&
+          text.find("permission.gated") != std::string::npos) {
         saw_synthetic_tool_message_ =
             text.find("Tool \\\"permission.gated\\\" threw an unexpected error.") != std::string::npos ||
             text.find("Tool \"permission.gated\" threw an unexpected error.") != std::string::npos;
-        return build_response(agent::ModelResponse{.text = "recovered after executor failure"});
+        return build_output(agent::AgentOutput{
+            .text = "Thought: recover from the executor failure.\nFinal Answer: recovered after executor failure",
+        });
       }
     }
 
-    agent::ModelResponse response;
-    response.finish_reason = "tool_calls";
-    response.tool_calls.push_back(agent::ToolCall{
-        .id = "permission_gated_call_1",
-        .name = "permission.gated",
-        .arguments = agent::Value::object({}),
-    });
-    return build_response(response);
+    agent::AgentOutput response;
+    response.finish_reason = "stop";
+    response.text = "Thought: run the gated tool.\nActions:\n"
+                    "[{\"tool\":\"permission.gated\",\"input\":{}}]";
+    return build_output(response);
   }
 
   [[nodiscard]] int generate_calls() const noexcept { return generate_calls_; }
@@ -810,11 +949,11 @@ class IncompleteFinishStreamingModel final : public agent::ChatModelAdapter {
  public:
   IncompleteFinishStreamingModel() : ChatModelAdapter("fixture", "incomplete-stream", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams&) override {
-    agent::ModelResponse response;
-    response.text = "partial answer that got cut off";
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
+    agent::AgentOutput response;
+    response.text = "Thought: answer was truncated.\nFinal Answer: partial answer that got cut off";
     response.finish_reason = "length";
-    return build_response(std::move(response));
+    return build_output(std::move(response));
   }
 };
 
@@ -822,17 +961,13 @@ class CountingToolLoopModel final : public agent::ChatModelAdapter {
  public:
   CountingToolLoopModel() : ChatModelAdapter("fixture", "counting-tool-loop", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams&) override {
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
     ++generate_calls_;
-    agent::ModelResponse response;
-    response.text = "progress " + std::to_string(generate_calls_);
-    response.finish_reason = "tool_calls";
-    response.tool_calls.push_back(agent::ToolCall{
-        .id = "loop_tool_" + std::to_string(generate_calls_),
-        .name = "noop",
-        .arguments = agent::Value::object({}),
-    });
-    return build_response(std::move(response));
+    agent::AgentOutput response;
+    response.text = "Thought: continue loop " + std::to_string(generate_calls_) +
+        ".\nActions:\n[{\"tool\":\"noop\",\"input\":{}}]";
+    response.finish_reason = "stop";
+    return build_output(std::move(response));
   }
 
   [[nodiscard]] int generate_calls() const noexcept { return generate_calls_; }
@@ -846,20 +981,442 @@ class StreamingFixtureModel final : public agent::ChatModelAdapter {
   StreamingFixtureModel() : ChatModelAdapter("fixture", "stream-model", 0.0, 256,
                                              {"input.text", "input.image", "reasoning"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams&) override {
-    agent::ModelResponse response;
-    response.text = "stream text";
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
+    bool react_prompt = false;
+    for (const auto& message : params.messages) {
+      react_prompt = react_prompt ||
+                     (message.role == agent::MessageRole::System &&
+                      agent::extract_text_content(message.content).find("internal tool-use format") != std::string::npos);
+    }
+    const std::string text = react_prompt
+        ? "Thought: provide the fixture stream answer.\nFinal Answer: stream text"
+        : "stream text";
+    agent::AgentOutput response;
+    response.text = text;
     response.reasoning = agent::ModelReasoning{.text = "thinking"};
     response.content = {
-        agent::text_part("stream text"),
+        agent::text_part(text),
         agent::image_part(agent::MediaSource{
             .kind = agent::MediaSourceKind::Url,
             .url = "https://example.test/plot.png",
             .mime_type = "image/png",
         }, "plot", "low"),
     };
-    return build_response(response);
+    return build_output(response);
   }
+};
+
+class StreamingReActFinalModel final : public agent::ChatModelAdapter {
+ public:
+  StreamingReActFinalModel() : ChatModelAdapter("fixture", "stream-react-final", 0.0, 256, {"input.text"}) {}
+
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
+    ++generate_calls_;
+    return build_output(agent::AgentOutput{
+        .text = "Thought: hidden reasoning\nFinal Answer: 实时答案",
+    });
+  }
+
+  void stream(const agent::GenerateParams&, StreamEventHandler on_event) override {
+    ++stream_calls_;
+    std::string text;
+    if (on_event) {
+      on_event(agent::ModelStreamEvent{
+          .type = agent::ModelStreamEventType::ResponseStart,
+          .provider = provider(),
+          .model = model(),
+      });
+      for (const auto& chunk : std::vector<std::string>{
+               "Thought: hidden reasoning",
+               "\nFin",
+               "al Answer: 实",
+               "时",
+               "答案",
+           }) {
+        text += chunk;
+        on_event(agent::ModelStreamEvent{
+            .type = agent::ModelStreamEventType::TextDelta,
+            .provider = provider(),
+            .model = model(),
+            .delta = chunk,
+            .text = text,
+        });
+      }
+      on_event(agent::ModelStreamEvent{
+          .type = agent::ModelStreamEventType::Response,
+          .provider = provider(),
+          .model = model(),
+          .response = build_output(agent::AgentOutput{.text = text}),
+      });
+    }
+  }
+
+  [[nodiscard]] int generate_calls() const noexcept { return generate_calls_; }
+  [[nodiscard]] int stream_calls() const noexcept { return stream_calls_; }
+
+ private:
+  int generate_calls_ = 0;
+  int stream_calls_ = 0;
+};
+
+class StreamingReActReasoningModel final : public agent::ChatModelAdapter {
+ public:
+  StreamingReActReasoningModel()
+      : ChatModelAdapter("fixture", "stream-react-reasoning", 0.0, 256, {"input.text", "reasoning"}) {}
+
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
+    ++generate_calls_;
+    return build_output(agent::AgentOutput{
+        .text = "Thought: summarize reasoning output.\nFinal Answer: reasoning visible",
+        .reasoning = agent::ModelReasoning{.text = "reasoning plan"},
+    });
+  }
+
+  void stream(const agent::GenerateParams&, StreamEventHandler on_event) override {
+    ++stream_calls_;
+    if (!on_event) {
+      return;
+    }
+    on_event(agent::ModelStreamEvent{
+        .type = agent::ModelStreamEventType::ResponseStart,
+        .provider = provider(),
+        .model = model(),
+    });
+    on_event(agent::ModelStreamEvent{
+        .type = agent::ModelStreamEventType::ReasoningDelta,
+        .provider = provider(),
+        .model = model(),
+        .delta = "reasoning ",
+        .reasoning = "reasoning ",
+    });
+    on_event(agent::ModelStreamEvent{
+        .type = agent::ModelStreamEventType::ReasoningDelta,
+        .provider = provider(),
+        .model = model(),
+        .delta = "plan",
+        .reasoning = "reasoning plan",
+    });
+    const std::string text = "Thought: summarize reasoning output.\nFinal Answer: reasoning visible";
+    on_event(agent::ModelStreamEvent{
+        .type = agent::ModelStreamEventType::TextDelta,
+        .provider = provider(),
+        .model = model(),
+        .delta = text,
+        .text = text,
+    });
+    on_event(agent::ModelStreamEvent{
+        .type = agent::ModelStreamEventType::Response,
+        .provider = provider(),
+        .model = model(),
+        .response = build_output(agent::AgentOutput{
+            .text = text,
+            .reasoning = agent::ModelReasoning{.text = "reasoning plan"},
+        }),
+    });
+  }
+
+  [[nodiscard]] int generate_calls() const noexcept { return generate_calls_; }
+  [[nodiscard]] int stream_calls() const noexcept { return stream_calls_; }
+
+ private:
+  int generate_calls_ = 0;
+  int stream_calls_ = 0;
+};
+
+class ReActReasoningProtocolLeakRecoveryModel final : public agent::ChatModelAdapter {
+ public:
+  ReActReasoningProtocolLeakRecoveryModel()
+      : ChatModelAdapter("fixture", "react-reasoning-protocol-leak-recovery", 0.0, 256,
+                         {"input.text", "reasoning"}) {}
+
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
+    ++generate_calls_;
+    for (auto message = params.messages.rbegin(); message != params.messages.rend(); ++message) {
+      if (message->metadata.at("reasoningProtocolLeak").as_bool(false)) {
+        saw_protocol_leak_observation_ =
+            agent::extract_text_content(message->content).find(
+                "ReAct protocol was emitted in reasoning channel") != std::string::npos;
+        return build_output(agent::AgentOutput{
+            .text = "Thought: re-emit in content\nFinal Answer: content answer",
+            .reasoning = agent::ModelReasoning{.text = "brief reasoning"},
+        });
+      }
+    }
+    return build_output(agent::AgentOutput{
+        .text = "",
+        .reasoning = agent::ModelReasoning{
+            .text = "Thought: misplaced protocol\nFinal Answer: reasoning answer",
+        },
+    });
+  }
+
+  [[nodiscard]] int generate_calls() const noexcept { return generate_calls_; }
+  [[nodiscard]] bool saw_protocol_leak_observation() const noexcept {
+    return saw_protocol_leak_observation_;
+  }
+
+ private:
+  int generate_calls_ = 0;
+  bool saw_protocol_leak_observation_ = false;
+};
+
+class ReActReasoningProtocolLeakRepeatModel final : public agent::ChatModelAdapter {
+ public:
+  ReActReasoningProtocolLeakRepeatModel()
+      : ChatModelAdapter("fixture", "react-reasoning-protocol-leak-repeat", 0.0, 256,
+                         {"input.text", "reasoning"}) {}
+
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
+    ++generate_calls_;
+    return build_output(agent::AgentOutput{
+        .text = "",
+        .reasoning = agent::ModelReasoning{
+            .text = "Thought: misplaced protocol\nFinal Answer: still in reasoning",
+        },
+    });
+  }
+
+  [[nodiscard]] int generate_calls() const noexcept { return generate_calls_; }
+
+ private:
+  int generate_calls_ = 0;
+};
+
+class StreamingPlainFinalModel final : public agent::ChatModelAdapter {
+ public:
+  StreamingPlainFinalModel() : ChatModelAdapter("fixture", "stream-plain-final", 0.0, 256, {"input.text"}) {}
+
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
+    ++generate_calls_;
+    return build_output(agent::AgentOutput{
+        .text = plain_answer(),
+    });
+  }
+
+  void stream(const agent::GenerateParams&, StreamEventHandler on_event) override {
+    ++stream_calls_;
+    std::string text;
+    if (!on_event) {
+      return;
+    }
+    on_event(agent::ModelStreamEvent{
+        .type = agent::ModelStreamEventType::ResponseStart,
+        .provider = provider(),
+        .model = model(),
+    });
+    for (const auto& chunk : std::vector<std::string>{"你好！我是", "一个智能", "助手。"}) {
+      text += chunk;
+      on_event(agent::ModelStreamEvent{
+          .type = agent::ModelStreamEventType::TextDelta,
+          .provider = provider(),
+          .model = model(),
+          .delta = chunk,
+          .text = text,
+      });
+    }
+    on_event(agent::ModelStreamEvent{
+        .type = agent::ModelStreamEventType::Response,
+        .provider = provider(),
+        .model = model(),
+        .response = build_output(agent::AgentOutput{.text = text}),
+    });
+  }
+
+  [[nodiscard]] static std::string plain_answer() { return "你好！我是一个智能助手。"; }
+  [[nodiscard]] int generate_calls() const noexcept { return generate_calls_; }
+  [[nodiscard]] int stream_calls() const noexcept { return stream_calls_; }
+
+ private:
+  int generate_calls_ = 0;
+  int stream_calls_ = 0;
+};
+
+std::string utf8_stream_acceptance_text() {
+  return "你好！我是 LumiAgent，一个专门协助处理本地工程和桌面任务的智能助手。请告诉我你需要完成什么任务。";
+}
+
+class StreamingReActUtf8BoundaryModel final : public agent::ChatModelAdapter {
+ public:
+  StreamingReActUtf8BoundaryModel()
+      : ChatModelAdapter("fixture", "stream-react-utf8-boundary", 0.0, 512, {"input.text"}) {}
+
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
+    ++generate_calls_;
+    return build_output(agent::AgentOutput{
+        .text = "Thought: hidden reasoning\nFinal Answer: " + utf8_stream_acceptance_text(),
+    });
+  }
+
+  void stream(const agent::GenerateParams&, StreamEventHandler on_event) override {
+    ++stream_calls_;
+    const auto answer = utf8_stream_acceptance_text();
+    const auto first_char = answer.find("你");
+    SMOKE_CHECK(first_char != std::string::npos);
+    const auto split = first_char + 1;
+    std::string text;
+    if (on_event) {
+      on_event(agent::ModelStreamEvent{
+          .type = agent::ModelStreamEventType::ResponseStart,
+          .provider = provider(),
+          .model = model(),
+      });
+      for (const auto& chunk : std::vector<std::string>{
+               "Thought: hidden reasoning\nFinal Answer: " + answer.substr(0, split),
+               answer.substr(split),
+           }) {
+        text += chunk;
+        on_event(agent::ModelStreamEvent{
+            .type = agent::ModelStreamEventType::TextDelta,
+            .provider = provider(),
+            .model = model(),
+            .delta = chunk,
+            .text = text,
+        });
+      }
+      on_event(agent::ModelStreamEvent{
+          .type = agent::ModelStreamEventType::Response,
+          .provider = provider(),
+          .model = model(),
+          .response = build_output(agent::AgentOutput{.text = text}),
+      });
+    }
+  }
+
+  [[nodiscard]] int generate_calls() const noexcept { return generate_calls_; }
+  [[nodiscard]] int stream_calls() const noexcept { return stream_calls_; }
+
+ private:
+  int generate_calls_ = 0;
+  int stream_calls_ = 0;
+};
+
+class StreamingReActActionModel final : public agent::ChatModelAdapter {
+ public:
+  explicit StreamingReActActionModel(std::function<int()> tool_call_count,
+                                     std::vector<int>* tool_counts_during_first_stream)
+      : ChatModelAdapter("fixture", "stream-react-action", 0.0, 256, {"input.text"}),
+        tool_call_count_(std::move(tool_call_count)),
+        tool_counts_during_first_stream_(tool_counts_during_first_stream) {}
+
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
+    return build_output(agent::AgentOutput{
+        .text = "Thought: final\nFinal Answer: 4",
+    });
+  }
+
+  void stream(const agent::GenerateParams&, StreamEventHandler on_event) override {
+    ++stream_calls_;
+    std::string text;
+    const std::vector<std::string> chunks =
+        stream_calls_ == 1
+            ? std::vector<std::string>{
+                  "Thought: use the calculator\nAct",
+                  "ions:\n[{\"tool\":\"math.eval\",\"in",
+                  "put\":{\"expression\":\"2+2\"}}]",
+              }
+            : std::vector<std::string>{
+                  "Thought: observation is enough\nFinal ",
+                  "Answer: ",
+                  "4",
+              };
+    if (on_event) {
+      on_event(agent::ModelStreamEvent{
+          .type = agent::ModelStreamEventType::ResponseStart,
+          .provider = provider(),
+          .model = model(),
+      });
+      record_tool_count_during_first_stream();
+      for (const auto& chunk : chunks) {
+        text += chunk;
+        on_event(agent::ModelStreamEvent{
+            .type = agent::ModelStreamEventType::TextDelta,
+            .provider = provider(),
+            .model = model(),
+            .delta = chunk,
+            .text = text,
+        });
+        record_tool_count_during_first_stream();
+      }
+      on_event(agent::ModelStreamEvent{
+          .type = agent::ModelStreamEventType::Response,
+          .provider = provider(),
+          .model = model(),
+          .response = build_output(agent::AgentOutput{.text = text}),
+      });
+      record_tool_count_during_first_stream();
+    }
+  }
+
+  [[nodiscard]] int stream_calls() const noexcept { return stream_calls_; }
+
+ private:
+  void record_tool_count_during_first_stream() {
+    if (stream_calls_ == 1 && tool_call_count_ && tool_counts_during_first_stream_) {
+      tool_counts_during_first_stream_->push_back(tool_call_count_());
+    }
+  }
+
+  std::function<int()> tool_call_count_;
+  std::vector<int>* tool_counts_during_first_stream_ = nullptr;
+  int stream_calls_ = 0;
+};
+
+class StreamingReActVisibleActionModel final : public agent::ChatModelAdapter {
+ public:
+  StreamingReActVisibleActionModel()
+      : ChatModelAdapter("fixture", "stream-react-visible-action", 0.0, 256, {"input.text"}) {}
+
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
+    return build_output(agent::AgentOutput{
+        .text = "Thought: final\nFinal Answer: 4",
+    });
+  }
+
+  void stream(const agent::GenerateParams&, StreamEventHandler on_event) override {
+    ++stream_calls_;
+    std::string text;
+    const std::vector<std::string> chunks =
+        stream_calls_ == 1
+            ? std::vector<std::string>{
+                  "Thought: explain first\nMessage: Let me che",
+                  "ck that for you.\nActions:\n[{\"tool\":\"math.eval\",\"in",
+                  "put\":{\"expression\":\"2+2\"}}]",
+              }
+            : std::vector<std::string>{
+                  "Thought: observation is enough\nFinal ",
+                  "Answer: ",
+                  "4",
+              };
+    if (!on_event) {
+      return;
+    }
+    on_event(agent::ModelStreamEvent{
+        .type = agent::ModelStreamEventType::ResponseStart,
+        .provider = provider(),
+        .model = model(),
+    });
+    for (const auto& chunk : chunks) {
+      text += chunk;
+      on_event(agent::ModelStreamEvent{
+          .type = agent::ModelStreamEventType::TextDelta,
+          .provider = provider(),
+          .model = model(),
+          .delta = chunk,
+          .text = text,
+      });
+    }
+    on_event(agent::ModelStreamEvent{
+        .type = agent::ModelStreamEventType::Response,
+        .provider = provider(),
+        .model = model(),
+        .response = build_output(agent::AgentOutput{.text = text}),
+    });
+  }
+
+  [[nodiscard]] int stream_calls() const noexcept { return stream_calls_; }
+
+ private:
+  int stream_calls_ = 0;
 };
 
 class CapturingMultimodalModel final : public agent::ChatModelAdapter {
@@ -867,14 +1424,20 @@ class CapturingMultimodalModel final : public agent::ChatModelAdapter {
   CapturingMultimodalModel() : ChatModelAdapter("fixture", "multimodal-capture", 0.0, 256,
                                                 {"input.text", "input.image"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     messages_ = params.messages;
-    return build_response(agent::ModelResponse{.text = "captured"});
+    const auto text = react_prompt(params)
+        ? std::string("Thought: respond to the multimodal input.\nFinal Answer: captured")
+        : std::string("captured");
+    return build_output(agent::AgentOutput{.text = text});
   }
 
   void stream(const agent::GenerateParams& params, StreamEventHandler on_event) override {
     messages_ = params.messages;
-    const auto response = build_response(agent::ModelResponse{.text = "captured stream"});
+    const auto text = react_prompt(params)
+        ? std::string("Thought: respond to the multimodal input.\nFinal Answer: captured stream")
+        : std::string("captured stream");
+    const auto response = build_output(agent::AgentOutput{.text = text});
     if (on_event) {
       on_event(agent::ModelStreamEvent{
           .type = agent::ModelStreamEventType::ResponseStart,
@@ -885,8 +1448,8 @@ class CapturingMultimodalModel final : public agent::ChatModelAdapter {
           .type = agent::ModelStreamEventType::TextDelta,
           .provider = provider(),
           .model = model(),
-          .delta = "captured stream",
-          .text = "captured stream",
+          .delta = text,
+          .text = text,
       });
       on_event(agent::ModelStreamEvent{
           .type = agent::ModelStreamEventType::Response,
@@ -900,6 +1463,13 @@ class CapturingMultimodalModel final : public agent::ChatModelAdapter {
   [[nodiscard]] const std::vector<agent::AgentMessage>& messages() const noexcept { return messages_; }
 
  private:
+  static bool react_prompt(const agent::GenerateParams& params) {
+    return std::any_of(params.messages.begin(), params.messages.end(), [](const agent::AgentMessage& message) {
+      return message.role == agent::MessageRole::System &&
+             agent::extract_text_content(message.content).find("internal tool-use format") != std::string::npos;
+    });
+  }
+
   std::vector<agent::AgentMessage> messages_;
 };
 
@@ -907,8 +1477,8 @@ class FlakyBeforeStartStreamingModel final : public agent::ChatModelAdapter {
  public:
   FlakyBeforeStartStreamingModel() : ChatModelAdapter("fixture", "flaky-before-start-stream", 0.0, 128) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams&) override {
-    return build_response(agent::ModelResponse{.text = "ok"});
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
+    return build_output(agent::AgentOutput{.text = "Thought: ok.\nFinal Answer: ok"});
   }
 
   void stream(const agent::GenerateParams&, StreamEventHandler on_event) override {
@@ -916,7 +1486,9 @@ class FlakyBeforeStartStreamingModel final : public agent::ChatModelAdapter {
     if (stream_calls_ == 1) {
       throw std::runtime_error("temporary stream failure");
     }
-    const auto response = build_response(agent::ModelResponse{.text = "retried stream"});
+    const auto response = build_output(agent::AgentOutput{
+        .text = "Thought: stream retry succeeded.\nFinal Answer: retried stream",
+    });
     if (on_event) {
       on_event(agent::ModelStreamEvent{
           .type = agent::ModelStreamEventType::ResponseStart,
@@ -940,8 +1512,8 @@ class FailingAfterDeltaStreamingModel final : public agent::ChatModelAdapter {
  public:
   FailingAfterDeltaStreamingModel() : ChatModelAdapter("fixture", "failing-after-delta-stream", 0.0, 128) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams&) override {
-    return build_response(agent::ModelResponse{.text = "partial"});
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
+    return build_output(agent::AgentOutput{.text = "Thought: partial.\nFinal Answer: partial"});
   }
 
   void stream(const agent::GenerateParams&, StreamEventHandler on_event) override {
@@ -957,8 +1529,8 @@ class FailingAfterDeltaStreamingModel final : public agent::ChatModelAdapter {
           .type = agent::ModelStreamEventType::TextDelta,
           .provider = provider(),
           .model = model(),
-          .delta = "partial",
-          .text = "partial",
+          .delta = "Thought: partial.\nFinal Answer: partial",
+          .text = "Thought: partial.\nFinal Answer: partial",
       });
     }
     throw std::runtime_error("stream failed after output");
@@ -976,8 +1548,8 @@ class CrashingStreamModel final : public agent::ChatModelAdapter {
  public:
   CrashingStreamModel() : ChatModelAdapter("fixture", "crashing-stream", 0.0, 128) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams&) override {
-    return build_response(agent::ModelResponse{.text = ""});
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
+    return build_output(agent::AgentOutput{.text = ""});
   }
 
   void stream(const agent::GenerateParams&, StreamEventHandler on_event) override {
@@ -992,14 +1564,39 @@ class CrashingStreamModel final : public agent::ChatModelAdapter {
   }
 };
 
+class FrameworkErrorStreamModel final : public agent::ChatModelAdapter {
+ public:
+  FrameworkErrorStreamModel() : ChatModelAdapter("fixture", "framework-error-stream", 0.0, 128) {}
+
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
+    return build_output(agent::AgentOutput{.text = ""});
+  }
+
+  void stream(const agent::GenerateParams&, StreamEventHandler on_event) override {
+    if (on_event) {
+      on_event(agent::ModelStreamEvent{
+          .type = agent::ModelStreamEventType::ResponseStart,
+          .provider = provider(),
+          .model = model(),
+      });
+    }
+    throw agent::ProtocolError("provider sent malformed stream frame", "malformed-stream-frame");
+  }
+};
+
 class CancellableStreamingModel final : public agent::ChatModelAdapter {
  public:
   explicit CancellableStreamingModel(std::atomic<bool>& started)
       : ChatModelAdapter("fixture", "cancellable-stream", 0.0, 128),
         started_(started) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams&) override {
-    return build_response(agent::ModelResponse{.text = "not used"});
+  CancellableStreamingModel(std::atomic<bool>& started, std::atomic<bool>& saw_cancel)
+      : ChatModelAdapter("fixture", "cancellable-stream", 0.0, 128),
+        started_(started),
+        saw_cancel_(&saw_cancel) {}
+
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
+    return build_output(agent::AgentOutput{.text = "not used"});
   }
 
   void stream(const agent::GenerateParams& params, StreamEventHandler on_event) override {
@@ -1013,6 +1610,9 @@ class CancellableStreamingModel final : public agent::ChatModelAdapter {
     started_.store(true);
     for (int attempt = 0; attempt < 200; ++attempt) {
       if (params.cancellation && params.cancellation->cancelled()) {
+        if (saw_cancel_) {
+          saw_cancel_->store(true);
+        }
         params.cancellation->throw_if_cancelled(agent::ExecutionTarget::Model);
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -1022,15 +1622,18 @@ class CancellableStreamingModel final : public agent::ChatModelAdapter {
 
  private:
   std::atomic<bool>& started_;
+  std::atomic<bool>* saw_cancel_ = nullptr;
 };
 
 class EvalSettingsModel final : public agent::ChatModelAdapter {
  public:
   EvalSettingsModel() : ChatModelAdapter("fixture", "eval-settings-default", 0.1, 64, {"input.text", "reasoning"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     last_settings_ = params.settings;
-    return build_response(agent::ModelResponse{.text = "settings ok"});
+    return build_output(agent::AgentOutput{
+        .text = "Thought: preserve eval settings.\nFinal Answer: settings ok",
+    });
   }
 
   [[nodiscard]] const agent::ModelSettings& last_settings() const noexcept { return last_settings_; }
@@ -1045,12 +1648,12 @@ class SequentialTextModel final : public agent::ChatModelAdapter {
       : ChatModelAdapter("fixture", "sequential-text", 0.0, 128, {"input.text"}),
         responses_(std::move(responses)) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams&) override {
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
     const std::size_t index = responses_.empty()
                                   ? 0
                                   : std::min<std::size_t>(generate_calls_, responses_.size() - 1);
     ++generate_calls_;
-    return build_response(agent::ModelResponse{.text = responses_.empty() ? "" : responses_[index]});
+    return build_output(agent::AgentOutput{.text = responses_.empty() ? "" : responses_[index]});
   }
 
   [[nodiscard]] int generate_calls() const noexcept { return static_cast<int>(generate_calls_); }
@@ -1064,7 +1667,7 @@ class FailingRuntimeModel final : public agent::ChatModelAdapter {
  public:
   FailingRuntimeModel() : ChatModelAdapter("fixture", "failing-runtime", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams&) override {
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
     throw std::runtime_error("runtime model failed");
   }
 };
@@ -1073,12 +1676,12 @@ class RetryingRuntimeModel final : public agent::ChatModelAdapter {
  public:
   RetryingRuntimeModel() : ChatModelAdapter("fixture", "retry-runtime", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams&) override {
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
     ++generate_calls_;
     if (generate_calls_ == 1) {
       throw std::runtime_error("transient model failure");
     }
-    return build_response(agent::ModelResponse{.text = "retried response"});
+    return build_output(agent::AgentOutput{.text = "Thought: retry succeeded.\nFinal Answer: retried response"});
   }
 
   [[nodiscard]] int generate_calls() const noexcept { return generate_calls_; }
@@ -1091,10 +1694,10 @@ class SlowRuntimeModel final : public agent::ChatModelAdapter {
  public:
   SlowRuntimeModel() : ChatModelAdapter("fixture", "slow-runtime", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams&) override {
+  agent::AgentOutput generate(const agent::GenerateParams&) override {
     ++generate_calls_;
     std::this_thread::sleep_for(std::chrono::milliseconds(8));
-    return build_response(agent::ModelResponse{.text = "late response"});
+    return build_output(agent::AgentOutput{.text = "late response"});
   }
 
   [[nodiscard]] int generate_calls() const noexcept { return generate_calls_; }
@@ -1107,21 +1710,23 @@ class CancellingToolModel final : public agent::ChatModelAdapter {
  public:
   CancellingToolModel() : ChatModelAdapter("fixture", "cancelling-tool-runtime", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     ++generate_calls_;
     for (const auto& message : params.messages) {
-      if (message.role == agent::MessageRole::Tool && message.name == "runtime.cancel") {
-        return build_response(agent::ModelResponse{.text = "unexpected continuation"});
+      const auto text = agent::extract_text_content(message.content);
+      if (text.find("Observation:") != std::string::npos &&
+          message.metadata.at("observation").as_bool(false) &&
+          text.find("runtime.cancel") != std::string::npos) {
+        return build_output(agent::AgentOutput{
+            .text = "Thought: cancellation should have stopped the run.\nFinal Answer: unexpected continuation",
+        });
       }
     }
-    agent::ModelResponse response;
-    response.finish_reason = "tool_calls";
-    response.tool_calls.push_back(agent::ToolCall{
-        .id = "cancel_call_1",
-        .name = "runtime.cancel",
-        .arguments = agent::Value::object({}),
-    });
-    return build_response(response);
+    agent::AgentOutput response;
+    response.finish_reason = "stop";
+    response.text = "Thought: run the cancellation tool.\nActions:\n"
+                    "[{\"tool\":\"runtime.cancel\",\"input\":{}}]";
+    return build_output(response);
   }
 
   [[nodiscard]] int generate_calls() const noexcept { return generate_calls_; }
@@ -1134,12 +1739,14 @@ class CancellationAwareModel final : public agent::ChatModelAdapter {
  public:
   CancellationAwareModel() : ChatModelAdapter("fixture", "cancellation-aware", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     saw_cancellation_ = params.cancellation != nullptr;
     if (params.cancellation) {
       params.cancellation->throw_if_cancelled(agent::ExecutionTarget::Model);
     }
-    return build_response(agent::ModelResponse{.text = "model cancellation propagated"});
+    return build_output(agent::AgentOutput{
+        .text = "Thought: cancellation token reached the model.\nFinal Answer: model cancellation propagated",
+    });
   }
 
   [[nodiscard]] bool saw_cancellation() const noexcept { return saw_cancellation_; }
@@ -1152,7 +1759,7 @@ class RuntimePlannerModel final : public agent::ChatModelAdapter {
  public:
   RuntimePlannerModel() : ChatModelAdapter("fixture", "runtime-planner", 0.0, 512, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     std::string prompt_text;
     bool has_plan_message = false;
     for (const auto& message : params.messages) {
@@ -1167,7 +1774,7 @@ class RuntimePlannerModel final : public agent::ChatModelAdapter {
     if (prompt_text.find("Return JSON only in this shape") != std::string::npos) {
       ++planning_calls_;
       SMOKE_CHECK(prompt_text.find("math.eval") != std::string::npos);
-      return build_response(agent::ModelResponse{.text =
+      return build_output(agent::AgentOutput{.text =
           "```json\n"
           "{\"goal\":\"Ship native planner\",\"steps\":["
           "{\"title\":\"Inspect requirements\",\"description\":\"Read task context\",\"toolName\":\"math.eval\"},"
@@ -1179,7 +1786,9 @@ class RuntimePlannerModel final : public agent::ChatModelAdapter {
     SMOKE_CHECK(has_plan_message);
     SMOKE_CHECK(prompt_text.find("Inspect requirements") != std::string::npos);
     saw_plan_message_ = true;
-    return build_response(agent::ModelResponse{.text = "planned response"});
+    return build_output(agent::AgentOutput{
+        .text = "Thought: answer using the injected execution plan.\nFinal Answer: planned response",
+    });
   }
 
   [[nodiscard]] bool saw_plan_message() const noexcept { return saw_plan_message_; }
@@ -1194,7 +1803,7 @@ class KnowledgeRunnerModel final : public agent::ChatModelAdapter {
  public:
   KnowledgeRunnerModel() : ChatModelAdapter("fixture", "knowledge-runner", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     std::string prompt_text;
     for (const auto& message : params.messages) {
       prompt_text += agent::extract_text_content(message.content);
@@ -1203,7 +1812,9 @@ class KnowledgeRunnerModel final : public agent::ChatModelAdapter {
     SMOKE_CHECK(prompt_text.find("Knowledge base retrieval") != std::string::npos);
     SMOKE_CHECK(prompt_text.find("Runner Knowledge") != std::string::npos);
     saw_knowledge_context_ = true;
-    return build_response(agent::ModelResponse{.text = "knowledge response"});
+    return build_output(agent::AgentOutput{
+        .text = "Thought: use the retrieved knowledge.\nFinal Answer: knowledge response",
+    });
   }
 
   [[nodiscard]] bool saw_knowledge_context() const noexcept { return saw_knowledge_context_; }
@@ -1216,22 +1827,22 @@ class ContextServiceModel final : public agent::ChatModelAdapter {
  public:
   ContextServiceModel() : ChatModelAdapter("fixture", "context-service", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     for (const auto& message : params.messages) {
-      if (message.role == agent::MessageRole::Tool && message.name == "context.inspect") {
-        agent::ModelResponse response;
-        response.text = "context inspected: " + agent::extract_text_content(message.content);
-        return build_response(std::move(response));
+      const auto text = agent::extract_text_content(message.content);
+      if (text.find("Observation:") != std::string::npos &&
+          message.metadata.at("observation").as_bool(false) &&
+          text.find("context.inspect") != std::string::npos) {
+        agent::AgentOutput response;
+        response.text = "Thought: answer from the context inspection.\nFinal Answer: context inspected: " + text;
+        return build_output(std::move(response));
       }
     }
-    agent::ModelResponse response;
-    response.finish_reason = "tool_calls";
-    response.tool_calls.push_back(agent::ToolCall{
-        .id = "context_call_1",
-        .name = "context.inspect",
-        .arguments = agent::Value::object({}),
-    });
-    return build_response(response);
+    agent::AgentOutput response;
+    response.finish_reason = "stop";
+    response.text = "Thought: inspect the runtime context.\nActions:\n"
+                    "[{\"tool\":\"context.inspect\",\"input\":{}}]";
+    return build_output(response);
   }
 };
 
@@ -1239,22 +1850,22 @@ class WorkflowChildAgentModel final : public agent::ChatModelAdapter {
  public:
   WorkflowChildAgentModel() : ChatModelAdapter("fixture", "workflow-child", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     for (const auto& message : params.messages) {
-      if (message.role == agent::MessageRole::Tool && message.name == "child.context") {
-        agent::ModelResponse response;
-        response.text = "runner child context ok";
-        return build_response(std::move(response));
+      const auto text = agent::extract_text_content(message.content);
+      if (text.find("Observation:") != std::string::npos &&
+          message.metadata.at("observation").as_bool(false) &&
+          text.find("child.context") != std::string::npos) {
+        agent::AgentOutput response;
+        response.text = "Thought: child context is available.\nFinal Answer: runner child context ok";
+        return build_output(std::move(response));
       }
     }
-    agent::ModelResponse response;
-    response.finish_reason = "tool_calls";
-    response.tool_calls.push_back(agent::ToolCall{
-        .id = "child_context_1",
-        .name = "child.context",
-        .arguments = agent::Value::object({}),
-    });
-    return build_response(response);
+    agent::AgentOutput response;
+    response.finish_reason = "stop";
+    response.text = "Thought: inspect child context.\nActions:\n"
+                    "[{\"tool\":\"child.context\",\"input\":{}}]";
+    return build_output(response);
   }
 };
 
@@ -1262,7 +1873,7 @@ class SkillRuntimeModel final : public agent::ChatModelAdapter {
  public:
   SkillRuntimeModel() : ChatModelAdapter("fixture", "skill-runtime", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     calls_ += 1;
     std::string prompt_text;
     for (const auto& message : params.messages) {
@@ -1273,18 +1884,17 @@ class SkillRuntimeModel final : public agent::ChatModelAdapter {
     if (calls_ == 1) {
       SMOKE_CHECK(prompt_text.find("Available Anthropic-style skills") != std::string::npos);
       SMOKE_CHECK(prompt_text.find("Audit auth module") != std::string::npos);
-      agent::ModelResponse response;
-      response.finish_reason = "tool_calls";
-      response.tool_calls.push_back(agent::ToolCall{
-          .id = "skill_tool_1",
-          .name = "fs.readText",
-          .arguments = agent::Value::object({{"path", "README.md"}}),
-      });
-      return build_response(response);
+      agent::AgentOutput response;
+      response.finish_reason = "stop";
+      response.text = "Thought: use the allowed skill tool.\nActions:\n"
+                      "[{\"tool\":\"fs.readText\",\"input\":{\"path\":\"README.md\"}}]";
+      return build_output(response);
     }
 
     SMOKE_CHECK(prompt_text.find("allowed") != std::string::npos);
-    return build_response(agent::ModelResponse{.text = "skill runtime ok"});
+    return build_output(agent::AgentOutput{
+        .text = "Thought: answer after the skill tool.\nFinal Answer: skill runtime ok",
+    });
   }
 
  private:
@@ -1295,7 +1905,7 @@ class SkillForkChildModel final : public agent::ChatModelAdapter {
  public:
   SkillForkChildModel() : ChatModelAdapter("fixture", "skill-fork-child", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     std::string prompt_text;
     for (const auto& message : params.messages) {
       prompt_text += agent::extract_text_content(message.content);
@@ -1303,7 +1913,9 @@ class SkillForkChildModel final : public agent::ChatModelAdapter {
     }
     SMOKE_CHECK(prompt_text.find("Fork audit auth module") != std::string::npos);
     SMOKE_CHECK(prompt_text.find("User task:\nauth module") != std::string::npos);
-    return build_response(agent::ModelResponse{.text = "child fork summary"});
+    return build_output(agent::AgentOutput{
+        .text = "Thought: summarize the forked audit.\nFinal Answer: child fork summary",
+    });
   }
 };
 
@@ -1311,7 +1923,7 @@ class SkillForkMainModel final : public agent::ChatModelAdapter {
  public:
   SkillForkMainModel() : ChatModelAdapter("fixture", "skill-fork-main", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     calls_ += 1;
     std::string prompt_text;
     for (const auto& message : params.messages) {
@@ -1322,17 +1934,16 @@ class SkillForkMainModel final : public agent::ChatModelAdapter {
       SMOKE_CHECK(prompt_text.find("Forked skill \"fork-audit\" result from agent \"reviewer\"") != std::string::npos);
       SMOKE_CHECK(prompt_text.find("child fork summary") != std::string::npos);
       SMOKE_CHECK(prompt_text.find("Fork audit auth module") == std::string::npos);
-      agent::ModelResponse response;
-      response.finish_reason = "tool_calls";
-      response.tool_calls.push_back(agent::ToolCall{
-          .id = "fork_tool_1",
-          .name = "fork.inspect",
-          .arguments = agent::Value::object({}),
-      });
-      return build_response(response);
+      agent::AgentOutput response;
+      response.finish_reason = "stop";
+      response.text = "Thought: inspect the fork result.\nActions:\n"
+                      "[{\"tool\":\"fork.inspect\",\"input\":{}}]";
+      return build_output(response);
     }
     SMOKE_CHECK(prompt_text.find("fork-service-ok") != std::string::npos);
-    return build_response(agent::ModelResponse{.text = "main consumed fork"});
+    return build_output(agent::AgentOutput{
+        .text = "Thought: answer after consuming the fork.\nFinal Answer: main consumed fork",
+    });
   }
 
  private:
@@ -1343,7 +1954,7 @@ class AutonomousRunnerModel final : public agent::ChatModelAdapter {
  public:
   AutonomousRunnerModel() : ChatModelAdapter("fixture", "autonomous-runner", 0.0, 512, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     std::string prompt_text;
     for (const auto& message : params.messages) {
       prompt_text += agent::extract_text_content(message.content);
@@ -1354,8 +1965,8 @@ class AutonomousRunnerModel final : public agent::ChatModelAdapter {
     if (prompt_text.find("Create a concise execution plan") != std::string::npos) {
       SMOKE_CHECK(prompt_text.find("Goal: Ship model-led report") != std::string::npos);
       SMOKE_CHECK(prompt_text.find("run=agent-auto-runner") != std::string::npos);
-      return build_response(agent::ModelResponse{.text =
-          "Plan:\n{\"summary\":\"model plan\",\"steps\":["
+      return build_output(agent::AgentOutput{.text =
+          "Thought: build a concise execution plan.\nFinal Answer: Plan:\n{\"summary\":\"model plan\",\"steps\":["
           "{\"id\":\"draft\",\"title\":\"Draft report\",\"objective\":\"Write a draft\",\"input\":{\"section\":\"draft\"}},"
           "{\"id\":\"final\",\"title\":\"Finish report\",\"objective\":\"Finalize the report\",\"dependsOn\":[\"draft\"]}"
           "]}"});
@@ -1365,16 +1976,18 @@ class AutonomousRunnerModel final : public agent::ChatModelAdapter {
       SMOKE_CHECK(prompt_text.find("Previous completed steps") != std::string::npos);
       SMOKE_CHECK(prompt_text.find("draft-output") != std::string::npos);
       SMOKE_CHECK(prompt_text.find("step=final") != std::string::npos);
-      return build_response(agent::ModelResponse{.text = "final-output"});
+      return build_output(agent::AgentOutput{.text = "Thought: finish the report.\nFinal Answer: final-output"});
     }
 
     if (prompt_text.find("Current step: Draft report") != std::string::npos) {
       SMOKE_CHECK(prompt_text.find("Step input") != std::string::npos);
       SMOKE_CHECK(prompt_text.find("step=draft") != std::string::npos);
-      return build_response(agent::ModelResponse{.text = "draft-output"});
+      return build_output(agent::AgentOutput{.text = "Thought: draft the report.\nFinal Answer: draft-output"});
     }
 
-    return build_response(agent::ModelResponse{.text = "unexpected autonomous prompt"});
+    return build_output(agent::AgentOutput{
+        .text = "Thought: unexpected autonomous prompt.\nFinal Answer: unexpected autonomous prompt",
+    });
   }
 
   [[nodiscard]] const std::vector<std::string>& prompts() const noexcept { return prompts_; }
@@ -1387,7 +2000,7 @@ class ServerRuntimeModel final : public agent::ChatModelAdapter {
  public:
   ServerRuntimeModel() : ChatModelAdapter("fixture", "server-runtime", 0.0, 256, {"input.text", "reasoning"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     last_settings_ = params.settings;
     std::string prompt_text;
     for (const auto& message : params.messages) {
@@ -1398,8 +2011,9 @@ class ServerRuntimeModel final : public agent::ChatModelAdapter {
     SMOKE_CHECK(prompt_text.find("server-source") != std::string::npos);
     const auto input_pos = prompt_text.rfind("server-input");
     SMOKE_CHECK(input_pos != std::string::npos);
-    return build_response(agent::ModelResponse{
-        .text = "server-ok:" + prompt_text.substr(input_pos),
+    return build_output(agent::AgentOutput{
+        .text = "Thought: respond to the server request.\nFinal Answer: server-ok:" +
+            prompt_text.substr(input_pos),
         .raw = agent::Value::object({
             {"usage", agent::Value::object({
                 {"prompt_tokens", 100},
@@ -1422,16 +2036,20 @@ class GovernanceModel final : public agent::ChatModelAdapter {
  public:
   GovernanceModel() : ChatModelAdapter("fixture", "governance-runtime", 0.0, 256, {"input.text"}) {}
 
-  agent::ModelResponse generate(const agent::GenerateParams& params) override {
+  agent::AgentOutput generate(const agent::GenerateParams& params) override {
     std::string prompt_text;
     for (const auto& message : params.messages) {
       prompt_text += agent::extract_text_content(message.content);
       prompt_text += "\n";
     }
     if (prompt_text.find("schema-governance") != std::string::npos) {
-      return build_response(agent::ModelResponse{.text = R"({"message":"contact jane@example.com"})"});
+      return build_output(agent::AgentOutput{
+          .text = "Thought: return governed JSON.\nFinal Answer: {\"message\":\"contact jane@example.com\"}",
+      });
     }
-    return build_response(agent::ModelResponse{.text = "plain output"});
+    return build_output(agent::AgentOutput{
+        .text = "Thought: return plain governed output.\nFinal Answer: plain output",
+    });
   }
 };
 

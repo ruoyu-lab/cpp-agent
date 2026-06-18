@@ -38,6 +38,44 @@ web search, and web fetch. Injected adapters can observe the token and abort
 host-specific work using the same cancellation object as the runner or tool
 executor.
 
+## ToolRun / BackgroundTask
+
+Long-lived custom tools should not block `ToolDefinition::execute()` until the
+work exits. Inject a `ToolRunManager` through `kToolServiceToolRunManager`,
+declare the service requirement on the tool, start a generic `custom` run,
+return the snapshot as the tool result, and let the host update/read/cancel it
+through the manager.
+
+```cpp
+agent::InMemoryToolRunManager tool_runs;
+agent::ToolExecutionContext context;
+context.service_refs.service_container.set(agent::kToolServiceToolRunManager, &tool_runs);
+
+auto tool = agent::define_tool(agent::ToolDefinition{
+    .name = "custom.index.start",
+    .service_requirements = {
+        agent::tool_service_requirement(agent::kToolServiceToolRunManager),
+    },
+    .long_running = true,
+    .execute = [](const agent::Value&, agent::ToolExecutionContext& ctx) {
+      auto& runs = ctx.service_refs.service_view.require(agent::kToolServiceToolRunManager);
+      auto run = runs.start(agent::ToolRunStartOptions{
+          .tool_name = "custom.index.start",
+          .kind = "custom",
+          .label = "index workspace",
+      });
+      return agent::Value::object({{"toolRun", agent::tool_run_snapshot_to_value(run)}});
+    },
+});
+```
+
+The generic layer manages `queued` / `running` / `waiting` / `completed` /
+`failed` / `cancelled` snapshots, cursor-based event/log reads, `list`,
+`status`, `wait`, and cooperative `cancel`. It is intentionally not a terminal
+API: a process runner, workflow runner, browser session, remote job, or any
+business-specific background task can all publish the same ToolRun shape.
+Synchronous tools and `shell.exec` continue to behave as before.
+
 ## Lazy tool discovery
 
 When a runner integrates many tools — typically several MCP servers' worth —

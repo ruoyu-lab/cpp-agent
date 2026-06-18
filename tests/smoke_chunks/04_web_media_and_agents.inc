@@ -33,8 +33,11 @@
   {
     auto autonomous_model = std::make_shared<AutonomousRunnerModel>();
     agent::AgentRunner autonomous_runner(agent::AgentRunnerConfig{
-        .adapter = autonomous_model,
-        .contexts = {
+        .model_runtime = {
+            .adapter = autonomous_model,
+        },
+        .context_runtime = {
+            .sources = std::vector<agent::ContextSource>{
             agent::ContextSource{
                 .id = "autonomous-runtime",
                 .title = "Autonomous Runtime",
@@ -56,7 +59,8 @@
                 },
             },
         },
-        .max_iterations = 2,
+            .max_iterations = 2,
+        },
     });
     agent::AgentAutonomousPlanner agent_planner(agent::AgentAutonomousPlannerConfig{
         .runner = &autonomous_runner,
@@ -299,7 +303,7 @@
   }));
   SMOKE_CHECK(resolved_app.agent_id == "main");
   SMOKE_CHECK(!resolved_app.tools.empty());
-  auto resolved_run = resolved_app.runner->run("config input", "config-session");
+  auto resolved_run = resolved_app.runner->execution().run("config input", "config-session");
   SMOKE_CHECK(resolved_run.text == "config input");
   SMOKE_CHECK(resolved_run.plan);
   SMOKE_CHECK(resolved_run.plan->goal == "Config-driven execution plan");
@@ -307,6 +311,50 @@
   SMOKE_CHECK(!resolved_run.knowledge_hits.empty());
   SMOKE_CHECK(resolved_run.knowledge_hits.front().citation.title == "Config Knowledge");
   SMOKE_CHECK(std::filesystem::exists(persistent_dir / "config-sessions" / "config-session.json"));
+
+  {
+    int configure_session_memory_calls = 0;
+    std::string configured_store_kind;
+    auto session_callback_options = native_resolve_options("main");
+    session_callback_options.configure_session_memory =
+        [&](agent::SessionMemoryOptions& session_options, const agent::Value& session_store_config) {
+          ++configure_session_memory_calls;
+          configured_store_kind = session_store_config.at("kind").as_string();
+          session_options.storage.summary_label = "Injected summary";
+          session_options.compaction.summarizer =
+              [](const agent::SessionMemorySummaryInput& input) {
+                return "injected:" + std::to_string(input.archived_messages.size());
+              };
+        };
+    auto session_callback_app = agent::resolve_native_agent_app(agent::Value::object({
+        {"agents", agent::Value::object({
+            {"main", agent::Value::object({
+                {"model", agent::Value::object({{"provider", "echo"}, {"model", "echo"}})},
+                {"memory", agent::Value::object({
+                    {"session", agent::Value::object({
+                        {"kind", "memory"},
+                        {"sessionOptions", agent::Value::object({
+                            {"compactionBudget", agent::Value::object({{"maxMessages", 1}})},
+                        })},
+                    })},
+                })},
+            })},
+        })},
+    }), std::move(session_callback_options));
+    SMOKE_CHECK(configure_session_memory_calls == 1);
+    SMOKE_CHECK(configured_store_kind == "memory");
+    auto session = session_callback_app.runner->sessions().get("session-callback");
+    session->add_many(std::vector<agent::AgentMessage>{
+        agent::create_message(agent::MessageRole::User, "first"),
+        agent::create_message(agent::MessageRole::Assistant, "second"),
+    });
+    session->compact();
+    auto messages = session->get_messages();
+    SMOKE_CHECK(messages.size() == 2);
+    SMOKE_CHECK(messages.front().role == agent::MessageRole::System);
+    const auto summary_text = agent::extract_text_content(messages.front().content);
+    SMOKE_CHECK(summary_text.find("Injected summary:\ninjected:1") != std::string::npos);
+  }
 
   std::vector<std::string> capability_fallback_calls;
   auto capability_fallback_app = agent::resolve_native_agent_app(agent::Value::object({
@@ -327,7 +375,7 @@
               })},
           })},
       })},
-  }), "main", [&](const agent::NativeProviderRequest& request) {
+  }), native_resolve_options("main", [&](const agent::NativeProviderRequest& request) {
     capability_fallback_calls.push_back(request.provider);
     SMOKE_CHECK(request.provider == "openai");
     SMOKE_CHECK(request.body.at("model").as_string() == "fallback");
@@ -335,13 +383,15 @@
         {"id", "capability-fallback"},
         {"choices", agent::Value::array({
             agent::Value::object({
-                {"message", agent::Value::object({{"content", "capability fallback ok"}})},
+                {"message", agent::Value::object({
+                    {"content", "Thought: Use the fallback model response.\nFinal Answer: capability fallback ok"},
+                })},
                 {"finish_reason", "stop"},
             }),
         })},
     });
-  });
-  auto capability_fallback_result = capability_fallback_app.runner->run("needs file", "config-cap-fallback");
+  }));
+  auto capability_fallback_result = capability_fallback_app.runner->execution().run("needs file", "config-cap-fallback");
   SMOKE_CHECK(capability_fallback_result.text == "capability fallback ok");
   SMOKE_CHECK((capability_fallback_calls == std::vector<std::string>{"openai"}));
 
@@ -364,7 +414,7 @@
               })},
           })},
       })},
-  }), "main", [&](const agent::NativeProviderRequest& request) {
+  }), native_resolve_options("main", [&](const agent::NativeProviderRequest& request) {
     runtime_fallback_calls.push_back(request.provider);
     if (request.provider == "openai") {
       SMOKE_CHECK(request.body.at("model").as_string() == "primary");
@@ -376,13 +426,15 @@
         {"id", "runtime-fallback"},
         {"choices", agent::Value::array({
             agent::Value::object({
-                {"message", agent::Value::object({{"content", "runtime fallback ok"}})},
+                {"message", agent::Value::object({
+                    {"content", "Thought: Use the runtime fallback response.\nFinal Answer: runtime fallback ok"},
+                })},
                 {"finish_reason", "stop"},
             }),
         })},
     });
-  });
-  auto runtime_fallback_result = runtime_fallback_app.runner->run("fallback now", "config-runtime-fallback");
+  }));
+  auto runtime_fallback_result = runtime_fallback_app.runner->execution().run("fallback now", "config-runtime-fallback");
   SMOKE_CHECK(runtime_fallback_result.text == "runtime fallback ok");
   SMOKE_CHECK((runtime_fallback_calls == std::vector<std::string>{"openai", "qwen"}));
 
@@ -415,7 +467,7 @@
               {"model", agent::Value::object({{"provider", "qwen"}})},
           })},
       })},
-  }), "main", [&](const agent::NativeProviderRequest& request) {
+  }), native_resolve_options("main", [&](const agent::NativeProviderRequest& request) {
     qwen_env_config_called = true;
     SMOKE_CHECK(request.provider == "qwen");
     SMOKE_CHECK(request.base_url == "https://qwen.env.test/v1");
@@ -425,13 +477,15 @@
         {"id", "qwen-env-config"},
         {"choices", agent::Value::array({
             agent::Value::object({
-                {"message", agent::Value::object({{"content", "qwen env config ok"}})},
+                {"message", agent::Value::object({
+                    {"content", "Thought: Confirm qwen env config.\nFinal Answer: qwen env config ok"},
+                })},
                 {"finish_reason", "stop"},
             }),
         })},
     });
-  });
-  auto qwen_env_config_result = qwen_env_config_app.runner->run("qwen env", "qwen-env-config-session");
+  }));
+  auto qwen_env_config_result = qwen_env_config_app.runner->execution().run("qwen env", "qwen-env-config-session");
   SMOKE_CHECK(qwen_env_config_called);
   SMOKE_CHECK(qwen_env_config_result.text == "qwen env config ok");
 
@@ -445,7 +499,7 @@
               {"model", agent::Value::object({{"provider", "deepseek"}})},
           })},
       })},
-  }), "main", [&](const agent::NativeProviderRequest& request) {
+  }), native_resolve_options("main", [&](const agent::NativeProviderRequest& request) {
     deepseek_env_config_called = true;
     SMOKE_CHECK(request.provider == "deepseek");
     SMOKE_CHECK(request.base_url == "https://deepseek.env.test/v1");
@@ -456,12 +510,15 @@
         {"model", "deepseek-env-model"},
         {"stop_reason", "end_turn"},
         {"content", agent::Value::array({
-            agent::Value::object({{"type", "text"}, {"text", "deepseek env config ok"}}),
+            agent::Value::object({
+                {"type", "text"},
+                {"text", "Thought: Confirm deepseek env config.\nFinal Answer: deepseek env config ok"},
+            }),
         })},
     });
-  });
+  }));
   auto deepseek_env_config_result =
-      deepseek_env_config_app.runner->run("deepseek env", "deepseek-env-config-session");
+      deepseek_env_config_app.runner->execution().run("deepseek env", "deepseek-env-config-session");
   SMOKE_CHECK(deepseek_env_config_called);
   SMOKE_CHECK(deepseek_env_config_result.text == "deepseek env config ok");
   if (had_qwen_model) {
@@ -527,7 +584,7 @@
               {"model", agent::Value::object({{"provider", "openai"}, {"model", "gpt-env"}})},
           })},
       })},
-  }), "main", [&](const agent::NativeProviderRequest& request) {
+  }), native_resolve_options("main", [&](const agent::NativeProviderRequest& request) {
     openai_env_config_called = true;
     SMOKE_CHECK(request.provider == "openai");
     SMOKE_CHECK(request.endpoint == "/chat/completions");
@@ -539,14 +596,16 @@
         {"id", "openai-env-config"},
         {"choices", agent::Value::array({
             agent::Value::object({
-                {"message", agent::Value::object({{"content", "openai env config ok"}})},
+                {"message", agent::Value::object({
+                    {"content", "Thought: Confirm openai env config.\nFinal Answer: openai env config ok"},
+                })},
                 {"finish_reason", "stop"},
             }),
         })},
     });
-  });
+  }));
   auto openai_env_config_result =
-      openai_env_config_app.runner->run("openai env", "openai-env-config-session");
+      openai_env_config_app.runner->execution().run("openai env", "openai-env-config-session");
   SMOKE_CHECK(openai_env_config_called);
   SMOKE_CHECK(openai_env_config_result.text == "openai env config ok");
 
@@ -559,7 +618,7 @@
               {"model", agent::Value::object({{"provider", "anthropic"}, {"model", "claude-env"}})},
           })},
       })},
-  }), "main", [&](const agent::NativeProviderRequest& request) {
+  }), native_resolve_options("main", [&](const agent::NativeProviderRequest& request) {
     anthropic_env_config_called = true;
     SMOKE_CHECK(request.provider == "anthropic");
     SMOKE_CHECK(request.base_url == "https://anthropic.env.test/v1");
@@ -570,12 +629,15 @@
         {"model", "claude-env"},
         {"stop_reason", "end_turn"},
         {"content", agent::Value::array({
-            agent::Value::object({{"type", "text"}, {"text", "anthropic env config ok"}}),
+            agent::Value::object({
+                {"type", "text"},
+                {"text", "Thought: Confirm anthropic env config.\nFinal Answer: anthropic env config ok"},
+            }),
         })},
     });
-  });
+  }));
   auto anthropic_env_config_result =
-      anthropic_env_config_app.runner->run("anthropic env", "anthropic-env-config-session");
+      anthropic_env_config_app.runner->execution().run("anthropic env", "anthropic-env-config-session");
   SMOKE_CHECK(anthropic_env_config_called);
   SMOKE_CHECK(anthropic_env_config_result.text == "anthropic env config ok");
 
@@ -588,7 +650,7 @@
               {"model", agent::Value::object({{"provider", "gemini"}, {"model", "gemini-env"}})},
           })},
       })},
-  }), "main", [&](const agent::NativeProviderRequest& request) {
+  }), native_resolve_options("main", [&](const agent::NativeProviderRequest& request) {
     gemini_env_config_called = true;
     SMOKE_CHECK(request.provider == "gemini");
     SMOKE_CHECK(request.base_url == "https://gemini.env.test/v1beta");
@@ -602,15 +664,17 @@
                 {"finishReason", "STOP"},
                 {"content", agent::Value::object({
                     {"parts", agent::Value::array({
-                        agent::Value::object({{"text", "gemini env config ok"}}),
+                        agent::Value::object({
+                            {"text", "Thought: Confirm gemini env config.\nFinal Answer: gemini env config ok"},
+                        }),
                     })},
                 })},
             }),
         })},
     });
-  });
+  }));
   auto gemini_env_config_result =
-      gemini_env_config_app.runner->run("gemini env", "gemini-env-config-session");
+      gemini_env_config_app.runner->execution().run("gemini env", "gemini-env-config-session");
   SMOKE_CHECK(gemini_env_config_called);
   SMOKE_CHECK(gemini_env_config_result.text == "gemini env config ok");
 
@@ -622,7 +686,7 @@
               {"model", agent::Value::object({{"provider", "ollama"}, {"model", "ollama-env"}})},
           })},
       })},
-  }), "main", [&](const agent::NativeProviderRequest& request) {
+  }), native_resolve_options("main", [&](const agent::NativeProviderRequest& request) {
     ollama_env_config_called = true;
     SMOKE_CHECK(request.provider == "ollama");
     SMOKE_CHECK(request.base_url == "http://ollama.env.test/api");
@@ -633,11 +697,13 @@
         {"created_at", "ollama-env-config"},
         {"done", true},
         {"done_reason", "stop"},
-        {"message", agent::Value::object({{"content", "ollama env config ok"}})},
+        {"message", agent::Value::object({
+            {"content", "Thought: Confirm ollama env config.\nFinal Answer: ollama env config ok"},
+        })},
     });
-  });
+  }));
   auto ollama_env_config_result =
-      ollama_env_config_app.runner->run("ollama env", "ollama-env-config-session");
+      ollama_env_config_app.runner->execution().run("ollama env", "ollama-env-config-session");
   SMOKE_CHECK(ollama_env_config_called);
   SMOKE_CHECK(ollama_env_config_result.text == "ollama env config ok");
 
@@ -822,6 +888,164 @@
   }
   SMOKE_CHECK(loaded_missing_env_failed);
 
+  agent::register_native_chat_provider_descriptor(agent::NativeChatProviderDescriptor{
+      .provider = "descriptor-smoke",
+      .create_adapter = [](const agent::Value&, agent::NativeChatProviderBuildContext) {
+        return std::make_shared<agent::EchoChatModelAdapter>();
+      },
+      .resolve_protocol = [](const agent::Value&) {
+        return agent::ProviderRequestProtocol::OpenAIChatCompletions;
+      },
+      .resolve_profile = [](const agent::Value&) {
+        return agent::ProviderRequestProfile{
+            .provider = "descriptor-smoke",
+            .runtime = "descriptor-smoke-runtime",
+            .protocol = agent::ProviderRequestProtocol::OpenAIChatCompletions,
+            .reasoning_mode = agent::ProviderReasoningMode::None,
+            .supports_reasoning = true,
+            .supports_reasoning_budget = false,
+            .supports_reasoning_visibility = false,
+            .strict_reasoning = false,
+            .reasoning_disable_strategy = agent::ProviderReasoningDisableStrategy::Unsupported,
+        };
+      },
+      .default_capabilities = {"input.text", "reasoning"},
+      .resolve_capabilities = [](const agent::Value& model) {
+        auto capabilities = std::set<std::string>{"input.text", "reasoning", "descriptor.capability"};
+        if (model.at("vision").as_bool(false)) {
+          capabilities.insert("input.image");
+        }
+        return capabilities;
+      },
+      .collect_env_refs = [](const agent::Value& model) {
+        std::vector<std::string> refs;
+        const auto env = model.at("descriptorEnv").as_string();
+        if (!env.empty()) {
+          refs.push_back(env);
+        }
+        return refs;
+      },
+  });
+  auto descriptor_model_config = agent::Value::object({
+      {"agents", agent::Value::object({
+          {"descriptor", agent::Value::object({
+              {"model", agent::Value::object({
+                  {"provider", "descriptor-smoke"},
+                  {"model", "descriptor-model"},
+                  {"descriptorEnv", "DESCRIPTOR_SMOKE_KEY"},
+                  {"vision", true},
+                  {"reasoning", agent::Value::object({{"enabled", true}})},
+                  {"requireCapabilities", agent::Value::array({"descriptor.capability", "input.image"})},
+              })},
+          })},
+      })},
+  });
+  agent::validate_native_agent_config(descriptor_model_config);
+  const auto descriptor_profile = agent::resolve_native_chat_provider_profile(
+      descriptor_model_config.at("agents").at("descriptor").at("model"));
+  SMOKE_CHECK(descriptor_profile.provider == "descriptor-smoke");
+  SMOKE_CHECK(descriptor_profile.runtime == "descriptor-smoke-runtime");
+  SMOKE_CHECK(descriptor_profile.protocol == agent::ProviderRequestProtocol::OpenAIChatCompletions);
+  SMOKE_CHECK(descriptor_profile.supports_reasoning);
+  SMOKE_CHECK(descriptor_profile.reasoning_disable_strategy ==
+              agent::ProviderReasoningDisableStrategy::Unsupported);
+  const std::vector<std::string> descriptor_env_keys{"DESCRIPTOR_SMOKE_KEY"};
+  SMOKE_CHECK(agent::collect_referenced_env_keys(descriptor_model_config) == descriptor_env_keys);
+
+  agent::register_native_text_embedding_provider_descriptor(
+      agent::NativeTextEmbeddingProviderDescriptor{
+          .provider = "descriptor-text-embedding-smoke",
+          .create_adapter = [](const agent::Value& embedding,
+                               agent::NativeEmbeddingProviderBuildContext) {
+            return std::make_shared<agent::HashEmbeddingAdapter>(
+                static_cast<int>(embedding.at("dimensions").as_integer(17)),
+                embedding.at("model").as_string("descriptor-text-embedding"),
+                embedding.at("spaceId").as_string("descriptor-text-space"));
+          },
+          .collect_env_refs = [](const agent::Value& embedding) {
+            return std::vector<std::string>{embedding.at("descriptorEnv").as_string()};
+          },
+          .resolve_known_dimensions = [](const agent::Value& embedding) -> std::optional<int> {
+            return static_cast<int>(embedding.at("dimensions").as_integer(17));
+          },
+      });
+  auto descriptor_embedding = agent::find_native_text_embedding_provider_descriptor(
+      "descriptor-text-embedding-smoke");
+  SMOKE_CHECK(descriptor_embedding.has_value());
+  const auto descriptor_embedding_provider_names = agent::native_text_embedding_provider_names();
+  SMOKE_CHECK(std::find(descriptor_embedding_provider_names.begin(),
+                        descriptor_embedding_provider_names.end(),
+                        "descriptor-text-embedding-smoke") !=
+              descriptor_embedding_provider_names.end());
+  auto descriptor_embedding_adapter = descriptor_embedding->create_adapter(
+      agent::Value::object({
+          {"provider", "descriptor-text-embedding-smoke"},
+          {"model", "descriptor-text-embedding"},
+          {"dimensions", 17},
+      }),
+      agent::NativeEmbeddingProviderBuildContext{});
+  SMOKE_CHECK(descriptor_embedding_adapter->dimensions() == 17);
+  auto descriptor_embedding_config = agent::Value::object({
+      {"resources", agent::Value::object({
+          {"knowledgeBases", agent::Value::object({
+              {"docs", agent::Value::object({
+                  {"id", "docs"},
+                  {"embedder", agent::Value::object({
+                      {"provider", "descriptor-text-embedding-smoke"},
+                      {"model", "descriptor-text-embedding"},
+                      {"dimensions", 17},
+                      {"descriptorEnv", "DESCRIPTOR_EMBEDDING_KEY"},
+                  })},
+              })},
+          })},
+      })},
+      {"agents", agent::Value::object({
+          {"descriptor", agent::Value::object({
+              {"model", agent::Value::object({
+                  {"provider", "descriptor-smoke"},
+                  {"model", "descriptor-model"},
+              })},
+              {"knowledge", agent::Value::object({
+                  {"base", agent::Value::object({{"use", "docs"}})},
+              })},
+          })},
+      })},
+  });
+  agent::validate_native_agent_config(descriptor_embedding_config);
+  const std::vector<std::string> descriptor_embedding_env_keys{
+      "DESCRIPTOR_EMBEDDING_KEY"};
+  SMOKE_CHECK(agent::collect_referenced_env_keys(descriptor_embedding_config) ==
+              descriptor_embedding_env_keys);
+
+  agent::register_native_chat_provider_descriptor(agent::NativeChatProviderDescriptor{
+      .provider = "descriptor-plain",
+      .create_adapter = [](const agent::Value&, agent::NativeChatProviderBuildContext) {
+        return std::make_shared<agent::EchoChatModelAdapter>();
+      },
+      .resolve_protocol = [](const agent::Value&) {
+        return agent::ProviderRequestProtocol::OpenAIChatCompletions;
+      },
+      .default_capabilities = {"input.text"},
+  });
+  auto descriptor_plain_config = agent::Value::object({
+      {"agents", agent::Value::object({
+          {"plain", agent::Value::object({
+              {"model", agent::Value::object({
+                  {"provider", "descriptor-plain"},
+                  {"model", "plain-model"},
+                  {"reasoning", agent::Value::object({{"enabled", true}})},
+              })},
+          })},
+      })},
+  });
+  bool descriptor_plain_reasoning_failed = false;
+  try {
+    agent::validate_native_agent_config(descriptor_plain_config);
+  } catch (const agent::ConfigurationError&) {
+    descriptor_plain_reasoning_failed = true;
+  }
+  SMOKE_CHECK(descriptor_plain_reasoning_failed);
+
   const auto config_file = persistent_dir / "agent-native.json";
   agent::write_json_file(config_file, agent::Value::object({
       {"agents", agent::Value::object({
@@ -834,14 +1058,14 @@
       })},
   }));
   auto loaded_app = agent::load_native_agent_app(config_file, "loaded");
-  auto loaded_run = loaded_app.runner->run("loaded input", "loaded-session");
+  auto loaded_run = loaded_app.runner->execution().run("loaded input", "loaded-session");
   SMOKE_CHECK(loaded_run.text == "loaded input");
   SMOKE_CHECK(std::filesystem::exists(persistent_dir / "loaded-sessions" / "loaded-session.json"));
   auto loaded_config_object = agent::load_native_loaded_agent_config(config_file);
   SMOKE_CHECK(loaded_config_object.cwd == persistent_dir);
   SMOKE_CHECK(loaded_config_object.path == config_file);
   auto loaded_config_app = agent::resolve_native_agent_app(loaded_config_object, "loaded");
-  auto loaded_config_run = loaded_config_app.runner->run("loaded config object input", "loaded-config-session");
+  auto loaded_config_run = loaded_config_app.runner->execution().run("loaded config object input", "loaded-config-session");
   SMOKE_CHECK(loaded_config_run.text == "loaded config object input");
   SMOKE_CHECK(std::filesystem::exists(persistent_dir / "loaded-sessions" / "loaded-config-session.json"));
 
@@ -864,7 +1088,7 @@
   SMOKE_CHECK(agent::resolve_agent_id(object_loaded_config) == "object");
   SMOKE_CHECK(agent::resolve_agent_definition(object_loaded_config).at("model").at("provider").as_string() == "echo");
   auto object_app = agent::resolve_native_agent_app(object_loaded_config, "object");
-  auto object_run = object_app.runner->run("object config input", "object-session");
+  auto object_run = object_app.runner->execution().run("object config input", "object-session");
   SMOKE_CHECK(object_run.text == "object config input");
   SMOKE_CHECK(std::filesystem::exists(object_config_root / "object-sessions" / "object-session.json"));
   auto default_loaded_config = agent::define_native_loaded_agent_config(agent::Value::object({
@@ -905,7 +1129,7 @@
   SMOKE_CHECK(discovered_config);
   SMOKE_CHECK(discovered_config->filename().string() == "node-agent.config.json");
   auto discovered_app = agent::load_native_agent_app(discovered_nested_dir, "discovered");
-  auto discovered_run = discovered_app.runner->run("discovered input", "discovered-session");
+  auto discovered_run = discovered_app.runner->execution().run("discovered input", "discovered-session");
   SMOKE_CHECK(discovered_run.text == "discovered input");
   SMOKE_CHECK(std::filesystem::exists(discovered_config_root / "discovered-sessions" / "discovered-session.json"));
   const auto priority_config_root = persistent_dir / "discover-config-priority";
@@ -953,7 +1177,7 @@
   SMOKE_CHECK(module_loader_called);
   SMOKE_CHECK(loaded_module_config.at("_cwd").as_string() == priority_config_root.string());
   auto module_app = agent::load_native_agent_app(priority_nested_dir, "module", module_loader);
-  auto module_run = module_app.runner->run("module config input", "module-session");
+  auto module_run = module_app.runner->execution().run("module config input", "module-session");
   SMOKE_CHECK(module_run.text == "module config input");
   SMOKE_CHECK(std::filesystem::exists(priority_config_root / "module-sessions" / "module-session.json"));
   bool module_non_object_failed = false;
@@ -1229,7 +1453,8 @@
         })},
     }));
   } catch (const agent::ConfigurationError& error) {
-    invalid_model_provider_failed = std::string(error.what()).find("provider must be one of") != std::string::npos;
+    invalid_model_provider_failed =
+        std::string(error.what()).find("not registered as a native chat provider") != std::string::npos;
   }
   SMOKE_CHECK(invalid_model_provider_failed);
   bool unsupported_bundle_failed = false;
@@ -1572,32 +1797,29 @@
       })},
   });
   auto permission_app = agent::resolve_native_agent_app(
-      config_with_permissions, "main",
-      [&](const agent::NativeProviderRequest& request) {
+      config_with_permissions,
+      native_resolve_options("main", [&](const agent::NativeProviderRequest& request) {
         permission_model_calls += 1;
         if (permission_model_calls == 1) {
-          SMOKE_CHECK(!request.body.at("tools").as_array().empty());
+          const auto messages_text = request.body.at("messages").stringify();
+          SMOKE_CHECK(messages_text.find("Available tools") != std::string::npos);
+          SMOKE_CHECK(messages_text.find("fs.writeText") != std::string::npos);
           return agent::Value::object({
               {"id", "perm_1"},
               {"choices", agent::Value::array({
                   agent::Value::object({
                       {"message", agent::Value::object({
-                          {"content", ""},
-                          {"tool_calls", agent::Value::array({
-                              agent::Value::object({
-                                  {"id", "call_write"},
-                                  {"type", "function"},
-                                  {"function", agent::Value::object({
-                                      {"name", "fs.writeText"},
-                                      {"arguments", agent::safe_json_stringify(agent::Value::object({
-                                          {"path", permission_target.string()},
-                                          {"content", "blocked"},
-                                      }))},
-                                  })},
-                              }),
-                          })},
+                          {"content",
+                           "Thought: Try the configured file-write tool.\nActions:\n[" +
+                               agent::safe_json_stringify(agent::Value::object({
+                                   {"tool", "fs.writeText"},
+                                   {"input", agent::Value::object({
+                                       {"path", permission_target.string()},
+                                       {"content", "blocked"},
+                                   })},
+                               })) + "]"},
                       })},
-                      {"finish_reason", "tool_calls"},
+                      {"finish_reason", "stop"},
                   }),
               })},
           });
@@ -1610,13 +1832,15 @@
             {"id", "perm_2"},
             {"choices", agent::Value::array({
                 agent::Value::object({
-                    {"message", agent::Value::object({{"content", "permission checked"}})},
+                    {"message", agent::Value::object({
+                        {"content", "Thought: Report the permission result.\nFinal Answer: permission checked"},
+                    })},
                     {"finish_reason", "stop"},
                 }),
             })},
         });
-      });
-  auto permission_run = permission_app.runner->run("try write", "permission-session");
+      }));
+  auto permission_run = permission_app.runner->execution().run("try write", "permission-session");
   SMOKE_CHECK(permission_model_calls == 2);
   SMOKE_CHECK(permission_run.text == "permission checked");
   SMOKE_CHECK(!std::filesystem::exists(permission_target));
@@ -1637,7 +1861,9 @@
           })},
       })},
   });
-  auto developer_app = agent::resolve_native_agent_app(config_with_developer, "main", {}, {}, {}, developer_adapters);
+  auto developer_app = agent::resolve_native_agent_app(
+      config_with_developer,
+      native_resolve_options("main", {}, {}, {}, developer_adapters));
   agent::ToolRegistry configured_developer_tools(developer_app.tools);
   agent::ToolExecutor configured_developer_executor(configured_developer_tools);
   // shell.exec requires shell_safe capabilities — install a permissive test
@@ -1663,7 +1889,8 @@
   };
   ConfiguredDeveloperSandbox configured_developer_sandbox;
   agent::ToolExecutionContext configured_developer_ctx;
-  configured_developer_ctx.service_refs.sandbox = &configured_developer_sandbox;
+  configured_developer_ctx.service_refs.service_container.set(agent::kToolServiceSandbox,
+                                                              &configured_developer_sandbox);
   auto configured_developer_shell = configured_developer_executor.execute_tool_call(agent::ToolCall{
       .id = "config_developer_shell_1",
       .name = "shell.exec",

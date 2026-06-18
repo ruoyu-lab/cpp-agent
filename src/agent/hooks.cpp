@@ -1,4 +1,4 @@
-#include "agent/agent.hpp"
+#include "agent/core_api.hpp"
 
 namespace agent {
 
@@ -116,6 +116,32 @@ HookSet merge_hooks(const std::vector<HookSet>& hooks) {
     return hook.on_child_agent_error;
   });
 
+  merged.before_skill_activation =
+      merged_callback<SkillActivationHookContext>(items, [](const HookSet& hook) -> const auto& {
+        return hook.before_skill_activation;
+      });
+  merged.after_skill_activation =
+      merged_callback<SkillActivationHookContext>(items, [](const HookSet& hook) -> const auto& {
+        return hook.after_skill_activation;
+      });
+  merged.on_skill_activation_error =
+      merged_callback<SkillActivationHookContext>(items, [](const HookSet& hook) -> const auto& {
+        return hook.on_skill_activation_error;
+      });
+
+  merged.before_skills_resolve =
+      merged_callback<SkillsResolveHookContext>(items, [](const HookSet& hook) -> const auto& {
+        return hook.before_skills_resolve;
+      });
+  merged.after_skills_resolve =
+      merged_callback<SkillsResolveHookContext>(items, [](const HookSet& hook) -> const auto& {
+        return hook.after_skills_resolve;
+      });
+  merged.on_skills_resolve_error =
+      merged_callback<SkillsResolveHookContext>(items, [](const HookSet& hook) -> const auto& {
+        return hook.on_skills_resolve_error;
+      });
+
   return merged;
 }
 
@@ -167,6 +193,30 @@ HookSet default_logging_hook_set(HookLogSink sink) {
            Value::object({{"toolName", ctx.tool_name}, {"decision", ctx.decision},
                           {"reason", ctx.reason}}));
     }
+  };
+
+  hooks.after_skill_activation = [emit](const SkillActivationHookContext& ctx) {
+    emit(HookLogSeverity::Trace, "after_skill_activation", "skill activation completed",
+         Value::object({{"skillName", ctx.skill_name},
+                        {"activationSource", ctx.activation_source},
+                        {"runId", ctx.run_id}}));
+  };
+  hooks.on_skill_activation_error = [emit](const SkillActivationHookContext& ctx) {
+    emit(HookLogSeverity::Warn, "on_skill_activation_error", "skill activation failed",
+         Value::object({{"skillName", ctx.skill_name},
+                        {"activationSource", ctx.activation_source},
+                        {"runId", ctx.run_id},
+                        {"error", ctx.error}}));
+  };
+  hooks.after_skills_resolve = [emit](const SkillsResolveHookContext& ctx) {
+    emit(HookLogSeverity::Trace, "after_skills_resolve", "skills resolved",
+         Value::object({{"activeSkills", ctx.active_skills},
+                        {"autoSelectedSkills", ctx.auto_selected_skills},
+                        {"runId", ctx.run_id}}));
+  };
+  hooks.on_skills_resolve_error = [emit](const SkillsResolveHookContext& ctx) {
+    emit(HookLogSeverity::Warn, "on_skills_resolve_error", "skills resolve failed",
+         Value::object({{"inputText", ctx.input_text}, {"runId", ctx.run_id}, {"error", ctx.error}}));
   };
 
   return hooks;

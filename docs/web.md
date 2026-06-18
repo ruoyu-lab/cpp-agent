@@ -31,9 +31,10 @@ returns an empty result set, matching the NodeJS explicit-zero behavior.
 
 `create_brave_web_search_provider` and `create_searxng_web_search_provider`
 shape provider requests and parse responses through `NativeWebSearchTransport`.
-Use `create_native_web_search_transport` with an injected `HttpTransport` when
-plain HTTP is sufficient; provide your own transport for HTTPS/TLS or production
-policy.
+Use `create_native_web_search_transport(HttpTransport)` with an injected
+transport. Include `agent/web_native.hpp` and link `agent_runtime_io_native`
+only when the built-in plain-HTTP transport is sufficient; provide your own
+transport for HTTPS/TLS or production policy.
 
 ## Fetching
 
@@ -41,6 +42,8 @@ policy.
 native fetch transport:
 
 ```cpp
+#include "agent/web_native.hpp"
+
 agent::NativeWebPageFetcher fetcher(agent::create_native_web_fetch_transport());
 auto page = fetcher.fetch(agent::WebFetchRequest{
     .url = "http://127.0.0.1:3000/docs",
@@ -73,6 +76,8 @@ falls back to browser rendering when the primary fetch fails or extracted text
 is shorter than `minimum_text_length`.
 
 ```cpp
+#include "agent/web_native.hpp"
+
 auto primary = std::make_shared<agent::NativeWebPageFetcher>(
     agent::create_native_web_fetch_transport());
 

@@ -56,6 +56,169 @@ std::string escape_json(const std::string& value) {
   return out.str();
 }
 
+namespace {
+
+std::filesystem::path unique_temp_path_for_write(const std::filesystem::path& path) {
+  const auto parent = path.parent_path();
+  const auto filename = path.filename().string();
+  std::random_device rd;
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    std::ostringstream suffix;
+    suffix << ".tmp-" << std::hex << rd() << "-" << attempt;
+    auto candidate = parent / (filename + suffix.str());
+    if (!std::filesystem::exists(candidate)) {
+      return candidate;
+    }
+  }
+  throw ConfigurationError("Unable to allocate temporary write path for: " + path.string());
+}
+
+void replace_file_with_temp(const std::filesystem::path& temp_path,
+                            const std::filesystem::path& final_path) {
+  std::error_code ec;
+  std::filesystem::rename(temp_path, final_path, ec);
+  if (!ec) {
+    return;
+  }
+  if (!std::filesystem::exists(temp_path)) {
+    throw ConfigurationError("Unable to replace file: " + final_path.string());
+  }
+  std::error_code remove_ec;
+  std::filesystem::remove(final_path, remove_ec);
+  if (remove_ec) {
+    throw ConfigurationError("Unable to replace file: " + final_path.string());
+  }
+  ec.clear();
+  std::filesystem::rename(temp_path, final_path, ec);
+  if (!ec) {
+    return;
+  }
+  throw ConfigurationError("Unable to replace file: " + final_path.string());
+}
+
+bool utf8_continuation(unsigned char ch) {
+  return (ch & 0xC0u) == 0x80u;
+}
+
+void throw_invalid_utf8(std::string_view context) {
+  throw ConfigurationError("Invalid UTF-8 sequence in " + std::string(context) + ".");
+}
+
+void throw_incomplete_utf8(std::string_view context) {
+  throw ConfigurationError("Incomplete UTF-8 sequence in " + std::string(context) + ".");
+}
+
+}  // namespace
+
+std::size_t complete_utf8_prefix_size(std::string_view text, std::string_view context) {
+  std::size_t offset = 0;
+  while (offset < text.size()) {
+    const auto lead = static_cast<unsigned char>(text[offset]);
+    if (lead < 0x80u) {
+      ++offset;
+      continue;
+    }
+
+    std::size_t width = 0;
+    unsigned char second_min = 0x80u;
+    unsigned char second_max = 0xBFu;
+    if (lead >= 0xC2u && lead <= 0xDFu) {
+      width = 2;
+    } else if (lead == 0xE0u) {
+      width = 3;
+      second_min = 0xA0u;
+    } else if (lead >= 0xE1u && lead <= 0xECu) {
+      width = 3;
+    } else if (lead == 0xEDu) {
+      width = 3;
+      second_max = 0x9Fu;
+    } else if (lead >= 0xEEu && lead <= 0xEFu) {
+      width = 3;
+    } else if (lead == 0xF0u) {
+      width = 4;
+      second_min = 0x90u;
+    } else if (lead >= 0xF1u && lead <= 0xF3u) {
+      width = 4;
+    } else if (lead == 0xF4u) {
+      width = 4;
+      second_max = 0x8Fu;
+    } else {
+      throw_invalid_utf8(context);
+    }
+
+    if (offset + 1 >= text.size()) {
+      return offset;
+    }
+    const auto second = static_cast<unsigned char>(text[offset + 1]);
+    if (second < second_min || second > second_max || !utf8_continuation(second)) {
+      throw_invalid_utf8(context);
+    }
+    if (width == 2) {
+      offset += width;
+      continue;
+    }
+
+    if (offset + 2 >= text.size()) {
+      return offset;
+    }
+    if (!utf8_continuation(static_cast<unsigned char>(text[offset + 2]))) {
+      throw_invalid_utf8(context);
+    }
+    if (width == 3) {
+      offset += width;
+      continue;
+    }
+
+    if (offset + 3 >= text.size()) {
+      return offset;
+    }
+    if (!utf8_continuation(static_cast<unsigned char>(text[offset + 3]))) {
+      throw_invalid_utf8(context);
+    }
+    offset += width;
+  }
+  return offset;
+}
+
+std::string take_complete_utf8_prefix(std::string& buffer, std::string_view context) {
+  const auto size = complete_utf8_prefix_size(buffer, context);
+  if (size == 0) {
+    return {};
+  }
+  std::string prefix = buffer.substr(0, size);
+  buffer.erase(0, size);
+  return prefix;
+}
+
+void require_complete_utf8(std::string_view text, std::string_view context) {
+  const auto size = complete_utf8_prefix_size(text, context);
+  if (size != text.size()) {
+    throw_incomplete_utf8(context);
+  }
+}
+
+Utf8StreamBuffer::Utf8StreamBuffer(std::string context)
+    : context_(std::move(context)) {}
+
+std::string Utf8StreamBuffer::push(std::string_view chunk) {
+  if (!chunk.empty()) {
+    pending_.append(chunk.data(), chunk.size());
+  }
+  return take_complete_utf8_prefix(pending_, context_);
+}
+
+std::string Utf8StreamBuffer::finish() {
+  auto complete = take_complete_utf8_prefix(pending_, context_);
+  if (!pending_.empty()) {
+    throw_incomplete_utf8(context_);
+  }
+  return complete;
+}
+
+bool Utf8StreamBuffer::empty() const noexcept {
+  return pending_.empty();
+}
+
 std::string indent_string(int count) {
   return std::string(std::max(0, count), ' ');
 }
@@ -208,6 +371,8 @@ std::string content_part_type_label(ContentPartType type) {
     case ContentPartType::Text: return "text";
     case ContentPartType::Image: return "image";
     case ContentPartType::File: return "file";
+    case ContentPartType::Audio: return "audio";
+    case ContentPartType::Video: return "video";
   }
   return "text";
 }
@@ -215,6 +380,8 @@ std::string content_part_type_label(ContentPartType type) {
 ContentPartType content_part_type_from_label(const std::string& type) {
   if (type == "image") return ContentPartType::Image;
   if (type == "file") return ContentPartType::File;
+  if (type == "audio") return ContentPartType::Audio;
+  if (type == "video") return ContentPartType::Video;
   return ContentPartType::Text;
 }
 
@@ -226,7 +393,7 @@ std::chrono::system_clock::time_point ms_to_time_point(long long value) {
   return std::chrono::system_clock::time_point(std::chrono::milliseconds(value));
 }
 
-EmbeddingVector normalize_vector(EmbeddingVector vector) {
+std::vector<double> normalize_vector(std::vector<double> vector) {
   double magnitude = 0;
   for (const double value : vector) {
     magnitude += value * value;
@@ -241,7 +408,7 @@ EmbeddingVector normalize_vector(EmbeddingVector vector) {
   return vector;
 }
 
-double dot_product(const EmbeddingVector& left, const EmbeddingVector& right) {
+double dot_product(const std::vector<double>& left, const std::vector<double>& right) {
   const std::size_t length = std::min(left.size(), right.size());
   double total = 0;
   for (std::size_t index = 0; index < length; ++index) {
@@ -317,11 +484,29 @@ void write_text_file(const std::filesystem::path& path, const std::string& text)
   if (!path.parent_path().empty()) {
     std::filesystem::create_directories(path.parent_path());
   }
-  std::ofstream output(path, std::ios::binary);
-  if (!output) {
-    throw ConfigurationError("Unable to write file: " + path.string());
+  const auto temp_path = unique_temp_path_for_write(path);
+  try {
+    {
+      std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
+      if (!output) {
+        throw ConfigurationError("Unable to write file: " + temp_path.string());
+      }
+      output << text;
+      output.flush();
+      if (!output) {
+        throw ConfigurationError("Unable to write file: " + temp_path.string());
+      }
+      output.close();
+      if (!output) {
+        throw ConfigurationError("Unable to close file: " + temp_path.string());
+      }
+    }
+    replace_file_with_temp(temp_path, path);
+  } catch (...) {
+    std::error_code ignored;
+    std::filesystem::remove(temp_path, ignored);
+    throw;
   }
-  output << text;
 }
 
 std::string bytes_to_text(const std::vector<std::uint8_t>& bytes) {

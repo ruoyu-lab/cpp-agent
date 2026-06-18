@@ -1,19 +1,43 @@
 # MCP API
 
 The native MCP module mirrors the NodeJS MCP package with JSON-RPC helpers,
-Anthropic `.mcp.json` loading, stdio transports, HTTP transports, in-process
-servers, and adapters that expose remote MCP tools, resources, and prompts to
-the C++ runtime.
+Anthropic `.mcp.json` loading, transport contracts, in-process servers, and
+adapters that expose remote MCP tools, resources, and prompts to the C++
+runtime.
 
-The module stays zero-dependency. Built-in transports cover stdio subprocesses
-and plain HTTP JSON-RPC POST. HTTPS, SSE, WebSocket, and hosted production MCP
-transports should be provided through injected transport implementations.
+`agent_mcp` stays protocol-only and platform-neutral. `agent_mcp_native` adds
+the optional zero-dependency stdio subprocess and plain HTTP JSON-RPC POST
+transports. HTTPS, SSE, WebSocket, and hosted production MCP transports should
+be provided through injected transport implementations.
+
+## Transport Governance Contract
+
+The native boundary is intentionally narrower than the NodeJS package:
+
+- stdio and plain HTTP are first-party native transports.
+- HTTPS, SSE, and WebSocket are supported through injected `MCPTransport`
+  implementations so embedders can provide their own TLS/event-loop/socket
+  stack.
+- stdio and HTTP transports use explicit response/request timeouts and fail
+  closed on timeout.
+- `MCPClient` serializes request/response matching with a request mutex. This is
+  the native concurrency contract today: embedders that need broader
+  concurrency should provide a transport/client wrapper with an explicit limit.
+- Tool adapters always tag tools with `mcp` and `mcp:<server>`, and optionally
+  `server:<server>`. NodeJS additionally exposes `scope:<scope>` tags for
+  `.mcp.json` server scope; native embedders should model scope in their host
+  registry or add equivalent tags when constructing tools.
+- Native adapters do not truncate tool descriptions by default. Hosts that
+  expose untrusted MCP servers should truncate before presenting tool catalogs
+  to a model, matching the NodeJS `maxDescriptionLength` policy.
 
 ## Anthropic Config
 
 Use the Anthropic-style `.mcp.json` helpers when loading MCP servers from disk:
 
 ```cpp
+#include "agent/mcp_native.hpp"
+
 auto config = agent::load_anthropic_mcp_config_file("/workspace/.mcp.json", {
     {"HOME", "/Users/service"},
     {"TOKEN", "local-token"},
@@ -43,19 +67,24 @@ class MCPTransport {
 };
 ```
 
-Available native transports:
+Available transports:
 
-- `MCPStdioTransport`: starts a subprocess, writes newline-delimited JSON-RPC
-  requests to stdin, and waits for matching responses on stdout.
-- `MCPNativeHttpTransport`: sends JSON-RPC messages with HTTP POST to a plain
-  `http://` URL.
 - `MCPCallbackTransport` / `MCPHttpTransport`: adapter-friendly wrappers around
   a synchronous request/response callback.
 - `MCPLineTransport`: newline-delimited JSON-RPC over caller-owned streams.
+- `MCPStdioTransport` (`agent/mcp_native.hpp`): starts a subprocess, writes newline-delimited JSON-RPC
+  requests to stdin, and waits for matching responses on stdout.
+- `MCPNativeHttpTransport` (`agent/mcp_native.hpp`): sends JSON-RPC messages with HTTP POST to a plain
+  `http://` URL.
 
 `create_native_mcp_transport` supports `stdio` and `http`. It intentionally
 rejects unsupported native transport types instead of silently falling back to a
 different transport.
+
+For SSE/WebSocket parity, implement `MCPTransport::start/send/close` and inject
+the transport into `MCPClient`. This keeps the native library independent from a
+specific event-loop or WebSocket implementation while preserving the same
+JSON-RPC client contract.
 
 ## Client
 
@@ -63,6 +92,8 @@ different transport.
 and prompt operations:
 
 ```cpp
+#include "agent/mcp_native.hpp"
+
 auto client = std::make_shared<agent::MCPClient>(
     "docs",
     std::make_shared<agent::MCPStdioTransport>(agent::MCPStdioTransportConfig{

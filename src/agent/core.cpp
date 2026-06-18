@@ -1,4 +1,4 @@
-#include "agent/agent.hpp"
+#include "agent/core_api.hpp"
 #include "detail/helpers.hpp"
 
 #include <algorithm>
@@ -7,6 +7,7 @@
 #include <ctime>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -34,6 +35,13 @@ Value string_vector_to_value(const std::vector<std::string>& values) {
   return Value(std::move(array));
 }
 
+std::tm utc_time_from_epoch(std::time_t time) {
+  static std::mutex mutex;
+  std::lock_guard<std::mutex> lock(mutex);
+  const std::tm* tm = std::gmtime(&time);
+  return tm ? *tm : std::tm{};
+}
+
 }  // namespace
 
 AgentFrameworkError::AgentFrameworkError(std::string message, std::string details)
@@ -41,6 +49,65 @@ AgentFrameworkError::AgentFrameworkError(std::string message, std::string detail
 
 const std::string& AgentFrameworkError::details() const noexcept {
   return details_;
+}
+
+std::string_view AgentFrameworkError::error_name() const noexcept {
+  return "AgentFrameworkError";
+}
+
+std::string_view AgentFrameworkError::error_category() const noexcept {
+  return "framework";
+}
+
+std::string_view AgentFrameworkError::error_code() const noexcept {
+  return "framework-error";
+}
+
+CancellationError::CancellationError(std::string message, std::string target, std::string reason)
+    : AgentFrameworkError(std::move(message)), target_(std::move(target)), reason_(std::move(reason)) {}
+
+const std::string& CancellationError::target() const noexcept {
+  return target_;
+}
+
+const std::string& CancellationError::reason() const noexcept {
+  return reason_;
+}
+
+std::string_view CancellationError::error_name() const noexcept {
+  return "CancellationError";
+}
+
+std::string_view CancellationError::error_category() const noexcept {
+  return "cancelled";
+}
+
+std::string_view CancellationError::error_code() const noexcept {
+  return "cancelled";
+}
+
+std::string_view ConfigurationError::error_name() const noexcept {
+  return "ConfigurationError";
+}
+
+std::string_view ConfigurationError::error_category() const noexcept {
+  return "configuration";
+}
+
+std::string_view ConfigurationError::error_code() const noexcept {
+  return "configuration";
+}
+
+std::string_view AdapterError::error_name() const noexcept {
+  return "AdapterError";
+}
+
+std::string_view AdapterError::error_category() const noexcept {
+  return "adapter";
+}
+
+std::string_view AdapterError::error_code() const noexcept {
+  return "adapter";
 }
 
 TimeoutError::TimeoutError(std::string message, std::string target, int timeout_ms)
@@ -54,6 +121,18 @@ int TimeoutError::timeout_ms() const noexcept {
   return timeout_ms_;
 }
 
+std::string_view TimeoutError::error_name() const noexcept {
+  return "TimeoutError";
+}
+
+std::string_view TimeoutError::error_category() const noexcept {
+  return "timeout";
+}
+
+std::string_view TimeoutError::error_code() const noexcept {
+  return "timeout";
+}
+
 RetryExhaustedError::RetryExhaustedError(std::string message, std::string target, int attempts)
     : AgentFrameworkError(std::move(message)), target_(std::move(target)), attempts_(attempts) {}
 
@@ -65,11 +144,54 @@ int RetryExhaustedError::attempts() const noexcept {
   return attempts_;
 }
 
+std::string_view RetryExhaustedError::error_name() const noexcept {
+  return "RetryExhaustedError";
+}
+
+std::string_view RetryExhaustedError::error_category() const noexcept {
+  return "retry";
+}
+
+std::string_view RetryExhaustedError::error_code() const noexcept {
+  return "retry-exhausted";
+}
+
+ProtocolError::ProtocolError(std::string message, std::string code, std::string details)
+    : AgentFrameworkError(std::move(message), std::move(details)), code_(std::move(code)) {}
+
+const std::string& ProtocolError::code() const noexcept {
+  return code_;
+}
+
+std::string_view ProtocolError::error_name() const noexcept {
+  return "ProtocolError";
+}
+
+std::string_view ProtocolError::error_category() const noexcept {
+  return "protocol";
+}
+
+std::string_view ProtocolError::error_code() const noexcept {
+  return code_;
+}
+
 SchemaValidationError::SchemaValidationError(std::string message, std::vector<SchemaValidationIssue> issues)
     : AgentFrameworkError(std::move(message)), issues_(std::move(issues)) {}
 
 const std::vector<SchemaValidationIssue>& SchemaValidationError::issues() const noexcept {
   return issues_;
+}
+
+std::string_view SchemaValidationError::error_name() const noexcept {
+  return "SchemaValidationError";
+}
+
+std::string_view SchemaValidationError::error_category() const noexcept {
+  return "schema";
+}
+
+std::string_view SchemaValidationError::error_code() const noexcept {
+  return "schema-validation";
 }
 
 ToolExecutionError::ToolExecutionError(std::string message, std::string tool_name, std::string tool_call_id)
@@ -85,6 +207,18 @@ const std::string& ToolExecutionError::tool_call_id() const noexcept {
   return tool_call_id_;
 }
 
+std::string_view ToolExecutionError::error_name() const noexcept {
+  return "ToolExecutionError";
+}
+
+std::string_view ToolExecutionError::error_category() const noexcept {
+  return "tool";
+}
+
+std::string_view ToolExecutionError::error_code() const noexcept {
+  return "tool-execution";
+}
+
 PermissionDeniedError::PermissionDeniedError(std::string message, std::string tool_name, std::string reason)
     : AgentFrameworkError(std::move(message)), tool_name_(std::move(tool_name)), reason_(std::move(reason)) {}
 
@@ -94,6 +228,18 @@ const std::string& PermissionDeniedError::tool_name() const noexcept {
 
 const std::string& PermissionDeniedError::reason() const noexcept {
   return reason_;
+}
+
+std::string_view PermissionDeniedError::error_name() const noexcept {
+  return "PermissionDeniedError";
+}
+
+std::string_view PermissionDeniedError::error_category() const noexcept {
+  return "permission";
+}
+
+std::string_view PermissionDeniedError::error_code() const noexcept {
+  return "permission-denied";
 }
 
 Value::Value() : storage_(nullptr) {}
@@ -240,12 +386,7 @@ void write_json_file(const std::filesystem::path& path, const Value& value, int 
 std::string now_iso8601() {
   const auto now = std::chrono::system_clock::now();
   const auto time = std::chrono::system_clock::to_time_t(now);
-  std::tm tm{};
-#if defined(_WIN32)
-  gmtime_s(&tm, &time);
-#else
-  gmtime_r(&time, &tm);
-#endif
+  const std::tm tm = utc_time_from_epoch(time);
   std::ostringstream out;
   out << std::put_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
   return out.str();

@@ -2,50 +2,63 @@
   "version": 1,
   "cases": [
     {
-      "name": "agent runner config defaults",
-      "target": "agentRunnerConfig",
+      "name": "event bus defaults to no sinks and raw payloads disabled",
+      "subject": "eventBus",
       "expected": {
-        "maxIterations": 8,
-        "enablePlanning": true,
-        "advertiseSkills": true,
-        "lazyToolMode": false,
-        "defaultSkills": [],
-        "forcedVisibleTools": [],
-        "skillModelConflictPolicy": "error",
-        "skillEffortConflictPolicy": "error",
-        "hasAdapter": false,
-        "hasThinkingAdapter": false,
-        "hasCritiqueAdapter": false,
-        "hasMemoryStore": false,
-        "hasScratchStore": false,
-        "hasPlanner": false
+        "includeRaw": false,
+        "sinks": []
       }
     },
     {
-      "name": "agent loop config defaults",
-      "target": "agentLoopConfig",
-      "expected": {
-        "systemPrompt": "",
-        "maxIterations": 8,
-        "hasModel": false,
-        "hasToolRegistry": false,
-        "hasToolExecutor": false,
-        "hasContextManager": false,
-        "hasEventBus": false
-      }
+      "name": "default hook logger emits trace success and warn failure events",
+      "subject": "defaultHookLogger",
+      "expected": [
+        {
+          "level": "trace",
+          "message": "hook.tool.success",
+          "payload": {
+            "toolName": "contract.defaults"
+          }
+        },
+        {
+          "level": "warn",
+          "message": "hook.tool.error",
+          "payload": {
+            "toolName": "contract.defaults",
+            "message": "default failure",
+            "name": "Error"
+          }
+        }
+      ]
     },
     {
-      "name": "model settings defaults",
-      "target": "modelSettings",
+      "name": "tool definition defaults are closed and low risk",
+      "subject": "toolDefinition",
       "expected": {
-        "model": "",
-        "temperature": null,
-        "maxOutputTokens": null,
-        "reasoning": null,
-        "cacheStrategy": "none",
-        "cacheScope": "system-and-tools",
-        "cacheKey": "",
-        "extra": {}
+        "descriptor": {
+          "name": "contract.defaults",
+          "description": "",
+          "inputSchema": {},
+          "readOnly": false,
+          "mutatesFiles": false,
+          "interactive": false,
+          "longRunning": false,
+          "batchable": false,
+          "concurrencyKey": "",
+          "sideEffectLevel": "unknown"
+        },
+        "capabilities": [],
+        "riskLevel": "low",
+        "tags": [],
+        "builtin": false,
+        "description": "",
+        "readOnly": false,
+        "mutatesFiles": false,
+        "interactive": false,
+        "longRunning": false,
+        "batchable": false,
+        "concurrencyKey": "",
+        "sideEffectLevel": "unknown"
       }
     }
   ]

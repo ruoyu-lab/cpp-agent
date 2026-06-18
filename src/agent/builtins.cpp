@@ -1,4 +1,4 @@
-#include "agent/agent.hpp"
+#include "agent/app_api.hpp"
 #include "detail/helpers.hpp"
 
 #include <algorithm>
@@ -154,6 +154,11 @@ WebFetchedPage fetch_web_page_with_default(NativeWebPageFetcher* fetcher, const 
   return default_fetcher.fetch(request);
 }
 
+template <typename T>
+T* get_tool_service(ToolExecutionContext& context, const ToolServiceToken<T>& token) {
+  return context.service_refs.service_view.get(token);
+}
+
 // ---------------------------------------------------------------------------
 // Scratchpad / todo policy constants. The actual storage lives behind the
 // injected `ScratchStore` interface (see `agent/scratch.hpp`). Todo lists are
@@ -165,21 +170,73 @@ constexpr const char* kTodoInternalPrefix = "__todo:";
 constexpr const char* kTodoListKey = "__todo:list";
 
 ScratchStore& require_scratch_store(ToolExecutionContext& context) {
-  if (!context.service_refs.scratch_store) {
+  auto* store = get_tool_service(context, kToolServiceScratchStore);
+  if (!store) {
     throw ConfigurationError(
         "Scratch / todo tools require an injected ScratchStore. "
-        "Set AgentRunnerConfig::scratch_store or ToolExecutionServices::scratch_store "
+        "Register kToolServiceScratchStore in ToolExecutionServices::service_container "
         "before invoking these tools.");
   }
-  return *context.service_refs.scratch_store;
+  return *store;
 }
 
 std::string resolve_session_id(ToolExecutionContext& context) {
-  return context.service_refs.session ? context.service_refs.session->session_id() : std::string("_");
+  auto* session = get_tool_service(context, kToolServiceSessionMemory);
+  return session ? session->session_id() : std::string("_");
 }
 
 bool is_valid_todo_status(const std::string& status) {
   return status == "pending" || status == "in_progress" || status == "completed" || status == "cancelled";
+}
+
+ToolRunListOptions tool_run_list_options_from_input(const Value& input) {
+  ToolRunListOptions options;
+  const auto status = input.at("status").as_string();
+  if (!status.empty()) {
+    options.status = tool_run_status_from_string(status);
+  }
+  options.kind = input.at("kind").as_string();
+  options.tool_name = input.at("toolName").as_string(input.at("tool_name").as_string());
+  options.active_only = input.at("activeOnly").as_bool(input.at("active_only").as_bool(false));
+  options.limit = static_cast<std::size_t>(std::max<long long>(0, input.at("limit").as_integer(100)));
+  return options;
+}
+
+ToolRunReadOptions tool_run_read_options_from_input(const Value& input) {
+  ToolRunReadOptions options;
+  options.cursor = static_cast<std::uint64_t>(std::max<long long>(0, input.at("cursor").as_integer(0)));
+  options.limit = static_cast<std::size_t>(std::max<long long>(0, input.at("limit").as_integer(100)));
+  options.tail = static_cast<std::size_t>(std::max<long long>(0, input.at("tail").as_integer(0)));
+  options.include_events = input.at("includeEvents").as_bool(input.at("include_events").as_bool(true));
+  options.include_logs = input.at("includeLogs").as_bool(input.at("include_logs").as_bool(true));
+  return options;
+}
+
+ToolRunWaitOptions tool_run_wait_options_from_input(const Value& input) {
+  ToolRunWaitOptions options;
+  const auto until = input.at("until").as_string("terminal");
+  options.until = until == "ready" ? ToolRunWaitUntil::Ready : ToolRunWaitUntil::Terminal;
+  const auto status = input.at("status").as_string();
+  if (!status.empty()) {
+    options.status = tool_run_status_from_string(status);
+  }
+  if (input.contains("ready")) {
+    options.ready = input.at("ready").as_bool();
+  }
+  if (input.contains("terminal")) {
+    options.terminal = input.at("terminal").as_bool();
+  }
+  options.timeout_ms = static_cast<int>(std::max<long long>(0, input.at("timeoutMs").as_integer(
+                                                        input.at("timeout_ms").as_integer(0))));
+  return options;
+}
+
+std::string tool_run_id_from_input(const Value& input) {
+  return input.at("runId").as_string(input.at("run_id").as_string());
+}
+
+Value tool_runs_unavailable_value() {
+  return Value::object({{"found", false}, {"reason", "tool_runs_unavailable"}});
 }
 
 Value::Array load_todo_list(ScratchStore& store, const std::string& session) {
@@ -415,12 +472,13 @@ std::vector<ToolDefinition> create_core_builtin_tools() {
             return schema;
           }(),
           .capabilities = {"tool.discover"},
+          .service_requirements = {tool_service_requirement(kToolServiceToolRegistry, true)},
           .risk_level = ToolRiskLevel::Low,
           .tags = {"core", "tool", "discover"},
           .bundle = "core",
           .builtin = true,
           .execute = [](const Value& input, ToolExecutionContext& context) -> ToolInvokeResult {
-            ToolRegistry* registry = context.service_refs.registry;
+            ToolRegistry* registry = get_tool_service(context, kToolServiceToolRegistry);
             if (!registry) {
               return Value::object({{"tools", Value::array({})}});
             }
@@ -467,12 +525,13 @@ std::vector<ToolDefinition> create_core_builtin_tools() {
             return schema;
           }(),
           .capabilities = {"tool.discover"},
+          .service_requirements = {tool_service_requirement(kToolServiceToolRegistry, true)},
           .risk_level = ToolRiskLevel::Low,
           .tags = {"core", "tool", "discover"},
           .bundle = "core",
           .builtin = true,
           .execute = [](const Value& input, ToolExecutionContext& context) -> ToolInvokeResult {
-            ToolRegistry* registry = context.service_refs.registry;
+            ToolRegistry* registry = get_tool_service(context, kToolServiceToolRegistry);
             if (!registry) {
               return Value::object({{"found", false}});
             }
@@ -494,6 +553,177 @@ std::vector<ToolDefinition> create_core_builtin_tools() {
                 {"bundle", tool.bundle},
                 {"tags", Value(tags)},
             });
+          },
+      }),
+      define_tool(ToolDefinition{
+          .name = "tool.run.list",
+          .description = "List background tool runs tracked by the framework.",
+          .input_schema = [] {
+            JsonSchema schema;
+            schema.type = JsonSchemaType::Object;
+            schema.properties["status"].type = JsonSchemaType::String;
+            schema.properties["kind"].type = JsonSchemaType::String;
+            schema.properties["toolName"].type = JsonSchemaType::String;
+            schema.properties["activeOnly"].type = JsonSchemaType::Boolean;
+            schema.properties["limit"].type = JsonSchemaType::Integer;
+            return schema;
+          }(),
+          .capabilities = {"tool.run.read"},
+          .service_requirements = {tool_service_requirement(kToolServiceToolRunManager, true)},
+          .risk_level = ToolRiskLevel::Low,
+          .tags = {"core", "tool", "run"},
+          .bundle = "core",
+          .builtin = true,
+          .read_only = true,
+          .side_effect_level = "read-only",
+          .execute = [](const Value& input, ToolExecutionContext& context) -> ToolInvokeResult {
+            auto* tool_runs = get_tool_service(context, kToolServiceToolRunManager);
+            if (!tool_runs) {
+              return Value::object({{"runs", Value::array({})}, {"reason", "tool_runs_unavailable"}});
+            }
+            return Value::object({{"runs", tool_run_snapshots_to_value(tool_runs->list(
+                                                 tool_run_list_options_from_input(input)))}});
+          },
+      }),
+      define_tool(ToolDefinition{
+          .name = "tool.run.status",
+          .description = "Return the current status for one background tool run.",
+          .input_schema = [] {
+            JsonSchema schema;
+            schema.type = JsonSchemaType::Object;
+            schema.required = {"runId"};
+            schema.properties["runId"].type = JsonSchemaType::String;
+            return schema;
+          }(),
+          .capabilities = {"tool.run.read"},
+          .service_requirements = {tool_service_requirement(kToolServiceToolRunManager, true)},
+          .risk_level = ToolRiskLevel::Low,
+          .tags = {"core", "tool", "run"},
+          .bundle = "core",
+          .builtin = true,
+          .read_only = true,
+          .side_effect_level = "read-only",
+          .execute = [](const Value& input, ToolExecutionContext& context) -> ToolInvokeResult {
+            auto* tool_runs = get_tool_service(context, kToolServiceToolRunManager);
+            if (!tool_runs) {
+              return tool_runs_unavailable_value();
+            }
+            auto snapshot = tool_runs->get(tool_run_id_from_input(input));
+            if (!snapshot) {
+              return Value::object({{"found", false}});
+            }
+            return Value::object({{"found", true}, {"run", tool_run_snapshot_to_value(*snapshot)}});
+          },
+      }),
+      define_tool(ToolDefinition{
+          .name = "tool.run.read",
+          .description = "Read events or logs from a background tool run.",
+          .input_schema = [] {
+            JsonSchema schema;
+            schema.type = JsonSchemaType::Object;
+            schema.required = {"runId"};
+            schema.properties["runId"].type = JsonSchemaType::String;
+            schema.properties["cursor"].type = JsonSchemaType::Integer;
+            schema.properties["limit"].type = JsonSchemaType::Integer;
+            schema.properties["tail"].type = JsonSchemaType::Integer;
+            schema.properties["includeEvents"].type = JsonSchemaType::Boolean;
+            schema.properties["includeLogs"].type = JsonSchemaType::Boolean;
+            return schema;
+          }(),
+          .capabilities = {"tool.run.read"},
+          .service_requirements = {tool_service_requirement(kToolServiceToolRunManager, true)},
+          .risk_level = ToolRiskLevel::Low,
+          .tags = {"core", "tool", "run"},
+          .bundle = "core",
+          .builtin = true,
+          .read_only = true,
+          .side_effect_level = "read-only",
+          .execute = [](const Value& input, ToolExecutionContext& context) -> ToolInvokeResult {
+            auto* tool_runs = get_tool_service(context, kToolServiceToolRunManager);
+            if (!tool_runs) {
+              return tool_runs_unavailable_value();
+            }
+            const auto run_id = tool_run_id_from_input(input);
+            if (!tool_runs->get(run_id)) {
+              return Value::object({{"found", false}});
+            }
+            auto output = tool_run_read_result_to_value(
+                tool_runs->read(run_id, tool_run_read_options_from_input(input)));
+            output["found"] = true;
+            return output;
+          },
+      }),
+      define_tool(ToolDefinition{
+          .name = "tool.run.wait",
+          .description = "Wait briefly for a background tool run to reach a status.",
+          .input_schema = [] {
+            JsonSchema schema;
+            schema.type = JsonSchemaType::Object;
+            schema.required = {"runId"};
+            schema.properties["runId"].type = JsonSchemaType::String;
+            schema.properties["status"].type = JsonSchemaType::String;
+            schema.properties["ready"].type = JsonSchemaType::Boolean;
+            schema.properties["terminal"].type = JsonSchemaType::Boolean;
+            schema.properties["until"].type = JsonSchemaType::String;
+            schema.properties["timeoutMs"].type = JsonSchemaType::Integer;
+            return schema;
+          }(),
+          .capabilities = {"tool.run.read"},
+          .service_requirements = {tool_service_requirement(kToolServiceToolRunManager, true)},
+          .risk_level = ToolRiskLevel::Low,
+          .tags = {"core", "tool", "run"},
+          .bundle = "core",
+          .builtin = true,
+          .read_only = true,
+          .long_running = true,
+          .concurrency_key = "tool-run",
+          .side_effect_level = "read-only",
+          .execute = [](const Value& input, ToolExecutionContext& context) -> ToolInvokeResult {
+            auto* tool_runs = get_tool_service(context, kToolServiceToolRunManager);
+            if (!tool_runs) {
+              return tool_runs_unavailable_value();
+            }
+            const auto run_id = tool_run_id_from_input(input);
+            if (!tool_runs->get(run_id)) {
+              return Value::object({{"found", false}});
+            }
+            auto snapshot = tool_runs->wait(run_id, tool_run_wait_options_from_input(input));
+            if (!snapshot) {
+              return Value::object({{"found", false}, {"reason", "timeout"}});
+            }
+            return Value::object({{"found", true}, {"run", tool_run_snapshot_to_value(*snapshot)}});
+          },
+      }),
+      define_tool(ToolDefinition{
+          .name = "tool.run.cancel",
+          .description = "Cancel a background tool run.",
+          .input_schema = [] {
+            JsonSchema schema;
+            schema.type = JsonSchemaType::Object;
+            schema.required = {"runId"};
+            schema.properties["runId"].type = JsonSchemaType::String;
+            schema.properties["reason"].type = JsonSchemaType::String;
+            return schema;
+          }(),
+          .capabilities = {"tool.run.control"},
+          .service_requirements = {tool_service_requirement(kToolServiceToolRunManager, true)},
+          .risk_level = ToolRiskLevel::Medium,
+          .tags = {"core", "tool", "run"},
+          .bundle = "core",
+          .builtin = true,
+          .concurrency_key = "tool-run",
+          .side_effect_level = "external",
+          .execute = [](const Value& input, ToolExecutionContext& context) -> ToolInvokeResult {
+            auto* tool_runs = get_tool_service(context, kToolServiceToolRunManager);
+            if (!tool_runs) {
+              return tool_runs_unavailable_value();
+            }
+            const auto run_id = tool_run_id_from_input(input);
+            if (!tool_runs->get(run_id)) {
+              return Value::object({{"found", false}});
+            }
+            auto snapshot = tool_runs->cancel(run_id, input.at("reason").as_string());
+            return Value::object({{"found", true}, {"run", tool_run_snapshot_to_value(snapshot)}});
           },
       }),
       define_tool(ToolDefinition{
@@ -618,6 +848,7 @@ std::vector<ToolDefinition> create_local_builtin_tools(std::vector<std::string> 
                          "contents have changed).",
           .input_schema = write_schema,
           .capabilities = {"fs.write"},
+          .service_requirements = {tool_service_requirement(kToolServiceHooks, true)},
           .risk_level = ToolRiskLevel::High,
           .builtin = true,
           .execute = [effective_roots](const Value& input, ToolExecutionContext& context) -> ToolInvokeResult {
@@ -626,7 +857,8 @@ std::vector<ToolDefinition> create_local_builtin_tools(std::vector<std::string> 
             const bool has_expected = input.contains("expectedSha256") &&
                                       !input.at("expectedSha256").is_null() &&
                                       !input.at("expectedSha256").as_string().empty();
-            if (context.service_refs.hooks && context.service_refs.hooks->before_fs_write) {
+            const HookSet* hooks = get_tool_service(context, kToolServiceHooks);
+            if (hooks && hooks->before_fs_write) {
               FsWriteHookContext hook_context;
               hook_context.target = ExecutionTarget::Tool;
               hook_context.trace_id = context.trace_context.trace_id;
@@ -635,7 +867,7 @@ std::vector<ToolDefinition> create_local_builtin_tools(std::vector<std::string> 
               hook_context.path = path;
               hook_context.content = content;
               hook_context.tool_name = "fs.writeText";
-              context.service_refs.hooks->before_fs_write(hook_context);
+              hooks->before_fs_write(hook_context);
             }
             if (has_expected) {
               const std::string expected = input.at("expectedSha256").as_string();
@@ -712,7 +944,28 @@ std::vector<ToolDefinition> create_local_builtin_tools(std::vector<std::string> 
                 truncated = trimmed.truncated;
               }
             }
+            Value preview = Value::object({
+                {"path", path},
+                {"diff", diff_text},
+                {"newFile", !was_existing},
+                {"linesAdded", lines_added},
+                {"linesRemoved", lines_removed},
+            });
+            if (binary) {
+              preview["binary"] = true;
+            }
+            if (truncated) {
+              preview["truncated"] = true;
+            }
+            emit_tool_progress(context, "file.edit.preview", preview);
             write_text_file(path, content);
+            emit_tool_progress(context, "file.edit.applied",
+                               Value::object({
+                                   {"path", path},
+                                   {"newFile", !was_existing},
+                                   {"linesAdded", lines_added},
+                                   {"linesRemoved", lines_removed},
+                               }));
             Value result = Value::object({
                 {"ok", true},
                 {"newFile", !was_existing},
@@ -862,6 +1115,7 @@ std::vector<ToolDefinition> create_developer_builtin_tools(DeveloperProcessExecu
           .description = "Execute a local process.",
           .input_schema = exec_schema,
           .capabilities = {"process.exec"},
+          .service_requirements = {tool_service_requirement(kToolServiceSandboxScope, true)},
           .risk_level = ToolRiskLevel::High,
           .tags = {"developer", "process"},
           .bundle = "developer",
@@ -881,14 +1135,18 @@ std::vector<ToolDefinition> create_developer_builtin_tools(DeveloperProcessExecu
             request.args = string_array_from_value(input.at("args"));
             request.cwd = input.at("cwd").as_string();
             request.cancellation = context.cancellation;
+            request.emit_progress = context.emit_progress;
             // Propagate the effective sandbox request so the business
             // executor picks the matching platform isolation mechanism.
             // Contract has already been enforced by the framework; the active
             // scope (if any) carries the request the executor entered with.
-            request.sandbox_request = context.service_refs.sandbox_scope
-                                          ? context.service_refs.sandbox_scope->request()
-                                          : SandboxRequest{};
+            auto* sandbox_scope = get_tool_service(context, kToolServiceSandboxScope);
+            request.sandbox_request = sandbox_scope ? sandbox_scope->request() : SandboxRequest{};
             auto result = executor(request);
+            emit_tool_progress(context, "terminal.exit",
+                               Value::object({
+                                   {"exitCode", result.exit_code},
+                               }));
             return Value::object({
                 {"stdout", truncated_output_to_value(truncate_for_model(result.stdout_text))},
                 {"stderr", truncated_output_to_value(truncate_for_model(result.stderr_text))},
@@ -1059,13 +1317,15 @@ std::vector<ToolDefinition> create_browser_builtin_tools(BrowserRenderer* render
           .description = "Render a page through a configured headless browser.",
           .input_schema = render_schema,
           .capabilities = {"browser.read"},
+          .service_requirements = {tool_service_requirement(kToolServiceBrowserRenderer, true)},
           .risk_level = ToolRiskLevel::Medium,
           .tags = {"browser", "render"},
           .bundle = "browser",
           .builtin = true,
           .execute = [renderer, make_request, require_renderer](const Value& input,
                                                                  ToolExecutionContext& context) -> ToolInvokeResult {
-            BrowserRenderer* active_renderer = renderer ? renderer : context.service_refs.browser_renderer;
+            BrowserRenderer* active_renderer = renderer ? renderer : get_tool_service(
+                context, kToolServiceBrowserRenderer);
             return browser_render_result_to_value(
                 require_renderer(active_renderer).render(make_request(input, false, context.cancellation)));
           },
@@ -1075,13 +1335,15 @@ std::vector<ToolDefinition> create_browser_builtin_tools(BrowserRenderer* render
           .description = "Extract rendered text from a page or selector.",
           .input_schema = render_schema,
           .capabilities = {"browser.read"},
+          .service_requirements = {tool_service_requirement(kToolServiceBrowserRenderer, true)},
           .risk_level = ToolRiskLevel::Medium,
           .tags = {"browser", "extract"},
           .bundle = "browser",
           .builtin = true,
           .execute = [renderer, make_request, require_renderer](const Value& input,
                                                                  ToolExecutionContext& context) -> ToolInvokeResult {
-            BrowserRenderer* active_renderer = renderer ? renderer : context.service_refs.browser_renderer;
+            BrowserRenderer* active_renderer = renderer ? renderer : get_tool_service(
+                context, kToolServiceBrowserRenderer);
             return browser_render_result_to_value(
                 require_renderer(active_renderer).render(make_request(input, false, context.cancellation)));
           },
@@ -1091,13 +1353,15 @@ std::vector<ToolDefinition> create_browser_builtin_tools(BrowserRenderer* render
           .description = "Capture a screenshot of a page through a configured headless browser.",
           .input_schema = render_schema,
           .capabilities = {"browser.screenshot"},
+          .service_requirements = {tool_service_requirement(kToolServiceBrowserRenderer, true)},
           .risk_level = ToolRiskLevel::High,
           .tags = {"browser", "screenshot"},
           .bundle = "browser",
           .builtin = true,
           .execute = [renderer, make_request, require_renderer](const Value& input,
                                                                  ToolExecutionContext& context) -> ToolInvokeResult {
-            BrowserRenderer* active_renderer = renderer ? renderer : context.service_refs.browser_renderer;
+            BrowserRenderer* active_renderer = renderer ? renderer : get_tool_service(
+                context, kToolServiceBrowserRenderer);
             return browser_render_result_to_value(
                 require_renderer(active_renderer).render(make_request(input, true, context.cancellation)));
           },
@@ -1136,6 +1400,8 @@ std::vector<ToolDefinition> create_web_builtin_tools(WebSearchProviderRegistry* 
           .description = "Search the web using a configured search provider.",
           .input_schema = search_schema,
           .capabilities = {"network.search"},
+          .service_requirements = {tool_service_requirement(kToolServiceWebSearchRegistry, true),
+                                   tool_service_requirement(kToolServiceDefaultSearchProvider, true)},
           .risk_level = ToolRiskLevel::Medium,
           .tags = {"web", "search"},
           .bundle = "web",
@@ -1143,9 +1409,14 @@ std::vector<ToolDefinition> create_web_builtin_tools(WebSearchProviderRegistry* 
           .execute = [search_registry, default_search_provider = std::move(default_search_provider)](
                          const Value& input, ToolExecutionContext& context) -> ToolInvokeResult {
             WebSearchProviderRegistry* active_registry =
-                search_registry ? search_registry : context.service_refs.web_search_registry;
+                search_registry ? search_registry : get_tool_service(
+                    context, kToolServiceWebSearchRegistry);
+            auto* configured_default_provider = get_tool_service(
+                context, kToolServiceDefaultSearchProvider);
             const std::string active_default_provider = default_search_provider.empty()
-                                                            ? context.service_refs.default_search_provider
+                                                            ? (configured_default_provider
+                                                                   ? *configured_default_provider
+                                                                   : std::string{})
                                                             : default_search_provider;
             const auto& provider = resolve_web_search_provider(active_registry, active_default_provider,
                                                                input.at("provider").as_string());
@@ -1166,6 +1437,7 @@ std::vector<ToolDefinition> create_web_builtin_tools(WebSearchProviderRegistry* 
           .description = "Fetch a web page and extract normalized content.",
           .input_schema = fetch_schema,
           .capabilities = {"network.http.read"},
+          .service_requirements = {tool_service_requirement(kToolServiceWebFetcher, true)},
           .risk_level = ToolRiskLevel::Medium,
           .tags = {"web", "fetch"},
           .bundle = "web",
@@ -1178,7 +1450,8 @@ std::vector<ToolDefinition> create_web_builtin_tools(WebSearchProviderRegistry* 
             }
             request.extract = input.at("extract").as_string("auto");
             request.cancellation = context.cancellation;
-            NativeWebPageFetcher* active_fetcher = fetcher ? fetcher : context.service_refs.web_fetcher;
+            NativeWebPageFetcher* active_fetcher = fetcher ? fetcher : get_tool_service(
+                context, kToolServiceWebFetcher);
             Value page = web_fetched_page_to_value(fetch_web_page_with_default(active_fetcher, request));
             if (page.is_object() && page.contains("text") && page.at("text").is_string()) {
               page["text"] = truncated_output_to_value(truncate_for_model(page.at("text").as_string()));
@@ -1190,8 +1463,7 @@ std::vector<ToolDefinition> create_web_builtin_tools(WebSearchProviderRegistry* 
 }
 
 std::vector<ToolDefinition> create_agent_builtin_tools(SessionMemory* session,
-                                                       KnowledgeBase* knowledge_base,
-                                                       KnowledgeBaseManager* knowledge_manager) {
+                                                       KnowledgeContextProvider* knowledge) {
   JsonSchema search_schema;
   search_schema.type = JsonSchemaType::Object;
   search_schema.required = {"query"};
@@ -1203,12 +1475,14 @@ std::vector<ToolDefinition> create_agent_builtin_tools(SessionMemory* session,
           .name = "session.snapshot",
           .description = "Read the current session snapshot.",
           .capabilities = {"memory.read"},
+          .service_requirements = {tool_service_requirement(kToolServiceSessionMemory, true)},
           .risk_level = ToolRiskLevel::Low,
           .tags = {"agent", "session", "memory"},
           .bundle = "agent",
           .builtin = true,
           .execute = [session](const Value&, ToolExecutionContext& context) -> ToolInvokeResult {
-            SessionMemory* active_session = session ? session : context.service_refs.session;
+            SessionMemory* active_session = session ? session : get_tool_service(
+                context, kToolServiceSessionMemory);
             if (!active_session) {
               return Value::object({{"session", Value()}});
             }
@@ -1220,32 +1494,25 @@ std::vector<ToolDefinition> create_agent_builtin_tools(SessionMemory* session,
           .description = "Search the configured knowledge base.",
           .input_schema = search_schema,
           .capabilities = {"knowledge.read"},
+          .service_requirements = {tool_service_requirement(kToolServiceKnowledgeProvider, true)},
           .risk_level = ToolRiskLevel::Low,
           .tags = {"agent", "knowledge"},
           .bundle = "agent",
           .builtin = true,
-          .execute = [knowledge_base, knowledge_manager](const Value& input,
-                                                         ToolExecutionContext& context) -> ToolInvokeResult {
+          .execute = [knowledge](const Value& input,
+                                 ToolExecutionContext& context) -> ToolInvokeResult {
             KnowledgeSearchOptions options;
             const auto requested_top_k = input.at("topK").as_integer(4);
             if (requested_top_k <= 0) {
               return Value::object({{"hits", Value::array({})}});
             }
             options.top_k = static_cast<std::size_t>(requested_top_k);
-            std::vector<KnowledgeSearchHit> hits;
-            KnowledgeBase* active_knowledge_base =
-                knowledge_base ? knowledge_base : context.service_refs.knowledge_base;
-            KnowledgeBaseManager* active_knowledge_manager =
-                knowledge_manager ? knowledge_manager : context.service_refs.knowledge_base_manager;
-            if (active_knowledge_base) {
-              hits = active_knowledge_base->search(input.at("query").as_string(), options);
-            } else if (active_knowledge_manager) {
-              ManagerSearchOptions manager_options;
-              manager_options.top_k = options.top_k;
-              hits = active_knowledge_manager->search(input.at("query").as_string(), manager_options);
-            } else {
+            KnowledgeContextProvider* active_knowledge =
+                knowledge ? knowledge : get_tool_service(context, kToolServiceKnowledgeProvider);
+            if (!active_knowledge) {
               return Value::object({{"hits", Value::array({})}});
             }
+            auto hits = active_knowledge->search(input.at("query").as_string(), std::move(options));
             return Value::object({{"hits", knowledge_hits_to_value(hits)}});
           },
       }),
@@ -1264,12 +1531,14 @@ std::vector<ToolDefinition> create_workflow_builtin_tools(WorkflowEngine* engine
           .description = "Load a workflow run state by id.",
           .input_schema = run_schema,
           .capabilities = {"workflow.read"},
+          .service_requirements = {tool_service_requirement(kToolServiceWorkflowEngine, true)},
           .risk_level = ToolRiskLevel::Low,
           .tags = {"workflow", "state"},
           .bundle = "workflow",
           .builtin = true,
           .execute = [engine](const Value& input, ToolExecutionContext& context) -> ToolInvokeResult {
-            WorkflowEngine* active_engine = engine ? engine : context.service_refs.workflow_engine;
+            WorkflowEngine* active_engine = engine ? engine : get_tool_service(
+                context, kToolServiceWorkflowEngine);
             if (!active_engine || !active_engine->store()) {
               return Value();
             }
@@ -1282,12 +1551,14 @@ std::vector<ToolDefinition> create_workflow_builtin_tools(WorkflowEngine* engine
           .description = "Resume a workflow run from persisted state.",
           .input_schema = run_schema,
           .capabilities = {"workflow.resume"},
+          .service_requirements = {tool_service_requirement(kToolServiceWorkflowEngine, true)},
           .risk_level = ToolRiskLevel::Medium,
           .tags = {"workflow", "resume"},
           .bundle = "workflow",
           .builtin = true,
           .execute = [engine](const Value& input, ToolExecutionContext& context) -> ToolInvokeResult {
-            WorkflowEngine* active_engine = engine ? engine : context.service_refs.workflow_engine;
+            WorkflowEngine* active_engine = engine ? engine : get_tool_service(
+                context, kToolServiceWorkflowEngine);
             if (!active_engine) {
               return Value();
             }
@@ -1299,12 +1570,14 @@ std::vector<ToolDefinition> create_workflow_builtin_tools(WorkflowEngine* engine
           .description = "List checkpoints for a persisted workflow run.",
           .input_schema = run_schema,
           .capabilities = {"workflow.read"},
+          .service_requirements = {tool_service_requirement(kToolServiceWorkflowEngine, true)},
           .risk_level = ToolRiskLevel::Low,
           .tags = {"workflow", "checkpoint"},
           .bundle = "workflow",
           .builtin = true,
           .execute = [engine](const Value& input, ToolExecutionContext& context) -> ToolInvokeResult {
-            WorkflowEngine* active_engine = engine ? engine : context.service_refs.workflow_engine;
+            WorkflowEngine* active_engine = engine ? engine : get_tool_service(
+                context, kToolServiceWorkflowEngine);
             if (!active_engine || !active_engine->store()) {
               return Value::array({});
             }
@@ -1363,6 +1636,8 @@ std::vector<ToolDefinition> create_state_builtin_tools() {
           .description = "Store a value in the per-session scratchpad under the given key.",
           .input_schema = scratch_set_schema,
           .capabilities = {"scratch.write"},
+          .service_requirements = {tool_service_requirement(kToolServiceScratchStore),
+                                   tool_service_requirement(kToolServiceSessionMemory, true)},
           .risk_level = ToolRiskLevel::Low,
           .tags = {"state", "scratch"},
           .bundle = "state",
@@ -1386,6 +1661,8 @@ std::vector<ToolDefinition> create_state_builtin_tools() {
           .description = "Read a value from the per-session scratchpad.",
           .input_schema = scratch_key_schema,
           .capabilities = {"scratch.read"},
+          .service_requirements = {tool_service_requirement(kToolServiceScratchStore),
+                                   tool_service_requirement(kToolServiceSessionMemory, true)},
           .risk_level = ToolRiskLevel::Low,
           .tags = {"state", "scratch"},
           .bundle = "state",
@@ -1406,6 +1683,8 @@ std::vector<ToolDefinition> create_state_builtin_tools() {
           .description = "List per-session scratchpad entries, optionally filtered by key prefix.",
           .input_schema = scratch_list_schema,
           .capabilities = {"scratch.read"},
+          .service_requirements = {tool_service_requirement(kToolServiceScratchStore),
+                                   tool_service_requirement(kToolServiceSessionMemory, true)},
           .risk_level = ToolRiskLevel::Low,
           .tags = {"state", "scratch"},
           .bundle = "state",
@@ -1434,6 +1713,8 @@ std::vector<ToolDefinition> create_state_builtin_tools() {
           .description = "Delete a key from the per-session scratchpad.",
           .input_schema = scratch_key_schema,
           .capabilities = {"scratch.write"},
+          .service_requirements = {tool_service_requirement(kToolServiceScratchStore),
+                                   tool_service_requirement(kToolServiceSessionMemory, true)},
           .risk_level = ToolRiskLevel::Low,
           .tags = {"state", "scratch"},
           .bundle = "state",
@@ -1455,6 +1736,8 @@ std::vector<ToolDefinition> create_state_builtin_tools() {
                          "createdAt/updatedAt timestamps.",
           .input_schema = todo_create_schema,
           .capabilities = {"scratch.write"},
+          .service_requirements = {tool_service_requirement(kToolServiceScratchStore),
+                                   tool_service_requirement(kToolServiceSessionMemory, true)},
           .risk_level = ToolRiskLevel::Low,
           .tags = {"state", "todo"},
           .bundle = "state",
@@ -1493,6 +1776,8 @@ std::vector<ToolDefinition> create_state_builtin_tools() {
           .description = "Update the status and/or text of a todo item by id.",
           .input_schema = todo_update_schema,
           .capabilities = {"scratch.write"},
+          .service_requirements = {tool_service_requirement(kToolServiceScratchStore),
+                                   tool_service_requirement(kToolServiceSessionMemory, true)},
           .risk_level = ToolRiskLevel::Low,
           .tags = {"state", "todo"},
           .bundle = "state",
@@ -1528,6 +1813,8 @@ std::vector<ToolDefinition> create_state_builtin_tools() {
           .description = "List per-session todo items, optionally filtered by status.",
           .input_schema = todo_list_schema,
           .capabilities = {"scratch.read"},
+          .service_requirements = {tool_service_requirement(kToolServiceScratchStore),
+                                   tool_service_requirement(kToolServiceSessionMemory, true)},
           .risk_level = ToolRiskLevel::Low,
           .tags = {"state", "todo"},
           .bundle = "state",
@@ -1546,6 +1833,8 @@ std::vector<ToolDefinition> create_state_builtin_tools() {
           .description = "Mark a todo item as completed. Convenience wrapper over todo.update.",
           .input_schema = todo_id_schema,
           .capabilities = {"scratch.write"},
+          .service_requirements = {tool_service_requirement(kToolServiceScratchStore),
+                                   tool_service_requirement(kToolServiceSessionMemory, true)},
           .risk_level = ToolRiskLevel::Low,
           .tags = {"state", "todo"},
           .bundle = "state",
@@ -1568,6 +1857,12 @@ std::vector<ToolDefinition> create_state_builtin_tools() {
           },
       }),
   };
+}
+
+std::vector<ToolDefinition> create_media_generation_builtin_tools(
+    MediaGenerationProviderRegistry* registry,
+    MediaGenerationToolOptions options) {
+  return create_media_generation_tools(registry, std::move(options));
 }
 
 std::vector<ToolBundleProvider> create_builtin_tool_bundle_providers() {
@@ -1674,6 +1969,18 @@ std::vector<ToolBundleProvider> create_builtin_tool_bundle_providers() {
               .default_risk_profile = "low",
           },
           .create_tools = [] { return create_state_builtin_tools(); },
+      },
+      ToolBundleProvider{
+          .metadata = ToolBundleMetadata{
+              .name = "media",
+              .tier = "portable",
+              .title = "Media Generation Builtin Tools",
+              .description = "Image, video, and audio generation tools backed by pluggable providers.",
+              .tags = {"builtin", "media", "generation"},
+              .capabilities = {"media.generate"},
+              .default_risk_profile = "medium",
+          },
+          .create_tools = [] { return create_media_generation_builtin_tools(); },
       },
   };
 }

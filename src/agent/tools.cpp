@@ -1,14 +1,17 @@
-#include "agent/agent.hpp"
+#include "agent/tools_api.hpp"
+#include "agent/shell_classifier.hpp"
 #include "detail/helpers.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <sstream>
 
@@ -117,13 +120,270 @@ bool matches_scalar(const T& actual, const std::vector<T>& expected) {
   return expected.empty() || contains_value(expected, actual);
 }
 
+template <typename T>
+bool matches_any_typed(const std::vector<T>& actual, const std::vector<T>& expected) {
+  if (expected.empty()) {
+    return true;
+  }
+  return std::any_of(expected.begin(), expected.end(), [&](const T& value) {
+    return contains_value(actual, value);
+  });
+}
+
+bool matches_permission_resources(const std::vector<PermissionResource>& resources,
+                                  const std::vector<PermissionResourceMatcher>& matchers) {
+  if (matchers.empty()) {
+    return true;
+  }
+  return std::any_of(matchers.begin(), matchers.end(), [&](const PermissionResourceMatcher& matcher) {
+    return std::any_of(resources.begin(), resources.end(), [&](const PermissionResource& resource) {
+      return permission_resource_matches(resource, matcher);
+    });
+  });
+}
+
 bool matches_permission_rule(const PermissionRequest& request, const ToolPermissionMatcher& matcher) {
   return matches_scalar(request.tool_name, matcher.tool_names) &&
          matches_any(request.capabilities, matcher.capabilities) &&
+         matches_any_typed(request.actions, matcher.actions) &&
+         matches_permission_resources(request.resources, matcher.resource_matchers) &&
          matches_any(request.tags, matcher.tags) &&
          matches_scalar(request.risk_level, matcher.risk_levels) &&
          (!matcher.builtin || request.builtin == *matcher.builtin) &&
          matches_scalar(request.bundle, matcher.bundles);
+}
+
+bool matches_fine_grained_rule(const PermissionRequest& request,
+                               const FineGrainedPermissionMatcher& matcher) {
+  return matches_scalar(request.tool_name, matcher.tool_names) &&
+         matches_any(request.capabilities, matcher.capabilities) &&
+         matches_any_typed(request.actions, matcher.actions) &&
+         matches_permission_resources(request.resources, matcher.resource_matchers) &&
+         matches_any(request.tags, matcher.tags) &&
+         matches_scalar(request.risk_level, matcher.risk_levels) &&
+         (!matcher.builtin || request.builtin == *matcher.builtin) &&
+         matches_scalar(request.bundle, matcher.bundles);
+}
+
+int risk_value(ToolRiskLevel risk) {
+  switch (risk) {
+    case ToolRiskLevel::Low:
+      return 0;
+    case ToolRiskLevel::Medium:
+      return 1;
+    case ToolRiskLevel::High:
+      return 2;
+  }
+  return 0;
+}
+
+ToolRiskLevel max_risk(ToolRiskLevel left, ToolRiskLevel right) {
+  return risk_value(left) >= risk_value(right) ? left : right;
+}
+
+std::vector<PermissionAction> actions_for_capability(const std::string& capability) {
+  if (capability == "state.read") return {PermissionAction::StateRead};
+  if (capability == "state.write") return {PermissionAction::StateWrite};
+  if (capability == "network.search" || capability == "network.crawl" ||
+      capability == "network.http.read" || capability == "network.http.write") {
+    return {PermissionAction::NetworkConnect};
+  }
+  if (capability == "fs.read") return {PermissionAction::FilesystemRead};
+  if (capability == "fs.write") return {PermissionAction::FilesystemWrite};
+  if (capability == "browser.read") return {PermissionAction::BrowserRead};
+  if (capability == "browser.screenshot") return {PermissionAction::BrowserScreenshot};
+  if (capability == "repository.read") {
+    return {PermissionAction::RepositoryRead, PermissionAction::FilesystemRead};
+  }
+  if (capability == "process.env.read") return {PermissionAction::EnvRead};
+  if (capability == "process.exec") return {PermissionAction::ProcessExecute};
+  if (capability == "memory.read") return {PermissionAction::MemoryRead};
+  if (capability == "knowledge.read") return {PermissionAction::KnowledgeRead};
+  if (capability == "workflow.read") return {PermissionAction::WorkflowRead};
+  if (capability == "workflow.resume") return {PermissionAction::WorkflowResume};
+  if (capability == "workflow.respond") return {PermissionAction::WorkflowRespond};
+  if (capability == "workflow.control") return {PermissionAction::WorkflowControl};
+  if (capability == "tool.discover") return {PermissionAction::ToolDiscover};
+  return {PermissionAction::ToolInvoke};
+}
+
+PermissionResourceKind resource_kind_for_capability(const std::string& capability) {
+  if (capability.rfind("fs.", 0) == 0) return PermissionResourceKind::Filesystem;
+  if (capability.rfind("network.", 0) == 0) return PermissionResourceKind::Network;
+  if (capability.rfind("process.", 0) == 0) return PermissionResourceKind::Process;
+  if (capability.rfind("state.", 0) == 0) return PermissionResourceKind::State;
+  if (capability.rfind("memory.", 0) == 0) return PermissionResourceKind::Memory;
+  if (capability.rfind("knowledge.", 0) == 0) return PermissionResourceKind::Knowledge;
+  if (capability.rfind("browser.", 0) == 0) return PermissionResourceKind::Browser;
+  if (capability.rfind("repository.", 0) == 0) return PermissionResourceKind::Repository;
+  if (capability.rfind("workflow.", 0) == 0) return PermissionResourceKind::Workflow;
+  if (capability.rfind("tool.", 0) == 0) return PermissionResourceKind::Tool;
+  return PermissionResourceKind::Unknown;
+}
+
+void push_unique_action(std::vector<PermissionAction>& target, PermissionAction action) {
+  if (!contains_value(target, action)) {
+    target.push_back(action);
+  }
+}
+
+void append_actions(std::vector<PermissionAction>& target,
+                    const std::vector<PermissionAction>& actions) {
+  for (const auto action : actions) {
+    push_unique_action(target, action);
+  }
+}
+
+Value shell_findings_to_value(const ShellCommandClassification& classification) {
+  Value::Array findings;
+  for (const auto& finding : classification.findings) {
+    findings.push_back(Value::object({
+        {"category", finding.category},
+        {"riskLevel", finding.risk_level},
+        {"reason", finding.reason},
+        {"command", finding.command},
+    }));
+  }
+  return Value(std::move(findings));
+}
+
+Value strings_to_value_array(const std::vector<std::string>& values) {
+  Value::Array out;
+  for (const auto& value : values) {
+    out.emplace_back(value);
+  }
+  return Value(std::move(out));
+}
+
+Value permission_actions_to_value_array(const std::vector<PermissionAction>& actions) {
+  Value::Array out;
+  for (const auto action : actions) {
+    out.emplace_back(to_string(action));
+  }
+  return Value(std::move(out));
+}
+
+Value permission_resources_to_value_array(const std::vector<PermissionResource>& resources) {
+  Value::Array out;
+  for (const auto& resource : resources) {
+    out.push_back(permission_resource_to_value(resource));
+  }
+  return Value(std::move(out));
+}
+
+PermissionRequest build_permission_request(const ToolDefinition& tool,
+                                           const ToolCall& tool_call,
+                                           const ToolExecutionContext& context) {
+  PermissionRequest request;
+  request.tool = PermissionToolRef{
+      .name = tool.name,
+      .capabilities = tool.capabilities,
+      .risk_level = to_string(tool.risk_level),
+      .tags = tool.tags,
+      .bundle = tool.bundle,
+      .builtin = tool.builtin,
+  };
+  request.tool_name = tool.name;
+  request.capabilities = tool.capabilities;
+  request.risk_level = tool.risk_level;
+  request.tags = tool.tags;
+  request.bundle = tool.bundle;
+  request.builtin = tool.builtin;
+  request.actions = {PermissionAction::ToolInvoke};
+  request.resources = {PermissionResource{
+      .kind = PermissionResourceKind::Tool,
+      .id = tool.name,
+      .actions = {PermissionAction::ToolInvoke},
+      .source = PermissionDecisionSource::Default,
+  }};
+  request.tool_call = tool_call;
+  request.context = context;
+
+  for (const auto& capability : tool.capabilities) {
+    const auto actions = actions_for_capability(capability);
+    append_actions(request.actions, actions);
+    request.resources.push_back(PermissionResource{
+        .kind = resource_kind_for_capability(capability),
+        .id = capability,
+        .actions = actions,
+        .source = PermissionDecisionSource::Capability,
+    });
+  }
+
+  if (contains_value(tool.capabilities, std::string("process.exec")) || tool.name == "shell.exec") {
+    const auto& args = tool_call.arguments;
+    const auto command = args.at("command").as_string();
+    if (!command.empty()) {
+      std::vector<std::string> argv;
+      if (args.at("args").is_array()) {
+        for (const auto& value : args.at("args").as_array()) {
+          argv.push_back(value.as_string());
+        }
+      }
+      const bool exec_file_shape =
+          !argv.empty() && command.find_first_of(";&|<>$`") == std::string::npos;
+      auto classification = exec_file_shape ? classify_exec_file_command(command, argv)
+                                            : classify_shell_command(command);
+      append_actions(request.actions, classification.actions);
+      for (auto& resource : classification.resources) {
+        request.resources.push_back(std::move(resource));
+      }
+      request.risk_level = max_risk(request.risk_level,
+                                    tool_risk_level_from_string(classification.risk_level,
+                                                                ToolRiskLevel::Medium));
+      PermissionResource classifier_resource;
+      classifier_resource.kind = PermissionResourceKind::Process;
+      classifier_resource.id = "shell.classification";
+      classifier_resource.actions = {PermissionAction::ProcessExecute};
+      classifier_resource.source = PermissionDecisionSource::Classifier;
+      classifier_resource.metadata = Value::object({
+          {"riskLevel", classification.risk_level},
+          {"commands", strings_to_value_array(classification.commands)},
+          {"findings", shell_findings_to_value(classification)},
+          {"operators", strings_to_value_array(classification.ast.operators)},
+          {"parseWarnings", strings_to_value_array(classification.ast.parse_warnings)},
+      });
+      request.resources.push_back(std::move(classifier_resource));
+    }
+  }
+
+  request.tool.risk_level = to_string(request.risk_level);
+  return request;
+}
+
+SandboxRequest permission_sandbox_request(const PermissionRequest& request,
+                                          const PermissionDecision& decision) {
+  auto resources = request.resources;
+  resources.insert(resources.end(), decision.resources.begin(), decision.resources.end());
+  auto from_resources = sandbox_request_from_permission_resources(
+      resources, Value::object({{"source", "permission"}}));
+  if (decision.sandbox_request) {
+    from_resources = merge_sandbox_requests(from_resources, *decision.sandbox_request);
+  }
+  return from_resources;
+}
+
+ToolSandboxPolicy merge_permission_sandbox_policy(const ToolSandboxPolicy& policy,
+                                                  const SandboxRequest& request) {
+  ToolSandboxPolicy merged;
+  merged.required = merge_sandbox_requests(policy.required, request);
+  if (policy.preferred) {
+    merged.preferred = merge_sandbox_requests(*policy.preferred, request);
+  }
+  return merged;
+}
+
+bool sandbox_request_is_empty(const SandboxRequest& request) {
+  return capabilities_satisfy(SandboxCapabilities{}, request.capabilities) &&
+         request.fs_read_paths.empty() &&
+         request.fs_write_paths.empty() &&
+         request.net_hosts.empty() &&
+         request.allowed_subcommands.empty() &&
+         (!request.extensions.is_object() || request.extensions.as_object().empty());
+}
+
+bool sandbox_policy_is_empty(const ToolSandboxPolicy& policy) {
+  return sandbox_request_is_empty(policy.required) && !policy.preferred.has_value();
 }
 
 Value tool_call_hook_value(const ToolCall& tool_call) {
@@ -135,6 +395,48 @@ Value tool_call_hook_value(const ToolCall& tool_call) {
 }
 
 }  // namespace
+
+bool ToolServiceView::has(const std::string& name) const {
+  return services_.find(name) != services_.end();
+}
+
+std::vector<std::string> ToolServiceView::names() const {
+  std::vector<std::string> names;
+  names.reserve(services_.size());
+  for (const auto& [name, _] : services_) {
+    names.push_back(name);
+  }
+  return names;
+}
+
+bool ToolServiceContainer::has(const std::string& name) const {
+  return services_.find(name) != services_.end();
+}
+
+ToolServiceView ToolServiceContainer::view(
+    const std::vector<ToolServiceRequirement>& requirements) const {
+  ToolServiceView scoped;
+  for (const auto& requirement : requirements) {
+    if (requirement.name.empty()) {
+      throw ConfigurationError("Tool service requirement name is required.");
+    }
+    const auto found = services_.find(requirement.name);
+    if (found != services_.end()) {
+      scoped.services_[requirement.name] = found->second;
+      continue;
+    }
+    if (!requirement.optional) {
+      throw ConfigurationError("Tool service \"" + requirement.name + "\" is required but was not provided.");
+    }
+  }
+  return scoped;
+}
+
+void ToolServiceContainer::merge_from(const ToolServiceContainer& other) {
+  for (const auto& [name, binding] : other.services_) {
+    services_[name] = binding;
+  }
+}
 
 Value merge_tool_service_values(const Value& base, const Value& overlay) {
   if (!base.is_object()) {
@@ -159,72 +461,8 @@ ToolExecutionServices merge_tool_execution_services(const ToolExecutionServices&
                                                     const ToolExecutionServices& overlay) {
   ToolExecutionServices merged = base;
   merged.values = merge_tool_service_values(base.values, overlay.values);
-  if (overlay.session) {
-    merged.session = overlay.session;
-  }
-  if (overlay.scratch_store) {
-    merged.scratch_store = overlay.scratch_store;
-  }
-  if (overlay.long_term_memory) {
-    merged.long_term_memory = overlay.long_term_memory;
-  }
-  if (overlay.knowledge_base) {
-    merged.knowledge_base = overlay.knowledge_base;
-  }
-  if (overlay.knowledge_base_manager) {
-    merged.knowledge_base_manager = overlay.knowledge_base_manager;
-  }
-  if (overlay.workflow_engine) {
-    merged.workflow_engine = overlay.workflow_engine;
-  }
-  if (overlay.workflow_definition) {
-    merged.workflow_definition = overlay.workflow_definition;
-  }
-  if (overlay.web_search_registry) {
-    merged.web_search_registry = overlay.web_search_registry;
-  }
-  if (!overlay.default_search_provider.empty()) {
-    merged.default_search_provider = overlay.default_search_provider;
-  }
-  if (overlay.web_fetcher) {
-    merged.web_fetcher = overlay.web_fetcher;
-  }
-  if (overlay.web_crawler) {
-    merged.web_crawler = overlay.web_crawler;
-  }
-  if (overlay.default_crawler_profile.is_object() && !overlay.default_crawler_profile.as_object().empty()) {
-    merged.default_crawler_profile = overlay.default_crawler_profile;
-  }
-  if (overlay.browser_renderer) {
-    merged.browser_renderer = overlay.browser_renderer;
-  }
-  if (overlay.artifact_lookup) {
-    merged.artifact_lookup = overlay.artifact_lookup;
-  }
-  if (overlay.ocr_registry) {
-    merged.ocr_registry = overlay.ocr_registry;
-  }
-  if (!overlay.default_ocr_provider.empty()) {
-    merged.default_ocr_provider = overlay.default_ocr_provider;
-  }
-  if (overlay.document_rasterizers) {
-    merged.document_rasterizers = overlay.document_rasterizers;
-  }
-  if (overlay.document_preprocessors) {
-    merged.document_preprocessors = overlay.document_preprocessors;
-  }
-  if (overlay.registry) {
-    merged.registry = overlay.registry;
-  }
-  if (overlay.hooks) {
-    merged.hooks = overlay.hooks;
-  }
-  if (overlay.sandbox) {
-    merged.sandbox = overlay.sandbox;
-  }
-  if (overlay.sandbox_scope) {
-    merged.sandbox_scope = overlay.sandbox_scope;
-  }
+  merged.service_container.merge_from(overlay.service_container);
+  merged.service_view = ToolServiceView{};
   return merged;
 }
 
@@ -250,6 +488,24 @@ ToolExecutionContext normalize_tool_execution_context(ToolExecutionContext conte
   context.service_refs.values = merge_tool_service_values(context.services, context.service_refs.values);
   context.services = context.service_refs.values;
   return context;
+}
+
+void emit_tool_progress(ToolExecutionContext& context,
+                        std::string kind,
+                        Value payload) {
+  if (!context.emit_progress || kind.empty()) {
+    return;
+  }
+  ToolProgressEvent event;
+  event.kind = std::move(kind);
+  if (context.tool_call) {
+    event.tool_call_id = context.tool_call->id;
+    event.tool_name = context.tool_call->name;
+  }
+  event.iteration = context.iteration;
+  event.payload = std::move(payload);
+  event.trace = context.trace_context;
+  context.emit_progress(event);
 }
 
 std::string to_string(ToolRiskLevel risk) {
@@ -308,9 +564,34 @@ Value permission_event_payload(const PermissionRequest& request, const Permissio
                         {"toolCallId", request.tool_call.id},
                         {"decision", to_string(decision.decision)},
                         {"reason", decision.reason},
+                        {"source", to_string(decision.source)},
+                        {"ruleId", decision.rule_id.empty() ? Value() : Value(decision.rule_id)},
+                        {"priority", decision.priority},
                         {"riskLevel", to_string(request.risk_level)},
+                        {"actions", permission_actions_to_value_array(request.actions)},
+                        {"resources", permission_resources_to_value_array(request.resources)},
+                        {"decisionResources", permission_resources_to_value_array(decision.resources)},
+                        {"sandboxRequest", decision.sandbox_request ? sandbox_request_to_value(*decision.sandbox_request) : Value()},
                         {"bundle", request.bundle},
                         {"builtin", request.builtin}});
+}
+
+Value tool_progress_event_payload(const ToolProgressEvent& event) {
+  return Value::object({
+      {"toolCallId", event.tool_call_id},
+      {"toolName", event.tool_name},
+      {"iteration", event.iteration},
+      {"sequence", static_cast<long long>(event.sequence)},
+      {"kind", event.kind},
+      {"payload", event.payload.is_null() ? Value::object({}) : event.payload},
+  });
+}
+
+std::string tool_progress_event_category(const ToolProgressEvent& event) {
+  if (event.kind == "tool.delta" || event.kind.rfind("tool.delta.", 0) == 0) {
+    return "tool.delta";
+  }
+  return "tool.progress";
 }
 
 Value retry_scheduled_tool_payload(const RetryScheduledContext& retry,
@@ -364,8 +645,77 @@ Value tool_audit_payload(const std::string& lifecycle, const ToolCall& tool_call
   return payload;
 }
 
+Value tool_result_payload_value(const ToolInvokeResult& result) {
+  if (std::holds_alternative<Value>(result)) {
+    return std::get<Value>(result);
+  }
+  const auto& envelope = std::get<ToolResultEnvelope>(result);
+  if (envelope.value) {
+    return *envelope.value;
+  }
+  Value::Object object{{"metadata", envelope.metadata}};
+  if (envelope.content) {
+    object["content"] = agent_message_to_value(
+        create_message(MessageRole::Assistant, *envelope.content)).at("content");
+  }
+  return Value(std::move(object));
+}
+
+Value tool_result_metadata_payload(const ToolInvokeResult& result) {
+  if (!std::holds_alternative<ToolResultEnvelope>(result)) {
+    return Value();
+  }
+  const auto& metadata = std::get<ToolResultEnvelope>(result).metadata;
+  return metadata.is_object() && !metadata.as_object().empty() ? metadata : Value();
+}
+
+Value tool_result_content_payload(const ToolInvokeResult& result) {
+  if (!std::holds_alternative<ToolResultEnvelope>(result)) {
+    return Value();
+  }
+  const auto& envelope = std::get<ToolResultEnvelope>(result);
+  if (!envelope.content) {
+    return Value();
+  }
+  return agent_message_to_value(create_message(MessageRole::Assistant, *envelope.content)).at("content");
+}
+
+Value tool_error_payload(const std::exception& error, const std::string& lifecycle_message) {
+  std::string type = "std::exception";
+  if (dynamic_cast<const ToolExecutionError*>(&error)) {
+    type = "ToolExecutionError";
+  } else if (dynamic_cast<const PermissionDeniedError*>(&error)) {
+    type = "PermissionDeniedError";
+  } else if (dynamic_cast<const ConfigurationError*>(&error)) {
+    type = "ConfigurationError";
+  } else if (dynamic_cast<const AgentFrameworkError*>(&error)) {
+    type = "AgentFrameworkError";
+  }
+  return Value::object({
+      {"message", error.what()},
+      {"type", type},
+      {"lifecycleMessage", lifecycle_message},
+  });
+}
+
+Value tool_lifecycle_base_payload(const std::string& phase,
+                                  const std::string& tool_name,
+                                  const ToolCall& tool_call,
+                                  const ToolExecutionContext& context,
+                                  const std::string& at_key,
+                                  const std::string& at) {
+  return Value::object({
+      {"phase", phase},
+      {"toolName", tool_name},
+      {"toolCallId", tool_call.id},
+      {"iteration", context.iteration},
+      {"arguments", tool_call.arguments},
+      {at_key, at},
+  });
+}
+
 std::string format_tool_error_output(const std::string& message) {
-  return Value::object({{"ok", false}, {"error", message}}).stringify(2);
+  return "{\n  \"ok\": false,\n  \"error\": " + Value(message).stringify(0) + "\n}";
 }
 
 std::string permission_denied_message(const std::string& tool_name) {
@@ -389,7 +739,18 @@ ToolInvokeResult ToolDefinition::invoke(const Value& input, ToolExecutionContext
 }
 
 ChatToolDescriptor ToolDefinition::descriptor() const {
-  return ChatToolDescriptor{name, description, input_schema};
+  return ChatToolDescriptor{
+      .name = name,
+      .description = description,
+      .input_schema = input_schema,
+      .read_only = read_only,
+      .mutates_files = mutates_files,
+      .interactive = interactive,
+      .long_running = long_running,
+      .batchable = batchable,
+      .concurrency_key = concurrency_key,
+      .side_effect_level = side_effect_level,
+  };
 }
 
 ToolDefinition define_tool(ToolDefinition tool) {
@@ -552,15 +913,18 @@ PermissionPolicy create_rule_based_permission_policy(RuleBasedPermissionPolicyCo
   return [config = std::move(config)](const PermissionRequest& request) -> PermissionDecision {
     for (const auto& rule : config.rules) {
       if (matches_permission_rule(request, rule.match)) {
-        return PermissionDecision{rule.decision, rule.reason};
+        return PermissionDecision{.decision = rule.decision,
+                                  .reason = rule.reason,
+                                  .source = PermissionDecisionSource::Rule};
       }
     }
     if (request.capabilities.empty()) {
-      return PermissionDecision{PermissionDecisionKind::Allow, {}};
+      return PermissionDecision{.decision = PermissionDecisionKind::Allow};
     }
     return PermissionDecision{
-        config.default_decision,
-        config.default_reason.empty() ? "No permission rule matched the tool request." : config.default_reason,
+        .decision = config.default_decision,
+        .reason = config.default_reason.empty() ? "No permission rule matched the tool request." : config.default_reason,
+        .source = PermissionDecisionSource::Default,
     };
   };
 }
@@ -574,24 +938,73 @@ PermissionPolicy create_capability_policy(CapabilityPermissionPolicyConfig confi
     };
 
     if (has_capability(config.deny)) {
-      return PermissionDecision{PermissionDecisionKind::Deny, "Denied by capability policy."};
+      return PermissionDecision{.decision = PermissionDecisionKind::Deny,
+                                .reason = "Denied by capability policy.",
+                                .source = PermissionDecisionSource::Capability};
     }
     if (has_capability(config.ask)) {
-      return PermissionDecision{PermissionDecisionKind::Ask, "Capability requires approval."};
+      return PermissionDecision{.decision = PermissionDecisionKind::Ask,
+                                .reason = "Capability requires approval.",
+                                .source = PermissionDecisionSource::Capability};
     }
     if (request.risk_level == ToolRiskLevel::High) {
-      return PermissionDecision{config.high_risk_mode, "High-risk tool execution."};
+      return PermissionDecision{.decision = config.high_risk_mode,
+                                .reason = "High-risk tool execution.",
+                                .source = PermissionDecisionSource::Capability};
     }
     if (!request.capabilities.empty() &&
         std::all_of(request.capabilities.begin(), request.capabilities.end(), [&](const std::string& capability) {
           return contains_value(config.allow, capability);
         })) {
-      return PermissionDecision{PermissionDecisionKind::Allow, {}};
+      return PermissionDecision{.decision = PermissionDecisionKind::Allow,
+                                .source = PermissionDecisionSource::Capability};
     }
     if (request.capabilities.empty()) {
-      return PermissionDecision{PermissionDecisionKind::Allow, {}};
+      return PermissionDecision{.decision = PermissionDecisionKind::Allow,
+                                .source = PermissionDecisionSource::Capability};
     }
-    return PermissionDecision{PermissionDecisionKind::Deny, "Capability is not allowed."};
+    return PermissionDecision{.decision = PermissionDecisionKind::Deny,
+                              .reason = "Capability is not allowed.",
+                              .source = PermissionDecisionSource::Capability};
+  };
+}
+
+PermissionPolicy create_fine_grained_permission_policy(FineGrainedPermissionPolicyConfig config) {
+  return [config = std::move(config)](const PermissionRequest& request) -> PermissionDecision {
+    const FineGrainedPermissionRule* best = nullptr;
+    std::size_t best_index = 0;
+    for (std::size_t index = 0; index < config.rules.size(); ++index) {
+      const auto& rule = config.rules[index];
+      if (!matches_fine_grained_rule(request, rule.match)) {
+        continue;
+      }
+      if (!best || rule.priority > best->priority ||
+          (rule.priority == best->priority && index < best_index)) {
+        best = &rule;
+        best_index = index;
+      }
+    }
+    if (best) {
+      return PermissionDecision{
+          .decision = best->decision,
+          .reason = best->reason,
+          .source = best->source,
+          .rule_id = best->id,
+          .priority = best->priority,
+          .resources = best->resources,
+          .sandbox_request = best->sandbox_request,
+      };
+    }
+    if (request.capabilities.empty() && request.actions.size() <= 1) {
+      return PermissionDecision{.decision = PermissionDecisionKind::Allow,
+                                .source = PermissionDecisionSource::Default};
+    }
+    return PermissionDecision{
+        .decision = config.default_decision,
+        .reason = config.default_reason.empty() ? "No fine-grained permission rule matched the tool request."
+                                                : config.default_reason,
+        .source = PermissionDecisionSource::Default,
+    };
   };
 }
 
@@ -607,7 +1020,9 @@ PermissionApprovalHandler create_cli_approval_handler(CliApprovalHandlerConfig c
     std::istream* input = config.input ? config.input : &std::cin;
     std::ostream* output = config.output ? config.output : &std::cout;
     if (!input || !output || !(*input) || !(*output)) {
-      return PermissionDecision{config.default_decision, "CLI approval streams are not available."};
+      return PermissionDecision{.decision = config.default_decision,
+                                .reason = "CLI approval streams are not available.",
+                                .source = PermissionDecisionSource::Approval};
     }
 
     const std::string prompt = config.prompt_formatter
@@ -619,16 +1034,21 @@ PermissionApprovalHandler create_cli_approval_handler(CliApprovalHandlerConfig c
 
     std::string answer;
     if (!std::getline(*input, answer)) {
-      return PermissionDecision{config.default_decision, decision.reason};
+      return PermissionDecision{.decision = config.default_decision,
+                                .reason = decision.reason,
+                                .source = PermissionDecisionSource::Approval};
     }
     std::transform(answer.begin(), answer.end(), answer.begin(), [](unsigned char ch) {
       return static_cast<char>(std::tolower(ch));
     });
     answer = trim_copy(std::move(answer));
     if (answer == "y" || answer == "yes") {
-      return PermissionDecision{PermissionDecisionKind::Allow, {}};
+      return PermissionDecision{.decision = PermissionDecisionKind::Allow,
+                                .source = PermissionDecisionSource::Approval};
     }
-    return PermissionDecision{config.default_decision, decision.reason};
+    return PermissionDecision{.decision = config.default_decision,
+                              .reason = decision.reason,
+                              .source = PermissionDecisionSource::Approval};
   };
 }
 
@@ -645,12 +1065,38 @@ ToolExecutor::ToolExecutor(ToolRegistry& registry, PermissionPolicy permission_p
 ToolExecutionResult ToolExecutor::execute_tool_call(const ToolCall& tool_call, ToolExecutionContext context) {
   context = normalize_tool_execution_context(std::move(context));
   context.trace_context = tool_execution_trace_context(context.trace_context);
+  context.tool_call = tool_call;
+  auto progress_sequence = std::make_shared<std::atomic<std::uint64_t>>(0);
+  auto forwarded_progress = context.emit_progress;
+  context.emit_progress = [this, tool_call, iteration = context.iteration,
+                           trace = context.trace_context, progress_sequence,
+                           forwarded_progress](ToolProgressEvent event) mutable {
+    if (event.kind.empty()) {
+      return;
+    }
+    event.tool_call_id = tool_call.id;
+    event.tool_name = tool_call.name;
+    event.iteration = iteration;
+    event.sequence = progress_sequence->fetch_add(1, std::memory_order_relaxed);
+    event.trace = trace;
+    if (event.payload.is_null()) {
+      event.payload = Value::object({});
+    }
+    if (event_bus_) {
+      event_bus_->publish(tool_progress_event_category(event), ExecutionTarget::Tool,
+                          tool_progress_event_payload(event),
+                          trace);
+    }
+    if (forwarded_progress) {
+      forwarded_progress(event);
+    }
+  };
   // Expose the registry to tools that need it (e.g. tool.search / tool.describe).
-  if (!context.service_refs.registry) {
-    context.service_refs.registry = &registry_;
+  if (!context.service_refs.service_container.has(kToolServiceToolRegistry.name)) {
+    context.service_refs.service_container.set(kToolServiceToolRegistry, &registry_);
   }
-  if (!context.service_refs.hooks) {
-    context.service_refs.hooks = &hooks_;
+  if (!context.service_refs.service_container.has(kToolServiceHooks.name)) {
+    context.service_refs.service_container.set(kToolServiceHooks, &hooks_);
   }
   auto tool_snapshot = registry_.find(tool_call.name);
   if (!tool_snapshot) {
@@ -662,6 +1108,17 @@ ToolExecutionResult ToolExecutor::execute_tool_call(const ToolCall& tool_call, T
                                              Value::object({{"ok", false},
                                                            {"error", error_message}})),
                           context.trace_context);
+      auto failed_payload = tool_lifecycle_base_payload("failed", tool_call.name, tool_call, context,
+                                                        "failedAt", now_iso8601());
+      failed_payload["ok"] = false;
+      failed_payload["error"] = Value::object({
+          {"message", error_message},
+          {"type", "ToolExecutionError"},
+          {"lifecycleMessage", error_message},
+      });
+      failed_payload["output"] = output;
+      failed_payload["durationMs"] = 0;
+      event_bus_->publish("tool.failed", ExecutionTarget::Tool, failed_payload, context.trace_context);
     }
     return ToolExecutionResult{
         .tool_call = tool_call,
@@ -672,23 +1129,30 @@ ToolExecutionResult ToolExecutor::execute_tool_call(const ToolCall& tool_call, T
     };
   }
   const ToolDefinition& tool = *tool_snapshot;
+  PermissionRequest permission_request = build_permission_request(tool, tool_call, context);
+  PermissionDecision permission_decision{.decision = PermissionDecisionKind::Allow,
+                                         .source = PermissionDecisionSource::Default};
+  const bool skill_allowed = tool_allowed_by_active_skills(tool_call, context);
 
-  if (!tool_allowed_by_active_skills(tool_call, context) && permission_policy_) {
-    PermissionRequest request;
-    request.tool_name = tool.name;
-    request.capabilities = tool.capabilities;
-    request.risk_level = tool.risk_level;
-    request.tags = tool.tags;
-    request.bundle = tool.bundle;
-    request.builtin = tool.builtin;
-    request.tool_call = tool_call;
-    request.context = context;
+  if (skill_allowed) {
+    permission_decision.source = PermissionDecisionSource::Skill;
+  }
+
+  if (!skill_allowed && permission_policy_) {
     if (event_bus_) {
       event_bus_->publish("tool.audit", ExecutionTarget::Tool,
                           tool_audit_payload(
                               "requested", tool_call,
                               Value::object({{"riskLevel", to_string(tool.risk_level)},
+                                            {"effectiveRiskLevel", to_string(permission_request.risk_level)},
                                             {"capabilities", strings_to_value(tool.capabilities)},
+                                            {"actions", [&]() {
+                                               Value::Array out;
+                                               for (const auto action : permission_request.actions) {
+                                                 out.emplace_back(to_string(action));
+                                               }
+                                               return Value(std::move(out));
+                                             }()},
                                             {"bundle", tool.bundle.empty() ? Value() : Value(tool.bundle)}})),
                           context.trace_context);
     }
@@ -701,16 +1165,38 @@ ToolExecutionResult ToolExecutor::execute_tool_call(const ToolCall& tool_call, T
       hook_context.tool_name = tool.name;
       hooks_.before_permission_check(hook_context);
     }
-    PermissionDecision decision = permission_policy_(request);
+    PermissionDecision decision = permission_policy_(permission_request);
     if (decision.decision == PermissionDecisionKind::Ask) {
+      const PermissionDecision proposed_decision = decision;
       if (event_bus_) {
         event_bus_->publish("permission.approval_requested", ExecutionTarget::Permission,
-                            permission_event_payload(request, decision), context.trace_context);
+                            permission_event_payload(permission_request, decision), context.trace_context);
       }
-      decision = approval_handler_ ? approval_handler_(request, decision)
-                                   : PermissionDecision{PermissionDecisionKind::Deny,
-                                                        "Approval handler is not configured."};
+      decision = approval_handler_ ? approval_handler_(permission_request, decision)
+                                   : PermissionDecision{
+                                         .decision = PermissionDecisionKind::Deny,
+                                         .reason = "Approval handler is not configured.",
+                                         .source = PermissionDecisionSource::Approval,
+                                     };
+      if (decision.decision == PermissionDecisionKind::Allow) {
+        if (decision.resources.empty()) {
+          decision.resources = proposed_decision.resources;
+        }
+        if (!decision.sandbox_request && proposed_decision.sandbox_request) {
+          decision.sandbox_request = proposed_decision.sandbox_request;
+        }
+        if (decision.source == PermissionDecisionSource::Default) {
+          decision.source = PermissionDecisionSource::Approval;
+        }
+        if (decision.rule_id.empty()) {
+          decision.rule_id = proposed_decision.rule_id;
+        }
+        if (decision.priority == 0) {
+          decision.priority = proposed_decision.priority;
+        }
+      }
     }
+    permission_decision = decision;
     if (decision.decision != PermissionDecisionKind::Allow) {
       const std::string reason = decision.reason.empty() ? "Tool is not permitted." : decision.reason;
       const std::string error_message = permission_denied_message(tool.name);
@@ -726,8 +1212,10 @@ ToolExecutionResult ToolExecutor::execute_tool_call(const ToolCall& tool_call, T
         hooks_.after_permission_check(hook_context);
       }
       if (event_bus_) {
+        auto denied_decision = decision;
+        denied_decision.reason = reason;
         event_bus_->publish("permission.denied", ExecutionTarget::Permission,
-                            permission_event_payload(request, PermissionDecision{decision.decision, reason}),
+                            permission_event_payload(permission_request, denied_decision),
                             context.trace_context);
         event_bus_->publish("tool.audit", ExecutionTarget::Tool,
                             tool_audit_payload("denied", tool_call,
@@ -736,6 +1224,20 @@ ToolExecutionResult ToolExecutor::execute_tool_call(const ToolCall& tool_call, T
                             context.trace_context);
       }
       const std::string output = format_tool_error_output(error_message);
+      if (event_bus_) {
+        auto failed_payload = tool_lifecycle_base_payload("failed", tool.name, tool_call, context,
+                                                          "failedAt", now_iso8601());
+        failed_payload["ok"] = false;
+        failed_payload["error"] = Value::object({
+            {"message", error_message},
+            {"type", "PermissionDeniedError"},
+            {"reason", reason},
+            {"lifecycleMessage", error_message},
+        });
+        failed_payload["output"] = output;
+        failed_payload["durationMs"] = 0;
+        event_bus_->publish("tool.failed", ExecutionTarget::Tool, failed_payload, context.trace_context);
+      }
       return ToolExecutionResult{
           .tool_call = tool_call,
           .ok = false,
@@ -757,7 +1259,7 @@ ToolExecutionResult ToolExecutor::execute_tool_call(const ToolCall& tool_call, T
     }
     if (event_bus_) {
       event_bus_->publish("permission.allowed", ExecutionTarget::Permission,
-                          permission_event_payload(request, decision), context.trace_context);
+                          permission_event_payload(permission_request, decision), context.trace_context);
       event_bus_->publish("permission.checked", ExecutionTarget::Permission,
                           Value::object({{"toolName", tool.name}, {"decision", "allow"}}),
                           context.trace_context);
@@ -767,6 +1269,9 @@ ToolExecutionResult ToolExecutor::execute_tool_call(const ToolCall& tool_call, T
     }
   }
 
+  std::string lifecycle_started_at;
+  auto lifecycle_start = std::chrono::steady_clock::now();
+  bool lifecycle_started = false;
   try {
     if (hooks_.before_tool) {
       ToolHookContext hook_context;
@@ -782,24 +1287,39 @@ ToolExecutionResult ToolExecutor::execute_tool_call(const ToolCall& tool_call, T
     if (event_bus_) {
       event_bus_->publish("tool.audit", ExecutionTarget::Tool,
                           tool_audit_payload("started", tool_call), context.trace_context);
+      lifecycle_started_at = now_iso8601();
+      lifecycle_start = std::chrono::steady_clock::now();
+      lifecycle_started = true;
       event_bus_->publish("tool.started", ExecutionTarget::Tool,
-                          Value::object({{"toolName", tool.name}, {"toolCallId", tool_call.id}}),
+                          tool_lifecycle_base_payload("started", tool.name, tool_call, context,
+                                                      "startedAt", lifecycle_started_at),
                           context.trace_context);
     }
-    context.tool_call = tool_call;
     // Sandbox contract: refuse to dispatch if the installed sandbox cannot
     // satisfy the tool's policy. `enforce_sandbox_contract` returns the
     // effective request (preferred when supported, else required) and emits
     // `sandbox.entered` / `sandbox.violated`. On rejection it throws
     // `SandboxContractError`, which bubbles up through the executor's normal
     // error path and is surfaced as a tool failure.
+    Sandbox* active_sandbox = context.service_refs.service_container.get(kToolServiceSandbox);
+    const bool should_apply_permission_sandbox =
+        active_sandbox != nullptr ||
+        !sandbox_policy_is_empty(tool.sandbox_policy) ||
+        permission_decision.sandbox_request.has_value() ||
+        !permission_decision.resources.empty();
+    const auto effective_policy =
+        should_apply_permission_sandbox
+            ? merge_permission_sandbox_policy(tool.sandbox_policy,
+                                              permission_sandbox_request(permission_request,
+                                                                        permission_decision))
+            : tool.sandbox_policy;
     auto effective_request =
-        enforce_sandbox_contract(tool.sandbox_policy, context.service_refs.sandbox, event_bus_);
+        enforce_sandbox_contract(effective_policy, active_sandbox, event_bus_);
     std::unique_ptr<SandboxScope> sandbox_scope;
-    if (context.service_refs.sandbox) {
-      sandbox_scope = context.service_refs.sandbox->enter(effective_request);
+    if (active_sandbox) {
+      sandbox_scope = active_sandbox->enter(effective_request);
     }
-    context.service_refs.sandbox_scope = sandbox_scope.get();
+    context.service_refs.service_container.set(kToolServiceSandboxScope, sandbox_scope.get());
     // RAII: clear the borrowed scope pointer on every path (success, throw,
     // return), and emit `sandbox.exited` if a scope was actually entered.
     struct SandboxScopeGuard {
@@ -809,7 +1329,8 @@ ToolExecutionResult ToolExecutor::execute_tool_call(const ToolCall& tool_call, T
       std::chrono::steady_clock::time_point start;
       const TraceContext* trace;
       ~SandboxScopeGuard() {
-        context_ptr->service_refs.sandbox_scope = nullptr;
+        context_ptr->service_refs.service_container.set(kToolServiceSandboxScope,
+                                                        static_cast<SandboxScope*>(nullptr));
         if (event_bus && entered) {
           const auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::steady_clock::now() - start).count();
@@ -820,6 +1341,9 @@ ToolExecutionResult ToolExecutor::execute_tool_call(const ToolCall& tool_call, T
       }
     } scope_guard{&context, event_bus_, static_cast<bool>(sandbox_scope),
                   std::chrono::steady_clock::now(), &context.trace_context};
+    context.service_refs.service_view =
+        context.service_refs.service_container.view(tool.service_requirements);
+    context.service_refs.service_container = ToolServiceContainer{};
     ToolInvokeResult result = execute_with_policies(
         ExecutionTarget::Tool, execution_policies_,
         Value::object({{"toolName", tool.name}, {"toolCallId", tool_call.id}}), context.cancellation,
@@ -858,8 +1382,27 @@ ToolExecutionResult ToolExecutor::execute_tool_call(const ToolCall& tool_call, T
       event_bus_->publish("tool.audit", ExecutionTarget::Tool,
                           tool_audit_payload("completed", tool_call, Value::object({{"ok", true}})),
                           context.trace_context);
+      const auto completed_at = now_iso8601();
+      const auto duration_ms = lifecycle_started
+                                   ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - lifecycle_start).count()
+                                   : 0;
+      auto completed_payload = tool_lifecycle_base_payload("completed", tool.name, tool_call, context,
+                                                           "completedAt", completed_at);
+      completed_payload["ok"] = true;
+      completed_payload["result"] = tool_result_payload_value(result);
+      completed_payload["output"] = output;
+      completed_payload["durationMs"] = static_cast<long long>(duration_ms);
+      const auto result_metadata = tool_result_metadata_payload(result);
+      if (!result_metadata.is_null()) {
+        completed_payload["metadata"] = result_metadata;
+      }
+      const auto result_content = tool_result_content_payload(result);
+      if (!result_content.is_null()) {
+        completed_payload["content"] = result_content;
+      }
       event_bus_->publish("tool.completed", ExecutionTarget::Tool,
-                          Value::object({{"toolName", tool.name}, {"toolCallId", tool_call.id}}),
+                          completed_payload,
                           context.trace_context);
     }
     if (hooks_.after_tool) {
@@ -902,9 +1445,19 @@ ToolExecutionResult ToolExecutor::execute_tool_call(const ToolCall& tool_call, T
                           tool_audit_payload("failed", tool_call,
                                              Value::object({{"ok", false}, {"error", error_message}})),
                           context.trace_context);
+      const auto failed_at = now_iso8601();
+      const auto duration_ms = lifecycle_started
+                                   ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - lifecycle_start).count()
+                                   : 0;
+      auto failed_payload = tool_lifecycle_base_payload("failed", tool.name, tool_call, context,
+                                                        "failedAt", failed_at);
+      failed_payload["ok"] = false;
+      failed_payload["error"] = tool_error_payload(error, error_message);
+      failed_payload["output"] = output;
+      failed_payload["durationMs"] = static_cast<long long>(duration_ms);
       event_bus_->publish("tool.failed", ExecutionTarget::Tool,
-                          Value::object({{"toolName", tool.name}, {"toolCallId", tool_call.id},
-                                         {"error", error_message}}),
+                          failed_payload,
                           context.trace_context);
     }
     return ToolExecutionResult{

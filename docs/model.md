@@ -20,11 +20,11 @@ params.messages = {
 };
 params.settings.model = "echo";
 
-agent::ModelResponse response = model->generate(params);
+agent::AgentOutput response = model->generate(params);
 ```
 
 `GenerateParams` carries messages, tool descriptors, model settings, and an
-optional `CancellationToken*`. `ModelResponse` preserves provider/model ids,
+optional `CancellationToken*`. `AgentOutput` preserves provider/model ids,
 content parts, plain text, reasoning, tool calls, finish reason, and raw
 provider data.
 
@@ -201,6 +201,7 @@ forms (`"none"`, `"explicit"`, `"system-only"`, `"system-and-tools"`,
 ### Usage parsing
 
 `ModelUsage` carries `input_tokens`, `output_tokens`, `total_tokens`,
+per-field token provenance (`*_tokens_source`), aggregate `quality`,
 `cached_input_tokens`, `reasoning_tokens`, and `reasoning_source`.
 `extract_model_usage` reads cache hits from:
 
@@ -210,7 +211,22 @@ forms (`"none"`, `"explicit"`, `"system-only"`, `"system-and-tools"`,
 - OpenAI `usage.prompt_tokens_details.cached_tokens`.
 - Gemini `usage_metadata.cached_content_token_count` (auto-cache only).
 
-JSON round-trips as `cachedInputTokens` (camelCase, matching Node conventions).
+JSON round-trips as camelCase fields matching Node conventions:
+`inputTokensSource`, `outputTokensSource`, `totalTokensSource`,
+`cachedInputTokensSource`, and `quality`.
+
+Token source values:
+
+| Source | Meaning |
+|---|---|
+| `Provider` | Provider or local runtime directly reported the count. |
+| `Derived` | Framework computed the value exactly from other reported fields. |
+| `Estimated` | Tokenizer or heuristic estimate. |
+| `Unknown` | No trustworthy count. |
+
+`quality` summarizes input/output/total provenance as
+`Provider | Mixed | Estimated | Unknown`. Reasoning has separate provenance
+because providers expose it independently.
 
 ### Reasoning tokens
 
@@ -231,7 +247,7 @@ Per-provider extraction:
 | `qwen` | OpenAI-compat reasoning details; falls back to DashScope `output.reasoning_content_tokens`. |
 | `deepseek` | OpenAI-compat reasoning details; otherwise estimated from `reasoning_content` text length. |
 | `gemini` | `usage_metadata.thoughts_token_count` → `Provider`. Output_tokens is composed as `candidates_token_count + thoughts_token_count` (Gemini reports them separately). |
-| `anthropic` | Provider does not report reasoning; falls back to estimation from `ModelResponse.reasoning` text. |
+| `anthropic` | Provider does not report reasoning; falls back to estimation from `AgentOutput.reasoning` text. |
 | `ollama`, `llama-cpp-native`, others | OpenAI-compat path attempted first; estimation fallback when reasoning text is present. |
 
 Helpers:
@@ -256,13 +272,14 @@ order-of-magnitude when comparing across languages.
 
 `AgentLoopRunResult` and `AgentRunnerRunResult` carry a `usage` field with the
 sum of all model-call usages observed during the run. Token counts are summed
-field-wise; `reasoning_source` is merged with the worst-case rule above so a
+field-wise; token sources and `reasoning_source` are merged with worst-case
+rules so a
 single iteration that lacked provider reasoning data degrades the overall
 `reasoning_source` to `Estimated` or `Unknown` accordingly.
 
 The `model.cache_stats` event payload includes `reasoningTokens` and
 `reasoningSource` alongside `totalInputTokens`, `cachedInputTokens`, `hitRate`,
-and `strategy`.
+`strategy`, token source fields, and `quality`.
 
 ### When to enable
 
@@ -277,7 +294,7 @@ opt in once you have measured hit rate via the `model.cache_stats` event.
 
 `GenerateParams::tools` accepts `ChatToolDescriptor` values. Provider request
 builders serialize those descriptors into each provider's tool format and parse
-tool calls back into `ModelResponse::tool_calls`.
+tool calls back into `AgentOutput::tool_calls`.
 
 For local llama.cpp use cases, `json_schema_to_gbnf` and
 `llama_tool_envelope_gbnf` build grammar constraints for structured output and

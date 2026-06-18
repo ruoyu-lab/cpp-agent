@@ -1,4 +1,4 @@
-#include "agent/agent.hpp"
+#include "agent/orchestration.hpp"
 #include "detail/helpers.hpp"
 
 #include <algorithm>
@@ -757,7 +757,7 @@ EvaluatorCoordinatorResult EvaluatorLoopCoordinator::run(std::string input, Coor
     attempts_run = attempt + 1;
     const std::string key = "evaluation:" + std::to_string(attempts_run);
     try {
-      last_result = context.primary_agent->run(current_input,
+      last_result = context.primary_agent->execution().run(current_input,
                                               "default",
                                               {},
                                               {},
@@ -822,7 +822,7 @@ AgentRunnerRunResult SupervisorWorkerCoordinator::run(std::string input, Coordin
   const std::string key = "worker:" + worker_id;
   AgentRunnerRunResult result;
   try {
-    result = worker->run(input,
+    result = worker->execution().run(input,
                          "default",
                          {},
                          {},
@@ -882,7 +882,7 @@ EvaluatorCoordinatorResult SupervisorEvaluatorCoordinator::run(std::string input
     AgentRunner* worker = require_worker_agent(context, worker_id);
     const std::string worker_key = "supervisor-evaluator:worker:" + std::to_string(attempts_run);
     try {
-      last_result = worker->run(current_input,
+      last_result = worker->execution().run(current_input,
                                 "default",
                                 {},
                                 {},
@@ -1008,7 +1008,7 @@ WorkflowBackedCoordinatorResult SupervisorWorkflowCoordinator::run(std::string i
 
   AgentRunnerRunResult worker_result;
   try {
-    worker_result = worker->run(input,
+    worker_result = worker->execution().run(input,
                                 "default",
                                 {},
                                 {},
@@ -1066,7 +1066,7 @@ AgentRunnerRunResult PlanActObserveCoordinator::run(std::string input, Coordinat
   for (int round = 0; round < max_rounds_; ++round) {
     const std::string key = "round:" + std::to_string(round + 1);
     try {
-      last_result = context.primary_agent->run(current_input,
+      last_result = context.primary_agent->execution().run(current_input,
                                               "default",
                                               {},
                                               {},

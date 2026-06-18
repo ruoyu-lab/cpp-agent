@@ -7,6 +7,7 @@
 //     ride along into the run context automatically.
 
 #include "agent/agent.hpp"
+#include "agent/knowledge.hpp"
 
 #include <iostream>
 #include <memory>
@@ -41,13 +42,13 @@ int main() {
   }
 
   agent::AgentRunnerConfig config;
-  config.adapter = std::make_shared<agent::EchoChatModelAdapter>();
-  config.knowledge_base = &kb;
+  config.model_runtime.adapter = std::make_shared<agent::EchoChatModelAdapter>();
+  config.knowledge_runtime.provider = &kb;
   agent::AgentRunner runner(std::move(config));
 
   // The runner will automatically retrieve from the knowledge base before
   // calling the model and expose the hits in the result.
-  auto result = runner.run("octopus hearts?", "rag-session");
+  auto result = runner.execution().run("octopus hearts?", "rag-session");
   std::cout << "[runner] knowledge_hits=" << result.knowledge_hits.size()
             << " text=" << result.text << "\n";
   return 0;

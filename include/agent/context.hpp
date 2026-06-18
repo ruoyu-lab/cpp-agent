@@ -1,7 +1,10 @@
 #pragma once
 
-#include "agent/memory.hpp"
+#include "agent/context_stats.hpp"
+#include "agent/knowledge_runtime.hpp"
+#include "agent/memory_retrieval.hpp"
 
+#include <cstdint>
 #include <mutex>
 
 namespace agent {
@@ -13,6 +16,10 @@ struct EmbeddedContextBlock {
   std::string title;
   std::string content;
   int priority = 0;
+  std::optional<ContextStatsBucketKind> stats_kind;
+  std::string stats_id;
+  std::string stats_label;
+  Value stats_metadata = Value::object({});
 };
 
 using ContextResolver = std::function<std::vector<EmbeddedContextBlock>(const Value& runtime)>;
@@ -24,6 +31,41 @@ struct ContextSource {
   int priority = 0;
 };
 
+struct EmbeddedContextAssembly {
+  std::vector<EmbeddedContextBlock> blocks;
+  std::optional<AgentMessage> message;
+  std::vector<ContextStatsBucketInput> stats_buckets;
+};
+
+enum class PromptAssemblySegmentKind {
+  System,
+  Preface,
+  EmbeddedContext,
+  Conversation,
+};
+
+std::string to_string(PromptAssemblySegmentKind kind);
+
+struct PromptAssemblySegment {
+  std::string id;
+  std::string label;
+  PromptAssemblySegmentKind kind = PromptAssemblySegmentKind::Conversation;
+  std::vector<AgentMessage> messages;
+  Value metadata = Value::object({});
+};
+
+struct PromptAssembly {
+  int version = 1;
+  std::string session_id;
+  int iteration = 0;
+  std::vector<PromptAssemblySegment> segments;
+  std::vector<AgentMessage> messages;
+  Value metadata = Value::object({});
+};
+
+Value prompt_assembly_segment_to_value(const PromptAssemblySegment& segment);
+Value prompt_assembly_to_value(const PromptAssembly& assembly);
+
 class EmbeddedContextManager {
  public:
   explicit EmbeddedContextManager(std::vector<ContextSource> sources = {});
@@ -33,6 +75,7 @@ class EmbeddedContextManager {
   EmbeddedContextManager& operator=(EmbeddedContextManager&& other) noexcept;
   ContextSource& register_source(ContextSource source);
   std::vector<EmbeddedContextBlock> resolve_blocks(const Value& runtime = Value::object({})) const;
+  EmbeddedContextAssembly build_assembly(const Value& runtime = Value::object({})) const;
   std::optional<AgentMessage> build_message(const Value& runtime = Value::object({})) const;
 
  private:

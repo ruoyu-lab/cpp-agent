@@ -635,7 +635,7 @@ ResolvedMedia DefaultDocumentPreprocessor::resolve_media(const MessageContentPar
     return context.media_resolver(part.source, context.artifact_lookup);
   }
   if (is_http_media_url(part.source)) {
-    return create_native_http_media_resolver()(part.source, context.artifact_lookup);
+    throw ConfigurationError("HTTP media URL preprocessing requires an injected media resolver.");
   }
   return resolver_.resolve(part.source, context.artifact_lookup);
 }

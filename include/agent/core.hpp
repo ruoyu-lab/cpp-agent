@@ -8,19 +8,54 @@ class AgentFrameworkError : public std::runtime_error {
  public:
   explicit AgentFrameworkError(std::string message, std::string details = {});
   [[nodiscard]] const std::string& details() const noexcept;
+  [[nodiscard]] virtual std::string_view error_name() const noexcept;
+  [[nodiscard]] virtual std::string_view error_category() const noexcept;
+  [[nodiscard]] virtual std::string_view error_code() const noexcept;
 
  private:
   std::string details_;
 };
 
+class CancellationError : public AgentFrameworkError {
+ public:
+  CancellationError(std::string message, std::string target, std::string reason = {});
+  [[nodiscard]] const std::string& target() const noexcept;
+  [[nodiscard]] const std::string& reason() const noexcept;
+  [[nodiscard]] std::string_view error_name() const noexcept override;
+  [[nodiscard]] std::string_view error_category() const noexcept override;
+  [[nodiscard]] std::string_view error_code() const noexcept override;
+
+ private:
+  std::string target_;
+  std::string reason_;
+};
+
 class ConfigurationError : public AgentFrameworkError {
  public:
   using AgentFrameworkError::AgentFrameworkError;
+  [[nodiscard]] std::string_view error_name() const noexcept override;
+  [[nodiscard]] std::string_view error_category() const noexcept override;
+  [[nodiscard]] std::string_view error_code() const noexcept override;
 };
 
 class AdapterError : public AgentFrameworkError {
  public:
   using AgentFrameworkError::AgentFrameworkError;
+  [[nodiscard]] std::string_view error_name() const noexcept override;
+  [[nodiscard]] std::string_view error_category() const noexcept override;
+  [[nodiscard]] std::string_view error_code() const noexcept override;
+};
+
+class ProtocolError : public AgentFrameworkError {
+ public:
+  ProtocolError(std::string message, std::string code, std::string details = {});
+  [[nodiscard]] const std::string& code() const noexcept;
+  [[nodiscard]] std::string_view error_name() const noexcept override;
+  [[nodiscard]] std::string_view error_category() const noexcept override;
+  [[nodiscard]] std::string_view error_code() const noexcept override;
+
+ private:
+  std::string code_;
 };
 
 class TimeoutError : public AgentFrameworkError {
@@ -28,6 +63,9 @@ class TimeoutError : public AgentFrameworkError {
   TimeoutError(std::string message, std::string target, int timeout_ms);
   [[nodiscard]] const std::string& target() const noexcept;
   [[nodiscard]] int timeout_ms() const noexcept;
+  [[nodiscard]] std::string_view error_name() const noexcept override;
+  [[nodiscard]] std::string_view error_category() const noexcept override;
+  [[nodiscard]] std::string_view error_code() const noexcept override;
 
  private:
   std::string target_;
@@ -39,6 +77,9 @@ class RetryExhaustedError : public AgentFrameworkError {
   RetryExhaustedError(std::string message, std::string target, int attempts);
   [[nodiscard]] const std::string& target() const noexcept;
   [[nodiscard]] int attempts() const noexcept;
+  [[nodiscard]] std::string_view error_name() const noexcept override;
+  [[nodiscard]] std::string_view error_category() const noexcept override;
+  [[nodiscard]] std::string_view error_code() const noexcept override;
 
  private:
   std::string target_;
@@ -54,6 +95,9 @@ class SchemaValidationError : public AgentFrameworkError {
  public:
   SchemaValidationError(std::string message, std::vector<SchemaValidationIssue> issues);
   [[nodiscard]] const std::vector<SchemaValidationIssue>& issues() const noexcept;
+  [[nodiscard]] std::string_view error_name() const noexcept override;
+  [[nodiscard]] std::string_view error_category() const noexcept override;
+  [[nodiscard]] std::string_view error_code() const noexcept override;
 
  private:
   std::vector<SchemaValidationIssue> issues_;
@@ -64,6 +108,9 @@ class ToolExecutionError : public AgentFrameworkError {
   ToolExecutionError(std::string message, std::string tool_name, std::string tool_call_id);
   [[nodiscard]] const std::string& tool_name() const noexcept;
   [[nodiscard]] const std::string& tool_call_id() const noexcept;
+  [[nodiscard]] std::string_view error_name() const noexcept override;
+  [[nodiscard]] std::string_view error_category() const noexcept override;
+  [[nodiscard]] std::string_view error_code() const noexcept override;
 
  private:
   std::string tool_name_;
@@ -75,6 +122,9 @@ class PermissionDeniedError : public AgentFrameworkError {
   PermissionDeniedError(std::string message, std::string tool_name, std::string reason);
   [[nodiscard]] const std::string& tool_name() const noexcept;
   [[nodiscard]] const std::string& reason() const noexcept;
+  [[nodiscard]] std::string_view error_name() const noexcept override;
+  [[nodiscard]] std::string_view error_category() const noexcept override;
+  [[nodiscard]] std::string_view error_code() const noexcept override;
 
  private:
   std::string tool_name_;

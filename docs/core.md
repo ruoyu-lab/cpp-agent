@@ -15,13 +15,22 @@ try {
 } catch (const agent::AgentFrameworkError& error) {
   auto message = std::string(error.what());
   auto details = error.details();
+  auto name = error.error_name();
+  auto category = error.error_category();
+  auto code = error.error_code();
 }
 ```
+
+`error_name()`, `error_category()`, and `error_code()` are the stable metadata
+contract used by stream events and host diagnostics. Error formatters do not
+infer framework error types by scanning RTTI; new framework errors should
+override these methods once at the exception type boundary.
 
 Specialized error types preserve context:
 
 - `ConfigurationError`: invalid app/configuration state.
 - `AdapterError`: injected adapter or provider failure.
+- `CancellationError`: cooperative cancellation target and reason.
 - `TimeoutError`: target plus timeout milliseconds.
 - `RetryExhaustedError`: target plus attempted count.
 - `SchemaValidationError`: structured schema validation issues.

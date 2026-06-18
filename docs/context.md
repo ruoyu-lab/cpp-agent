@@ -2,7 +2,7 @@
 
 The native context module contains two public surfaces: embedded runtime context
 blocks and execution planning. Both are declared in `agent/context.hpp` and are
-included by the umbrella `agent/agent.hpp` header.
+included by the runtime umbrella `agent/agent.hpp` header.
 
 ## Embedded Context
 
@@ -19,6 +19,10 @@ context.register_source(agent::ContextSource{
           agent::EmbeddedContextBlock{
               .content = "Use the tenant policy attached to this session.",
               .priority = 100,
+              .stats_kind = agent::ContextStatsBucketKind::Context,
+              .stats_id = "tenant.policy",
+              .stats_label = "Tenant Policy",
+              .stats_metadata = agent::Value::object({{"scope", "tenant"}}),
           },
       };
     },
@@ -41,11 +45,34 @@ auto message = context.build_message(
 - `title`: optional block title; defaults to the source title when empty.
 - `content`: block body. Empty content is skipped.
 - `priority`: block priority; defaults to the source priority when zero.
+- `stats_kind`: optional context stats bucket kind; defaults to
+  `ContextStatsBucketKind::Context`.
+- `stats_id`: optional stable stats bucket id; defaults to `context.<sourceId>`
+  or `context.<sourceId>.<index>` when a source returns multiple blocks.
+- `stats_label`: optional display label for the stats bucket; defaults to the
+  rendered block title.
+- `stats_metadata`: optional object copied to the stats bucket. The framework
+  adds `source = "embedded-context"`, `sourceId`, `sourceTitle`, and
+  `blockTitle`.
 
 `register_source` validates that `id` and `resolve` are present. Sources and
 resolved blocks are sorted by descending priority. `resolve_blocks` returns the
-raw blocks, while `build_message` returns a system `AgentMessage` with
-`metadata.source = "embedded-context"` and the rendered block titles.
+raw blocks.
+
+`build_assembly` is the stats-aware prompt assembly API. It resolves blocks once
+and returns:
+
+- `blocks`: the ordered resolved blocks.
+- `message`: the rendered system `AgentMessage`, when at least one block has
+  content.
+- `stats_buckets`: one derived preamble bucket plus one bucket per rendered
+  block.
+
+`build_message` remains the convenience API for hosts that only need the system
+message. The rendered message keeps `metadata.source = "embedded-context"`,
+`metadata.blocks`, and `metadata.statsBlocks` for diagnostics, but context
+stats should use `build_assembly().stats_buckets` rather than re-counting the
+merged message as one bucket.
 
 ## Planner Interface
 

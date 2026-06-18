@@ -5,14 +5,14 @@ conversation turn back after a successful run or stream.
 
 ## Retrieval Defaults
 
-Attach memory with `AgentRunnerConfig::long_term_memory`:
+Attach memory with `AgentRuntimeBuilder::long_term_memory`:
 
 ```cpp
 auto memory = std::make_shared<agent::LongTermMemory>();
-agent::AgentRunner runner(agent::AgentRunnerConfig{
-    .adapter = model,
-    .long_term_memory = memory,
-});
+auto runner = agent::AgentRuntimeBuilder()
+                  .model(model)
+                  .long_term_memory(memory)
+                  .build();
 ```
 
 Runner memory retrieval follows the NodeJS tri-state `enabled` behavior:

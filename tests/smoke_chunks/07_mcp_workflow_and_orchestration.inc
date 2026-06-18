@@ -77,7 +77,8 @@
       },
       "/v1/chat/completions",
       "https://api.openai.test",
-      "provider-key");
+      "provider-key",
+      {}, {}, {}, agent::ProviderReasoningMode::None, openai_smoke_runtime_options());
   auto provider_response = provider_model.generate(agent::GenerateParams{
       .messages = {agent::create_message(agent::MessageRole::User, "hello")},
   });
@@ -89,7 +90,11 @@
       [&](const agent::NativeProviderRequest&) {
         missing_openai_key_called = true;
         return agent::Value::object({});
-      });
+      },
+      "/v1/chat/completions",
+      {},
+      {},
+      {}, {}, {}, agent::ProviderReasoningMode::None, openai_smoke_runtime_options());
   bool missing_openai_key_failed = false;
   try {
     (void)missing_openai_key_model.generate(agent::GenerateParams{
@@ -122,7 +127,8 @@
       },
       "/v1/chat/completions",
       "https://api.openai.test",
-      "provider-cancel-key");
+      "provider-cancel-key",
+      {}, {}, {}, agent::ProviderReasoningMode::None, openai_smoke_runtime_options());
   try {
     (void)provider_cancellation_model.generate(agent::GenerateParams{
         .messages = {agent::create_message(agent::MessageRole::User, "cancel provider")},
@@ -176,7 +182,8 @@
       },
       "/v1/chat/completions",
       "https://api.openai.test",
-      "provider-args-key");
+      "provider-args-key",
+      {}, {}, {}, agent::ProviderReasoningMode::None, openai_smoke_runtime_options());
   auto provider_argument_normalization = provider_argument_normalization_model.generate(agent::GenerateParams{
       .messages = {agent::create_message(agent::MessageRole::User, "args")},
   });
@@ -215,12 +222,25 @@
             "data: {\"id\":\"chatcmpl_stream\",\"model\":\"gpt-stream\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
             "data: [DONE]\n\n",
         };
-      });
-  auto provider_stream_events = provider_stream_model.stream(agent::GenerateParams{
+      },
+      {}, {}, agent::ProviderReasoningMode::None, openai_smoke_runtime_options());
+  const auto provider_stream_contract = provider_stream_model.stream_contract();
+  SMOKE_CHECK(provider_stream_contract.schema_version == agent::kAgentStreamEventSchemaVersion);
+  SMOKE_CHECK(provider_stream_contract.provider == "openai");
+  SMOKE_CHECK(provider_stream_contract.model == "gpt-stream");
+  SMOKE_CHECK(provider_stream_contract.frame_boundary == agent::ModelStreamFrameBoundary::SseEvent);
+  SMOKE_CHECK(provider_stream_contract.text_delta);
+  SMOKE_CHECK(agent::model_provider_stream_contract_to_value(provider_stream_contract)
+                  .at("frameBoundary").as_string() == "sse-event");
+  auto provider_stream_events = capture_model_stream(provider_stream_model, agent::GenerateParams{
       .messages = {agent::create_message(agent::MessageRole::User, "hello")},
   });
   SMOKE_CHECK(provider_stream_called);
   SMOKE_CHECK(provider_stream_events.size() == 6);
+  for (std::size_t index = 0; index < provider_stream_events.size(); ++index) {
+    SMOKE_CHECK(provider_stream_events[index].schema_version == agent::kAgentStreamEventSchemaVersion);
+    SMOKE_CHECK(provider_stream_events[index].sequence == index + 1);
+  }
   SMOKE_CHECK(provider_stream_events[0].type == agent::ModelStreamEventType::ResponseStart);
   SMOKE_CHECK(provider_stream_events[1].type == agent::ModelStreamEventType::TextDelta);
   SMOKE_CHECK(provider_stream_events[1].text == "hel");
@@ -262,9 +282,10 @@
         return std::vector<std::string>{
             "data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n",
         };
-      });
+      },
+      {}, {}, agent::ProviderReasoningMode::None, openai_smoke_runtime_options());
   try {
-    (void)provider_stream_cancellation_model.stream(agent::GenerateParams{
+    (void)capture_model_stream(provider_stream_cancellation_model, agent::GenerateParams{
         .messages = {agent::create_message(agent::MessageRole::User, "stream cancel")},
         .cancellation = &provider_stream_cancellation,
     });
@@ -333,7 +354,8 @@
       },
       "/v1/chat/completions",
       "https://api.openai.responses",
-      "responses-key");
+      "responses-key",
+      {}, {}, {}, agent::ProviderReasoningMode::None, openai_smoke_runtime_options());
   auto provider_responses = provider_responses_model.generate(agent::GenerateParams{
       .messages = {
           agent::create_message(agent::MessageRole::System, "responses system"),
@@ -384,8 +406,9 @@
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream\",\"model\":\"gpt-responses-stream\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"stream answer\"}]},{\"type\":\"reasoning\",\"summary\":[{\"text\":\"completed reason\"}]},{\"type\":\"function_call\",\"call_id\":\"call_stream\",\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\\\"stream\\\"}\"}]}}\n\n",
             "data: [DONE]\n\n",
         };
-      });
-  auto provider_responses_stream = provider_responses_stream_model.stream(agent::GenerateParams{
+      },
+      {}, {}, agent::ProviderReasoningMode::None, openai_smoke_runtime_options());
+  auto provider_responses_stream = capture_model_stream(provider_responses_stream_model, agent::GenerateParams{
       .messages = {agent::create_message(agent::MessageRole::User, "stream input")},
       .settings = agent::ModelSettings{
           .reasoning = agent::ReasoningSettings{.enabled = true},
@@ -428,8 +451,9 @@
               })},
           })},
       }),
-      "main",
-      [](const agent::NativeProviderRequest&) -> agent::Value {
+      native_resolve_options("main",
+      [&](const agent::NativeProviderRequest& request) -> agent::Value {
+        (void)request;
         SMOKE_CHECK(false);
         return agent::Value::object({});
       },
@@ -441,17 +465,91 @@
         configured_provider_stream_called = true;
         SMOKE_CHECK(request.provider == "openai");
         SMOKE_CHECK(request.headers.at("authorization") == "Bearer config-stream-key");
-        SMOKE_CHECK(request.body.at("stream").as_bool());
         return std::vector<std::string>{
-            "data: {\"id\":\"cfg_stream\",\"model\":\"gpt-config-stream\",\"choices\":[{\"delta\":{\"content\":\"config stream\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"cfg_stream\",\"model\":\"gpt-config-stream\",\"choices\":[{\"delta\":{\"content\":\"Thought: Produce the configured response\\nFin\"}}]}\n\n",
+            "data: {\"id\":\"cfg_stream\",\"model\":\"gpt-config-stream\",\"choices\":[{\"delta\":{\"content\":\"al Answer: config stream\"},\"finish_reason\":\"stop\"}]}\n\n",
             "data: [DONE]\n\n",
         };
-      });
-  auto configured_provider_stream = configured_provider_stream_app.runner->stream(
+      }));
+  auto configured_provider_stream = capture_runner_stream(
+      *configured_provider_stream_app.runner,
       "config stream input",
       "config-stream-session");
   SMOKE_CHECK(configured_provider_stream_called);
   SMOKE_CHECK(configured_provider_stream.result.text == "config stream");
+
+  struct OpenAICompatibleProfileCase {
+    std::string provider;
+    std::string model;
+    std::string base_url;
+    std::string api_key;
+  };
+  const std::vector<OpenAICompatibleProfileCase> openai_compatible_profiles = {
+      {"lmstudio", "lmstudio-config-stream", "http://127.0.0.1:1234/v1", ""},
+      {"llamacpp", "llamacpp-config-stream", "http://127.0.0.1:8080/v1", ""},
+      {"vllm", "vllm-config-stream", "http://127.0.0.1:8000/v1", ""},
+      {"openrouter", "openrouter/config-stream", "https://openrouter.ai/api/v1", "openrouter-key"},
+      {"groq", "groq-config-stream", "https://api.groq.com/openai/v1", "groq-key"},
+      {"siliconflow", "siliconflow-config-stream", "https://api.siliconflow.cn/v1", "siliconflow-key"},
+      {"omlx", "omlx-config-stream", "http://127.0.0.1:8000/v1", ""},
+      {"kimi", "kimi-k2.6", "https://api.moonshot.ai/v1", "kimi-key"},
+      {"zhipu", "glm-4.7", "https://open.bigmodel.cn/api/paas/v4", "zhipu-key"},
+      {"doubao", "doubao-seed-1-6", "https://ark.cn-beijing.volces.com/api/v3", "doubao-key"},
+      {"hunyuan", "hunyuan-turbos-latest", "https://api.hunyuan.cloud.tencent.com/v1", "hunyuan-key"},
+      {"minimax", "MiniMax-M3", "https://api.minimax.io/v1", "minimax-key"},
+      {"qianfan", "ernie-4.5-turbo", "https://qianfan.baidubce.com/v2", "qianfan-key"},
+  };
+  for (const auto& profile : openai_compatible_profiles) {
+    bool configured_profile_stream_called = false;
+    auto model_config = agent::Value::object({
+        {"provider", profile.provider},
+        {"model", profile.model},
+    });
+    if (!profile.api_key.empty()) {
+      model_config["apiKey"] = profile.api_key;
+    }
+    auto configured_profile_stream_app = agent::resolve_native_agent_app(
+        agent::Value::object({
+            {"agents", agent::Value::object({
+                {"main", agent::Value::object({
+                    {"model", model_config},
+                })},
+            })},
+        }),
+        native_resolve_options("main",
+        [&](const agent::NativeProviderRequest& request) -> agent::Value {
+          (void)request;
+          SMOKE_CHECK(false);
+          return agent::Value::object({});
+        },
+        {},
+        {},
+        {},
+        {},
+        [&](const agent::NativeProviderRequest& request) {
+          configured_profile_stream_called = true;
+          SMOKE_CHECK(request.provider == profile.provider);
+          SMOKE_CHECK(request.endpoint == "/chat/completions");
+          SMOKE_CHECK(request.base_url == profile.base_url);
+          SMOKE_CHECK(request.body.at("model").as_string() == profile.model);
+          if (!profile.api_key.empty()) {
+            SMOKE_CHECK(request.headers.at("authorization") == "Bearer " + profile.api_key);
+          } else {
+            SMOKE_CHECK(request.headers.find("authorization") == request.headers.end());
+          }
+          return std::vector<std::string>{
+              "data: {\"id\":\"profile_stream\",\"model\":\"" + profile.model + "\",\"choices\":[{\"delta\":{\"content\":\"Thought: Profile stream\\nFinal \"}}]}\n\n",
+              "data: {\"id\":\"profile_stream\",\"model\":\"" + profile.model + "\",\"choices\":[{\"delta\":{\"content\":\"Answer: " + profile.provider + " ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+              "data: [DONE]\n\n",
+          };
+        }));
+    auto configured_profile_stream = capture_runner_stream(
+        *configured_profile_stream_app.runner,
+        "config profile stream input",
+        profile.provider + "-config-stream-session");
+    SMOKE_CHECK(configured_profile_stream_called);
+    SMOKE_CHECK(configured_profile_stream.result.text == profile.provider + " ok");
+  }
 
   bool configured_ollama_stream_called = false;
   auto configured_ollama_stream_app = agent::resolve_native_agent_app(
@@ -466,8 +564,9 @@
               })},
           })},
       }),
-      "main",
-      [](const agent::NativeProviderRequest&) -> agent::Value {
+      native_resolve_options("main",
+      [&](const agent::NativeProviderRequest& request) -> agent::Value {
+        (void)request;
         SMOKE_CHECK(false);
         return agent::Value::object({});
       },
@@ -480,13 +579,14 @@
         SMOKE_CHECK(request.provider == "ollama");
         SMOKE_CHECK(request.endpoint == "/chat");
         SMOKE_CHECK(request.base_url == "http://127.0.0.1:11434/api");
-        SMOKE_CHECK(request.body.at("stream").as_bool());
         return std::vector<std::string>{
-            "{\"model\":\"llama-config-stream\",\"message\":{\"content\":\"config ollama\"}}\n",
+            "{\"model\":\"llama-config-stream\",\"message\":{\"content\":\"Thought: Produce the configured Ollama response\\nFinal \"}}\n",
+            "{\"model\":\"llama-config-stream\",\"message\":{\"content\":\"Answer: config ollama\"}}\n",
             "{\"model\":\"llama-config-stream\",\"created_at\":\"ollama_cfg\",\"done\":true,\"done_reason\":\"stop\",\"message\":{}}\n",
         };
-      });
-  auto configured_ollama_stream = configured_ollama_stream_app.runner->stream(
+      }));
+  auto configured_ollama_stream = capture_runner_stream(
+      *configured_ollama_stream_app.runner,
       "config ollama stream input",
       "ollama-config-stream-session");
   SMOKE_CHECK(configured_ollama_stream_called);
@@ -506,8 +606,9 @@
               })},
           })},
       }),
-      "main",
-      [](const agent::NativeProviderRequest&) -> agent::Value {
+      native_resolve_options("main",
+      [&](const agent::NativeProviderRequest& request) -> agent::Value {
+        (void)request;
         SMOKE_CHECK(false);
         return agent::Value::object({});
       },
@@ -522,10 +623,12 @@
         SMOKE_CHECK(request.base_url == "https://generativelanguage.googleapis.com/v1beta");
         SMOKE_CHECK(request.headers.at("x-goog-api-key") == "gemini-config-stream-key");
         return std::vector<std::string>{
-            "data: {\"responseId\":\"gemini_cfg\",\"modelVersion\":\"gemini-config-stream\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"config gemini\"}]}}]}\n\n",
+            "data: {\"responseId\":\"gemini_cfg\",\"modelVersion\":\"gemini-config-stream\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Thought: Produce the configured Gemini response\\nFinal \"}]}}]}\n\n",
+            "data: {\"responseId\":\"gemini_cfg\",\"modelVersion\":\"gemini-config-stream\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"Answer: config gemini\"}]}}]}\n\n",
         };
-      });
-  auto configured_gemini_stream = configured_gemini_stream_app.runner->stream(
+      }));
+  auto configured_gemini_stream = capture_runner_stream(
+      *configured_gemini_stream_app.runner,
       "config gemini stream input",
       "gemini-config-stream-session");
 	  SMOKE_CHECK(configured_gemini_stream_called);
@@ -600,14 +703,16 @@
         SMOKE_CHECK(request.base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1");
         SMOKE_CHECK(request.headers.at("authorization") == "Bearer qwen-stream-key");
         SMOKE_CHECK(request.body.at("stream").as_bool());
+        SMOKE_CHECK(request.body.at("stream_options").at("include_usage").as_bool());
         SMOKE_CHECK(request.body.at("enable_thinking").as_bool());
         return std::vector<std::string>{
             "data: {\"id\":\"qwen_stream\",\"model\":\"qwen-plus\",\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
             "data: {\"id\":\"qwen_stream\",\"model\":\"qwen-plus\",\"choices\":[{\"delta\":{\"content\":\" answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"qwen_stream\",\"model\":\"qwen-plus\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"completion_tokens_details\":{\"reasoning_tokens\":3}}}\n\n",
             "data: [DONE]\n\n",
         };
       });
-  auto qwen_stream_events = qwen_stream_model.stream(agent::GenerateParams{
+  auto qwen_stream_events = capture_model_stream(qwen_stream_model, agent::GenerateParams{
       .messages = {agent::create_message(agent::MessageRole::User, "hello")},
       .settings = agent::ModelSettings{
           .reasoning = agent::ReasoningSettings{.enabled = true},
@@ -622,6 +727,11 @@
   SMOKE_CHECK(qwen_stream_events[3].response.reasoning);
   SMOKE_CHECK(qwen_stream_events[3].response.reasoning->text == "think");
   SMOKE_CHECK(qwen_stream_events[3].response.text == " answer");
+  const auto qwen_stream_usage = agent::extract_model_usage(qwen_stream_events[3].response);
+  SMOKE_CHECK(qwen_stream_usage.input_tokens == 11);
+  SMOKE_CHECK(qwen_stream_usage.output_tokens == 7);
+  SMOKE_CHECK(qwen_stream_usage.reasoning_tokens == 3);
+  SMOKE_CHECK(qwen_stream_usage.reasoning_source == agent::ReasoningSource::Provider);
 
   bool qwen_responses_called = false;
   agent::QwenChatModelAdapter qwen_responses_model(
@@ -792,7 +902,7 @@
 	            "data: [DONE]\n\n",
 	        };
 	      });
-	  auto mimo_stream_events = mimo_stream_model.stream(agent::GenerateParams{
+	  auto mimo_stream_events = capture_model_stream(mimo_stream_model, agent::GenerateParams{
 	      .messages = {agent::create_message(agent::MessageRole::User, "hello stream")},
 	  });
 	  SMOKE_CHECK(mimo_stream_called);
@@ -898,7 +1008,7 @@
             "data: {\"type\":\"message_stop\"}\n\n",
         };
       });
-  auto anthropic_stream_events = anthropic_stream_model.stream(agent::GenerateParams{
+  auto anthropic_stream_events = capture_model_stream(anthropic_stream_model, agent::GenerateParams{
       .messages = {agent::create_message(agent::MessageRole::User, "hello")},
       .tools = {agent::ChatToolDescriptor{.name = "lookup", .description = "Lookup data"}},
       .settings = agent::ModelSettings{
@@ -999,14 +1109,14 @@
         SMOKE_CHECK(request.body.at("thinking").at("type").as_string() == "enabled");
         SMOKE_CHECK(!request.body.at("thinking").contains("budget_tokens"));
         return std::vector<std::string>{
-            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"ds_stream\",\"model\":\"deepseek-stream\"}}\n\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"ds_stream\",\"model\":\"deepseek-stream\",\"usage\":{\"input_tokens\":9,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":1}}}\n\n",
             "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"deep\"}}\n\n",
             "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"<think>tagged stream</think>seek stream\"}}\n\n",
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":6,\"completion_tokens_details\":{\"reasoning_tokens\":2}}}\n\n",
             "data: {\"type\":\"message_stop\"}\n\n",
         };
       });
-  auto deepseek_stream_events = deepseek_stream_model.stream(agent::GenerateParams{
+  auto deepseek_stream_events = capture_model_stream(deepseek_stream_model, agent::GenerateParams{
       .messages = {agent::create_message(agent::MessageRole::User, "hello")},
       .settings = agent::ModelSettings{
           .reasoning = agent::ReasoningSettings{.enabled = true},
@@ -1025,6 +1135,12 @@
   SMOKE_CHECK(deepseek_stream_events[4].response.reasoning->text == "deep");
   SMOKE_CHECK(deepseek_stream_events[4].response.text == "seek stream");
   SMOKE_CHECK(deepseek_stream_events[4].response.finish_reason == "stop");
+  const auto deepseek_stream_usage = agent::extract_model_usage(deepseek_stream_events[4].response);
+  SMOKE_CHECK(deepseek_stream_usage.input_tokens == 14);
+  SMOKE_CHECK(deepseek_stream_usage.output_tokens == 6);
+  SMOKE_CHECK(deepseek_stream_usage.cached_input_tokens == 4);
+  SMOKE_CHECK(deepseek_stream_usage.reasoning_tokens == 2);
+  SMOKE_CHECK(deepseek_stream_usage.reasoning_source == agent::ReasoningSource::Provider);
 
   bool ollama_called = false;
   agent::OllamaChatModelAdapter ollama_model("llama3.1",
@@ -1036,6 +1152,10 @@
         SMOKE_CHECK(!request.body.at("stream").as_bool());
         SMOKE_CHECK(request.body.at("think").as_bool());
         SMOKE_CHECK(request.body.at("options").at("temperature").as_number() == 0.2);
+        SMOKE_CHECK(request.body.at("options").at("num_ctx").as_integer() == 8192);
+        SMOKE_CHECK(request.body.at("options").at("top_k").as_integer() == 42);
+        SMOKE_CHECK(request.body.at("options").at("num_batch").as_integer() == 256);
+        SMOKE_CHECK(request.body.at("keep_alive").as_string() == "10m");
         return agent::Value::object({
             {"model", "llama3.1"},
             {"done", true},
@@ -1059,6 +1179,16 @@
       .settings = agent::ModelSettings{
           .temperature = 0.2,
           .reasoning = agent::ReasoningSettings{.enabled = true},
+          .extra = agent::Value::object({
+              {"ollama", agent::Value::object({
+                  {"numCtx", 8192},
+                  {"keepAlive", "10m"},
+                  {"options", agent::Value::object({
+                      {"top_k", 42},
+                      {"num_batch", 256},
+                  })},
+              })},
+          }),
       },
   });
   SMOKE_CHECK(ollama_called);
@@ -1066,6 +1196,25 @@
   SMOKE_CHECK(ollama_response.reasoning && ollama_response.reasoning->text == "ollama reasoning");
   SMOKE_CHECK(ollama_response.tool_calls.size() == 1);
   SMOKE_CHECK(ollama_response.tool_calls.front().name == "echo");
+
+  bool invalid_ollama_extra_failed = false;
+  try {
+    (void)agent::build_ollama_chat_request(
+        agent::GenerateParams{
+            .messages = {agent::create_message(agent::MessageRole::User, "hello")},
+            .settings = agent::ModelSettings{
+                .extra = agent::Value::object({
+                    {"ollama", agent::Value::object({{"numCtx", "large"}})},
+                }),
+            },
+        },
+        "llama3.1");
+  } catch (const agent::ConfigurationError& error) {
+    invalid_ollama_extra_failed =
+        std::string(error.what()).find("ModelSettings.extra.ollama.numCtx must be a number") !=
+        std::string::npos;
+  }
+  SMOKE_CHECK(invalid_ollama_extra_failed);
 
   bool ollama_tagged_called = false;
   agent::OllamaChatModelAdapter ollama_tagged_model("llama-tagged",
@@ -1111,7 +1260,7 @@
             "{\"model\":\"llama-tagged-stream\",\"done\":true,\"done_reason\":\"stop\",\"message\":{\"content\":\"答案\"}}\n",
         };
       });
-  auto ollama_tagged_stream_events = ollama_tagged_stream_model.stream(agent::GenerateParams{
+  auto ollama_tagged_stream_events = capture_model_stream(ollama_tagged_stream_model, agent::GenerateParams{
       .messages = {agent::create_message(agent::MessageRole::User, "hello")},
       .settings = agent::ModelSettings{
           .reasoning = agent::ReasoningSettings{.enabled = true},
@@ -1155,7 +1304,12 @@
             "{\"model\":\"llama-stream\",\"created_at\":\"ollama_done\",\"done\":true,\"done_reason\":\"stop\",\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"echo\",\"arguments\":{\"value\":2}}}]}}\n",
         };
       });
-  auto ollama_stream_events = ollama_stream_model.stream(agent::GenerateParams{
+  const auto ollama_stream_contract = ollama_stream_model.stream_contract();
+  SMOKE_CHECK(ollama_stream_contract.schema_version == agent::kAgentStreamEventSchemaVersion);
+  SMOKE_CHECK(ollama_stream_contract.provider == "ollama");
+  SMOKE_CHECK(ollama_stream_contract.frame_boundary == agent::ModelStreamFrameBoundary::JsonLine);
+  SMOKE_CHECK(ollama_stream_contract.reasoning_delta);
+  auto ollama_stream_events = capture_model_stream(ollama_stream_model, agent::GenerateParams{
       .messages = {agent::create_message(agent::MessageRole::User, "hello")},
       .settings = agent::ModelSettings{
           .reasoning = agent::ReasoningSettings{.enabled = true},
@@ -1185,6 +1339,130 @@
 	  SMOKE_CHECK(ollama_stream_events[5].response.tool_calls.front().arguments.at("value").as_integer() == 2);
 	  SMOKE_CHECK(ollama_stream_events[5].response.finish_reason == "tool_calls");
 
+  const auto run_ollama_realtime_reasoning_case =
+      [&](const std::string& case_name,
+          const std::vector<std::string>& chunks,
+          const std::vector<std::size_t>& expected_reasoning_counts,
+          const std::string& expected_reasoning) {
+        bool realtime_ollama_called = false;
+        std::size_t reasoning_event_count = 0;
+        std::vector<std::size_t> reasoning_counts_after_chunk;
+        std::vector<agent::ModelStreamEvent> realtime_events;
+        bool stream_returned = false;
+        bool saw_reasoning_before_return = false;
+        agent::OllamaChatModelAdapter realtime_ollama_model(
+            "llama-realtime-" + case_name,
+            [](const agent::NativeProviderRequest&) -> agent::Value {
+              SMOKE_CHECK(false);
+              return agent::Value::object({});
+            },
+            "http://127.0.0.1:11434/",
+            {},
+            [&](const agent::NativeProviderRequest& request,
+                agent::NativeProviderStreamingChunkHandler on_chunk) {
+              realtime_ollama_called = true;
+              SMOKE_CHECK(request.provider == "ollama");
+              for (const auto& chunk : chunks) {
+                on_chunk(chunk);
+                reasoning_counts_after_chunk.push_back(reasoning_event_count);
+              }
+            });
+        std::string reasoning_delta_text;
+        realtime_ollama_model.stream(
+            agent::GenerateParams{
+                .messages = {agent::create_message(agent::MessageRole::User, "hello")},
+                .settings = agent::ModelSettings{
+                    .reasoning = agent::ReasoningSettings{.enabled = true},
+                },
+            },
+            [&](const agent::ModelStreamEvent& event) {
+              realtime_events.push_back(event);
+              if (event.type == agent::ModelStreamEventType::ReasoningDelta) {
+                ++reasoning_event_count;
+                saw_reasoning_before_return = saw_reasoning_before_return || !stream_returned;
+                reasoning_delta_text += event.delta;
+                SMOKE_CHECK(event.reasoning == reasoning_delta_text);
+              }
+            });
+        stream_returned = true;
+        SMOKE_CHECK(realtime_ollama_called);
+        SMOKE_CHECK(reasoning_counts_after_chunk == expected_reasoning_counts);
+        SMOKE_CHECK(saw_reasoning_before_return);
+        SMOKE_CHECK(reasoning_delta_text == expected_reasoning);
+        SMOKE_CHECK(!realtime_events.empty());
+        SMOKE_CHECK(realtime_events.back().type == agent::ModelStreamEventType::Response);
+        SMOKE_CHECK(realtime_events.back().response.reasoning);
+        SMOKE_CHECK(realtime_events.back().response.reasoning->text == expected_reasoning);
+      };
+
+  const std::string ollama_realtime_done =
+      "{\"model\":\"llama-realtime\",\"done\":true,\"done_reason\":\"stop\",\"message\":{}}";
+  const std::string ollama_realtime_thinking =
+      "{\"model\":\"llama-realtime\",\"message\":{\"thinking\":\"abc\",\"content\":\"\"},\"done\":false}";
+  run_ollama_realtime_reasoning_case("newline",
+                                     {ollama_realtime_thinking + "\n", ollama_realtime_done + "\n"},
+                                     {1, 1},
+                                     "abc");
+  run_ollama_realtime_reasoning_case("no-newline",
+                                     {ollama_realtime_thinking, ollama_realtime_done},
+                                     {1, 1},
+                                     "abc");
+  run_ollama_realtime_reasoning_case("split-json",
+                                     {ollama_realtime_thinking.substr(0, 37),
+                                      ollama_realtime_thinking.substr(37),
+                                      ollama_realtime_done},
+                                     {0, 1, 1},
+                                     "abc");
+  const std::string ollama_realtime_utf8 =
+      "{\"model\":\"llama-realtime\",\"message\":{\"thinking\":\"你好\",\"content\":\"\"},\"done\":false}";
+  const auto utf8_split = ollama_realtime_utf8.find("你");
+  SMOKE_CHECK(utf8_split != std::string::npos);
+  run_ollama_realtime_reasoning_case("split-utf8",
+                                     {ollama_realtime_utf8.substr(0, utf8_split + 1),
+                                      ollama_realtime_utf8.substr(utf8_split + 1),
+                                      ollama_realtime_done},
+                                     {0, 1, 1},
+                                     "你好");
+  const std::string ollama_property_stream = ollama_realtime_utf8 + ollama_realtime_done;
+  for (const std::size_t chunk_size : std::vector<std::size_t>{1, 2, 3, 4, 5, 7, 11}) {
+    std::vector<std::string> chunks;
+    for (std::size_t offset = 0; offset < ollama_property_stream.size(); offset += chunk_size) {
+      chunks.push_back(ollama_property_stream.substr(offset, chunk_size));
+    }
+    bool property_ollama_called = false;
+    agent::OllamaChatModelAdapter property_ollama_model(
+        "llama-property-" + std::to_string(chunk_size),
+        [](const agent::NativeProviderRequest&) -> agent::Value {
+          SMOKE_CHECK(false);
+          return agent::Value::object({});
+        },
+        "http://127.0.0.1:11434/",
+        {},
+        [&](const agent::NativeProviderRequest&,
+            agent::NativeProviderStreamingChunkHandler on_chunk) {
+          property_ollama_called = true;
+          for (const auto& chunk : chunks) {
+            on_chunk(chunk);
+          }
+        });
+    std::string reasoning_delta_text;
+    property_ollama_model.stream(
+        agent::GenerateParams{
+            .messages = {agent::create_message(agent::MessageRole::User, "hello")},
+            .settings = agent::ModelSettings{
+                .reasoning = agent::ReasoningSettings{.enabled = true},
+            },
+        },
+        [&](const agent::ModelStreamEvent& event) {
+          if (event.type == agent::ModelStreamEventType::ReasoningDelta) {
+            reasoning_delta_text += event.delta;
+          }
+        });
+    SMOKE_CHECK(property_ollama_called);
+    SMOKE_CHECK(reasoning_delta_text == "你好");
+    SMOKE_CHECK(reasoning_delta_text.find(std::string("\xEF\xBF\xBD")) == std::string::npos);
+  }
+
   auto slow_ollama_stream_model = std::make_shared<agent::OllamaChatModelAdapter>(
       "llama-slow-stream",
       [](const agent::NativeProviderRequest&) -> agent::Value {
@@ -1197,7 +1475,7 @@
         SMOKE_CHECK(request.provider == "ollama");
         SMOKE_CHECK(request.body.at("stream").as_bool());
         const std::vector<std::string> chunks{
-            "{\"model\":\"llama-slow-stream\",\"message\":{\"content\":\"one \"}}\n",
+            "{\"model\":\"llama-slow-stream\",\"message\":{\"content\":\"Thought: stream slowly\\nFinal Answer: one \"}}\n",
             "{\"model\":\"llama-slow-stream\",\"message\":{\"content\":\"two \"}}\n",
             "{\"model\":\"llama-slow-stream\",\"message\":{\"content\":\"three\"}}\n",
             "{\"model\":\"llama-slow-stream\",\"done\":true,\"done_reason\":\"stop\",\"message\":{}}\n",
@@ -1208,17 +1486,19 @@
         }
       });
   agent::AgentRunner slow_ollama_runner(agent::AgentRunnerConfig{
-      .adapter = slow_ollama_stream_model,
+      .model_runtime = {
+          .adapter = slow_ollama_stream_model,
+      },
   });
   std::vector<std::chrono::steady_clock::time_point> slow_ollama_delta_times;
   const auto slow_ollama_sink_id =
-      slow_ollama_runner.register_event_sink([&](const agent::FrameworkEvent& event) {
+      slow_ollama_runner.events().register_sink([&](const agent::FrameworkEvent& event) {
         if (event.category == "model.delta") {
           slow_ollama_delta_times.push_back(std::chrono::steady_clock::now());
         }
       });
-  const auto slow_ollama_result = slow_ollama_runner.stream("hello", "slow-ollama-stream");
-  slow_ollama_runner.unregister_event_sink(slow_ollama_sink_id);
+  const auto slow_ollama_result = capture_runner_stream(slow_ollama_runner, "hello", "slow-ollama-stream");
+  slow_ollama_runner.events().unregister_sink(slow_ollama_sink_id);
   SMOKE_CHECK(slow_ollama_result.result.text == "one two three");
   SMOKE_CHECK(slow_ollama_delta_times.size() >= 3);
   for (std::size_t index = 1; index < slow_ollama_delta_times.size(); ++index) {
@@ -1316,9 +1596,10 @@
             "data: {\"responseId\":\"gemini_stream\",\"modelVersion\":\"gemini-stream\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"gemini thought\",\"thought\":true}]}}]}\n\n",
             "data: {\"responseId\":\"gemini_stream\",\"modelVersion\":\"gemini-stream\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"gemini \"},{\"text\":\"stream\"}]}}]}\n\n",
             "data: {\"responseId\":\"gemini_stream\",\"modelVersion\":\"gemini-stream\",\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"gem_tool\",\"name\":\"lookup\",\"args\":{\"query\":\"native\"}}}]}}]}\n\n",
+            "data: {\"responseId\":\"gemini_stream\",\"modelVersion\":\"gemini-stream\",\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":7,\"thoughtsTokenCount\":3,\"totalTokenCount\":30}}\n\n",
         };
       });
-  auto gemini_stream_events = gemini_stream_model.stream(agent::GenerateParams{
+  auto gemini_stream_events = capture_model_stream(gemini_stream_model, agent::GenerateParams{
       .messages = {agent::create_message(agent::MessageRole::User, "hello")},
       .settings = agent::ModelSettings{
           .reasoning = agent::ReasoningSettings{
@@ -1354,6 +1635,12 @@
   SMOKE_CHECK(gemini_stream_events[5].response.tool_calls.front().id == "gem_tool");
   SMOKE_CHECK(gemini_stream_events[5].response.tool_calls.front().arguments.at("query").as_string() == "native");
   SMOKE_CHECK(gemini_stream_events[5].response.finish_reason == "tool_calls");
+  const auto gemini_stream_usage = agent::extract_model_usage(gemini_stream_events[5].response);
+  SMOKE_CHECK(gemini_stream_usage.input_tokens == 20);
+  SMOKE_CHECK(gemini_stream_usage.output_tokens == 10);
+  SMOKE_CHECK(gemini_stream_usage.total_tokens == 30);
+  SMOKE_CHECK(gemini_stream_usage.reasoning_tokens == 3);
+  SMOKE_CHECK(gemini_stream_usage.reasoning_source == agent::ReasoningSource::Provider);
 
   agent::InMemoryRealtimeBus realtime(agent::InMemoryRealtimeBusOptions{.replay_limit = 8});
   int realtime_deliveries = 0;
@@ -2126,8 +2413,8 @@
      public:
       StreamingToolCallModel()
           : ChatModelAdapter("test", "tcd-runtime", 0.0, 64, {"input.text"}) {}
-      agent::ModelResponse generate(const agent::GenerateParams&) override {
-        agent::ModelResponse response;
+      agent::AgentOutput generate(const agent::GenerateParams&) override {
+        agent::AgentOutput response;
         response.text = "";
         response.finish_reason = "tool_calls";
         response.tool_calls.push_back(agent::ToolCall{
@@ -2135,7 +2422,7 @@
             .name = "noop",
             .arguments = agent::Value::object({{"k", std::string("v")}}),
         });
-        return build_response(response);
+        return build_output(response);
       }
       void stream(const agent::GenerateParams& params,
                   StreamEventHandler on_event) override {
@@ -2146,12 +2433,12 @@
               .provider = "test",
               .model = "tcd-runtime",
           });
-          agent::ModelResponse final_response;
+          agent::AgentOutput final_response;
           final_response.text = "done";
           final_response.finish_reason = "stop";
           on_event(agent::ModelStreamEvent{
               .type = agent::ModelStreamEventType::Response,
-              .response = build_response(final_response),
+              .response = build_output(final_response),
           });
           return;
         }
@@ -2175,7 +2462,7 @@
               .tool_call_args_accumulated = accum,
           });
         }
-        agent::ModelResponse response;
+        agent::AgentOutput response;
         response.finish_reason = "tool_calls";
         response.tool_calls.push_back(agent::ToolCall{
             .id = "call_R",
@@ -2184,7 +2471,7 @@
         });
         on_event(agent::ModelStreamEvent{
             .type = agent::ModelStreamEventType::Response,
-            .response = build_response(response),
+            .response = build_output(response),
         });
         (void)params;
       }
@@ -2210,7 +2497,7 @@
         tcd_bus_events.push_back(event);
       }
     });
-    agent::AgentLoop tcd_loop(agent::AgentLoopConfig{
+    agent::internal::AgentLoop tcd_loop(agent::internal::AgentLoopConfig{
         .model = std::make_shared<StreamingToolCallModel>(),
         .tool_registry = &tcd_registry,
         .tool_executor = &tcd_executor,
@@ -2219,7 +2506,7 @@
         .event_bus = &tcd_bus,
     });
     agent::SessionMemory tcd_session(agent::SessionMemoryOptions{.storage = {.session_id = "tcd"}});
-    auto tcd_stream = tcd_loop.stream(tcd_session, std::string("go"));
+    auto tcd_stream = capture_loop_stream(tcd_loop, tcd_session, std::string("go"));
 
     std::size_t first_delta_index = static_cast<std::size_t>(-1);
     std::size_t first_tool_start_index = static_cast<std::size_t>(-1);
@@ -2330,4 +2617,215 @@
     SMOKE_CHECK(final_event.response.tool_calls.size() == 1);
     SMOKE_CHECK(final_event.response.tool_calls.front().id == delta_event->tool_call_id);
     SMOKE_CHECK(final_event.response.tool_calls.front().name == "fs.readText");
+  }
+
+  // Test F: incremental SSE parsing waits for a complete event before parsing
+  // JSON, even when a UTF-8 character is split across network chunks.
+  {
+    const std::string replacement{
+        static_cast<char>(0xEF), static_cast<char>(0xBF), static_cast<char>(0xBD)};
+    std::vector<agent::ModelStreamEvent> events;
+    std::vector<std::size_t> event_counts_after_chunk;
+    agent::OpenAICompatibleChatModelAdapter boundary_model(
+        "boundary", "gpt-boundary",
+        [](const agent::NativeProviderRequest&) {
+          return agent::Value::object({});
+        },
+        "/v1/chat/completions",
+        "https://api.boundary.test",
+        "",
+        agent::NativeProviderStreamTransport{},
+        "",
+        [&](const agent::NativeProviderRequest&,
+            agent::NativeProviderStreamingChunkHandler on_chunk) {
+          const std::string frame =
+              "data: {\"id\":\"utf8\",\"model\":\"gpt-boundary\",\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\n";
+          const auto utf8_start = frame.find("好");
+          const auto delimiter_start = frame.rfind("\n\n");
+          SMOKE_CHECK(utf8_start != std::string::npos);
+          SMOKE_CHECK(delimiter_start != std::string::npos);
+          const auto split_inside_utf8 = utf8_start + 1;
+
+          on_chunk(std::string_view(frame.data(), split_inside_utf8));
+          event_counts_after_chunk.push_back(events.size());
+          on_chunk(std::string_view(frame.data() + split_inside_utf8,
+                                    delimiter_start + 1 - split_inside_utf8));
+          event_counts_after_chunk.push_back(events.size());
+          on_chunk(std::string_view(frame.data() + delimiter_start + 1,
+                                    frame.size() - delimiter_start - 1));
+          event_counts_after_chunk.push_back(events.size());
+          on_chunk("data: [DONE]\n\n");
+        });
+
+    boundary_model.stream(
+        agent::GenerateParams{.messages = {agent::create_message(agent::MessageRole::User, "hi")}},
+        [&](const agent::ModelStreamEvent& event) {
+          events.push_back(event);
+        });
+
+    SMOKE_CHECK(event_counts_after_chunk.size() == 3);
+    SMOKE_CHECK(event_counts_after_chunk[0] == 0);
+    SMOKE_CHECK(event_counts_after_chunk[1] == 0);
+    SMOKE_CHECK(event_counts_after_chunk[2] > 0);
+
+    std::size_t text_delta_count = 0;
+    std::string final_text;
+    for (const auto& event : events) {
+      if (event.type == agent::ModelStreamEventType::TextDelta) {
+        ++text_delta_count;
+        SMOKE_CHECK(event.delta.find(replacement) == std::string::npos);
+        SMOKE_CHECK(event.text.find(replacement) == std::string::npos);
+        SMOKE_CHECK(event.delta == "你好");
+      }
+      if (event.type == agent::ModelStreamEventType::Response) {
+        final_text = event.response.text;
+      }
+    }
+    SMOKE_CHECK(text_delta_count == 1);
+    SMOKE_CHECK(final_text == "你好");
+  }
+
+  // Test F2: complete SSE events can still carry model delta strings split
+  // through a UTF-8 codepoint by a token-level provider. The parser must hold
+  // the partial codepoint and emit only monotonic complete text deltas.
+  {
+    const auto expected = utf8_stream_acceptance_text();
+    const auto first_char = expected.find("你");
+    SMOKE_CHECK(first_char != std::string::npos);
+    const auto split_inside_utf8 = first_char + 1;
+    const std::string replacement{
+        static_cast<char>(0xEF), static_cast<char>(0xBF), static_cast<char>(0xBD)};
+    const std::vector<std::string> chunks{
+        "data: {\"id\":\"utf8-delta\",\"model\":\"gpt-boundary\",\"choices\":[{\"delta\":{\"content\":\"" +
+            expected.substr(0, split_inside_utf8) + "\"}}]}\n\n",
+        "data: {\"id\":\"utf8-delta\",\"model\":\"gpt-boundary\",\"choices\":[{\"delta\":{\"content\":\"" +
+            expected.substr(split_inside_utf8) + "\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    };
+    const auto events = agent::parse_openai_chat_stream_events(chunks, "openai", "gpt-boundary");
+    std::size_t text_delta_count = 0;
+    std::string delta_text;
+    std::string previous_text;
+    std::string final_text;
+    for (const auto& event : events) {
+      if (event.type == agent::ModelStreamEventType::TextDelta) {
+        ++text_delta_count;
+        SMOKE_CHECK(event.delta.find(replacement) == std::string::npos);
+        SMOKE_CHECK(event.text.find(replacement) == std::string::npos);
+        SMOKE_CHECK(event.text.size() >= previous_text.size());
+        SMOKE_CHECK(event.text.compare(0, previous_text.size(), previous_text) == 0);
+        SMOKE_CHECK(event.delta == event.text.substr(previous_text.size()));
+        previous_text = event.text;
+        delta_text += event.delta;
+      }
+      if (event.type == agent::ModelStreamEventType::Response) {
+        final_text = event.response.text;
+      }
+    }
+    SMOKE_CHECK(text_delta_count == 1);
+    SMOKE_CHECK(delta_text == expected);
+    SMOKE_CHECK(previous_text == expected);
+    SMOKE_CHECK(final_text == expected);
+  }
+
+  // Test G: malformed SSE frames do not emit partial events before the frame
+  // boundary and fail explicitly once a complete invalid JSON frame arrives.
+  // Test H: incremental JSONL parsing waits for a complete JSON frame before
+  // parsing Ollama chunks split through a UTF-8 character.
+  {
+    std::vector<agent::ModelStreamEvent> events;
+    std::vector<std::size_t> event_counts_after_chunk;
+    bool malformed_sse_threw = false;
+    agent::OpenAICompatibleChatModelAdapter malformed_sse_model(
+        "openai",
+        "gpt-malformed-sse",
+        [](const agent::NativeProviderRequest&) {
+          return agent::Value::object({});
+        },
+        "/v1/chat/completions",
+        "https://api.openai.test",
+        "stream-key",
+        {},
+        {},
+        [&](const agent::NativeProviderRequest&,
+            agent::NativeProviderStreamingChunkHandler on_chunk) {
+          on_chunk("data: {bad");
+          event_counts_after_chunk.push_back(events.size());
+          on_chunk("}\n\n");
+        },
+        agent::ProviderReasoningMode::None,
+        openai_smoke_runtime_options());
+    try {
+      malformed_sse_model.stream(
+          agent::GenerateParams{.messages = {agent::create_message(agent::MessageRole::User, "hi")}},
+          [&](const agent::ModelStreamEvent& event) {
+            events.push_back(event);
+          });
+    } catch (const std::exception&) {
+      malformed_sse_threw = true;
+    }
+    SMOKE_CHECK(event_counts_after_chunk.size() == 1);
+    SMOKE_CHECK(event_counts_after_chunk[0] == 0);
+    SMOKE_CHECK(malformed_sse_threw);
+  }
+
+  {
+    const std::string replacement{
+        static_cast<char>(0xEF), static_cast<char>(0xBF), static_cast<char>(0xBD)};
+    std::vector<agent::ModelStreamEvent> events;
+    std::vector<std::size_t> event_counts_after_chunk;
+    agent::OllamaChatModelAdapter boundary_model(
+        "qwen-boundary",
+        [](const agent::NativeProviderRequest&) {
+          return agent::Value::object({});
+        },
+        "http://127.0.0.1:11434/api",
+        agent::NativeProviderStreamTransport{},
+        [&](const agent::NativeProviderRequest&,
+            agent::NativeProviderStreamingChunkHandler on_chunk) {
+          const std::string line =
+              "{\"model\":\"qwen-boundary\",\"message\":{\"role\":\"assistant\",\"content\":\"你好\"},\"done\":false}\n";
+          const std::string done =
+              "{\"model\":\"qwen-boundary\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\"}\n";
+          const auto utf8_start = line.find("好");
+          const auto newline_start = line.size() - 1;
+          SMOKE_CHECK(utf8_start != std::string::npos);
+          const auto split_inside_utf8 = utf8_start + 1;
+
+          on_chunk(std::string_view(line.data(), split_inside_utf8));
+          event_counts_after_chunk.push_back(events.size());
+          on_chunk(std::string_view(line.data() + split_inside_utf8,
+                                    newline_start - split_inside_utf8));
+          event_counts_after_chunk.push_back(events.size());
+          on_chunk(std::string_view(line.data() + newline_start, 1));
+          event_counts_after_chunk.push_back(events.size());
+          on_chunk(done);
+        });
+
+    boundary_model.stream(
+        agent::GenerateParams{.messages = {agent::create_message(agent::MessageRole::User, "hi")}},
+        [&](const agent::ModelStreamEvent& event) {
+          events.push_back(event);
+        });
+
+    SMOKE_CHECK(event_counts_after_chunk.size() == 3);
+    SMOKE_CHECK(event_counts_after_chunk[0] == 0);
+    SMOKE_CHECK(event_counts_after_chunk[1] > 0);
+    SMOKE_CHECK(event_counts_after_chunk[2] == event_counts_after_chunk[1]);
+
+    std::size_t text_delta_count = 0;
+    std::string final_text;
+    for (const auto& event : events) {
+      if (event.type == agent::ModelStreamEventType::TextDelta) {
+        ++text_delta_count;
+        SMOKE_CHECK(event.delta.find(replacement) == std::string::npos);
+        SMOKE_CHECK(event.text.find(replacement) == std::string::npos);
+        SMOKE_CHECK(event.delta == "你好");
+      }
+      if (event.type == agent::ModelStreamEventType::Response) {
+        final_text = event.response.text;
+      }
+    }
+    SMOKE_CHECK(text_delta_count == 1);
+    SMOKE_CHECK(final_text == "你好");
   }

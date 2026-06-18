@@ -3,6 +3,7 @@
 #include "agent/context.hpp"
 #include "agent/http.hpp"
 #include "agent/tools.hpp"
+#include "agent/tool_services_modules.hpp"
 
 #include <mutex>
 
@@ -196,7 +197,7 @@ struct HumanWorkflowNodeProviderParams {
 using HumanWorkflowResponseProvider = std::function<Value(const HumanWorkflowNodeProviderParams&)>;
 
 WorkflowNodeHandler create_human_workflow_node_handler(HumanWorkflowResponseProvider provider);
-WorkflowNodeHandler create_webhook_workflow_node_handler(HttpTransport transport = create_native_http_transport());
+WorkflowNodeHandler create_webhook_workflow_node_handler(HttpTransport transport);
 
 class WorkflowNodeRegistry {
  public:

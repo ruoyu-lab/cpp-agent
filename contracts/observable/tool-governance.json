@@ -1,0 +1,129 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "explicit governance metadata projects to tool definition and descriptor",
+      "input": {
+        "name": "contract.read",
+        "description": "Read contract data.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [],
+          "additionalProperties": false
+        },
+        "capabilities": ["fs.read"],
+        "riskLevel": "medium",
+        "tags": ["filesystem"],
+        "bundle": "local",
+        "builtin": true,
+        "readOnly": true,
+        "mutatesFiles": false,
+        "interactive": false,
+        "longRunning": false,
+        "batchable": true,
+        "concurrencyKey": "workspace",
+        "sideEffectLevel": "read-only"
+      },
+      "expected": {
+        "definition": {
+          "name": "contract.read",
+          "description": "Read contract data.",
+          "inputSchema": {
+            "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [],
+          "additionalProperties": false
+          },
+          "capabilities": ["fs.read"],
+          "riskLevel": "medium",
+          "tags": ["filesystem"],
+          "bundle": "local",
+          "builtin": true,
+          "readOnly": true,
+          "mutatesFiles": false,
+          "interactive": false,
+          "longRunning": false,
+          "batchable": true,
+          "concurrencyKey": "workspace",
+          "sideEffectLevel": "read-only"
+        },
+        "descriptor": {
+          "name": "contract.read",
+          "description": "Read contract data.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "readOnly": true,
+          "mutatesFiles": false,
+          "interactive": false,
+          "longRunning": false,
+          "batchable": true,
+          "concurrencyKey": "workspace",
+          "sideEffectLevel": "read-only"
+        }
+      }
+    },
+    {
+      "name": "file mutation metadata remains explicit and serial-risk",
+      "input": {
+        "name": "contract.write",
+        "description": "Write contract data.",
+        "capabilities": ["fs.write"],
+        "riskLevel": "high",
+        "tags": ["filesystem"],
+        "bundle": "local",
+        "builtin": true,
+        "mutatesFiles": true,
+        "concurrencyKey": "workspace",
+        "sideEffectLevel": "filesystem-write"
+      },
+      "expected": {
+        "definition": {
+          "name": "contract.write",
+          "description": "Write contract data.",
+          "inputSchema": {},
+          "capabilities": ["fs.write"],
+          "riskLevel": "high",
+          "tags": ["filesystem"],
+          "bundle": "local",
+          "builtin": true,
+          "readOnly": false,
+          "mutatesFiles": true,
+          "interactive": false,
+          "longRunning": false,
+          "batchable": false,
+          "concurrencyKey": "workspace",
+          "sideEffectLevel": "filesystem-write"
+        },
+        "descriptor": {
+          "name": "contract.write",
+          "description": "Write contract data.",
+          "inputSchema": {},
+          "readOnly": false,
+          "mutatesFiles": true,
+          "interactive": false,
+          "longRunning": false,
+          "batchable": false,
+          "concurrencyKey": "workspace",
+          "sideEffectLevel": "filesystem-write"
+        }
+      }
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-#include "agent/agent.hpp"
+#include "agent/app_api.hpp"
 #include "detail/helpers.hpp"
 
 #include <algorithm>
@@ -55,7 +55,7 @@ struct ScopedRunnerEventSink {
   std::size_t sink_id = 0;
 
   ~ScopedRunnerEventSink() noexcept {
-    runner.unregister_event_sink(sink_id);
+    runner.events().unregister_sink(sink_id);
   }
 };
 
@@ -178,8 +178,16 @@ std::vector<std::string> collect_eval_status_stages(const std::vector<AgentRunne
       add_unique_string(stages, "planning");
       continue;
     }
+    if (event.type == AgentRunnerStreamEventType::UserVisibleDelta) {
+      add_unique_string(stages, "answer");
+      continue;
+    }
     if (event.type == AgentRunnerStreamEventType::Error) {
       add_unique_string(stages, "error");
+      continue;
+    }
+    if (event.type == AgentRunnerStreamEventType::Cancelled) {
+      add_unique_string(stages, "cancelled");
       continue;
     }
     if (event.type != AgentRunnerStreamEventType::Loop) {
@@ -188,14 +196,29 @@ std::vector<std::string> collect_eval_status_stages(const std::vector<AgentRunne
     switch (event.loop_event.type) {
       case AgentLoopStreamEventType::ModelStart:
       case AgentLoopStreamEventType::ModelTextDelta:
+      case AgentLoopStreamEventType::UserVisibleDelta:
       case AgentLoopStreamEventType::ModelReasoningDelta:
-      case AgentLoopStreamEventType::ModelResponse:
+      case AgentLoopStreamEventType::ModelReasoningCompleted:
+      case AgentLoopStreamEventType::AgentOutput:
       case AgentLoopStreamEventType::ToolCallArgumentDelta:
         add_unique_string(stages, "model");
         break;
+      case AgentLoopStreamEventType::ToolBatchStart:
       case AgentLoopStreamEventType::ToolStart:
+      case AgentLoopStreamEventType::ToolDelta:
       case AgentLoopStreamEventType::ToolComplete:
-      case AgentLoopStreamEventType::Tools:
+      case AgentLoopStreamEventType::ToolBatchComplete:
+        add_unique_string(stages, "tool");
+        break;
+      case AgentLoopStreamEventType::ReActMessage:
+      case AgentLoopStreamEventType::ReActFinal:
+      case AgentLoopStreamEventType::ReActFinalRejected:
+      case AgentLoopStreamEventType::ReActReasoningProtocolLeak:
+      case AgentLoopStreamEventType::ReActParseError:
+        add_unique_string(stages, "model");
+        break;
+      case AgentLoopStreamEventType::ReActActionBatch:
+      case AgentLoopStreamEventType::ReActObservation:
         add_unique_string(stages, "tool");
         break;
       case AgentLoopStreamEventType::IterationStart:
@@ -274,6 +297,16 @@ int days_in_month(int year, int month) {
     return 0;
   }
   return days[static_cast<std::size_t>(month - 1)];
+}
+
+long long days_from_civil(int year, unsigned month, unsigned day) {
+  year -= month <= 2 ? 1 : 0;
+  const int era = (year >= 0 ? year : year - 399) / 400;
+  const auto year_of_era = static_cast<unsigned>(year - era * 400);
+  const unsigned month_prime = month > 2 ? month - 3 : month + 9;
+  const unsigned day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+  const unsigned day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+  return static_cast<long long>(era) * 146097LL + static_cast<long long>(day_of_era) - 719468LL;
 }
 
 std::optional<long long> parse_iso8601_epoch_ms(const std::string& value) {
@@ -361,20 +394,12 @@ std::optional<long long> parse_iso8601_epoch_ms(const std::string& value) {
     return std::nullopt;
   }
 
-  std::tm tm{};
-  tm.tm_year = year - 1900;
-  tm.tm_mon = month - 1;
-  tm.tm_mday = day;
-  tm.tm_hour = hour;
-  tm.tm_min = minute;
-  tm.tm_sec = second;
-  tm.tm_isdst = 0;
-#if defined(_WIN32)
-  const auto seconds = _mkgmtime(&tm);
-#else
-  const auto seconds = timegm(&tm);
-#endif
-  return (static_cast<long long>(seconds) * 1000LL) + millisecond -
+  const long long days = days_from_civil(year, static_cast<unsigned>(month), static_cast<unsigned>(day));
+  const long long seconds = (days * 24LL * 60LL * 60LL) +
+                            (static_cast<long long>(hour) * 60LL * 60LL) +
+                            (static_cast<long long>(minute) * 60LL) +
+                            static_cast<long long>(second);
+  return (seconds * 1000LL) + millisecond -
          (static_cast<long long>(offset_minutes) * 60LL * 1000LL);
 }
 
@@ -480,10 +505,85 @@ std::vector<std::string> collect_eval_tool_calls(const AgentRunnerRunResult& run
       continue;
     }
     for (const auto& call : entry.response.tool_calls) {
-      calls.push_back(call.name);
+      add_unique_string(calls, call.name);
+    }
+  }
+  for (const auto& entry : run.react_trace) {
+    if (entry.type == ReActStepType::ActionBatch) {
+      for (const auto& action : entry.actions) {
+        add_unique_string(calls, action.tool);
+      }
+    }
+  }
+  for (const auto& message : run.messages) {
+    if (message.role != MessageRole::Assistant) {
+      continue;
+    }
+    const auto text = extract_text_content(message.content);
+    const auto actions_pos = text.find("Actions:");
+    if (actions_pos == std::string::npos) {
+      continue;
+    }
+    std::string json = text.substr(actions_pos + std::string("Actions:").size());
+    const auto first = std::find_if(json.begin(), json.end(), [](unsigned char ch) {
+      return !std::isspace(ch);
+    });
+    const auto last = std::find_if(json.rbegin(), json.rend(), [](unsigned char ch) {
+      return !std::isspace(ch);
+    }).base();
+    if (first >= last) {
+      continue;
+    }
+    json = std::string(first, last);
+    try {
+      const auto parsed = parse_json(json);
+      if (!parsed.is_array()) {
+        continue;
+      }
+      for (const auto& action : parsed.as_array()) {
+        const auto tool = action.at("tool").as_string();
+        if (!tool.empty()) {
+          add_unique_string(calls, tool);
+        }
+      }
+    } catch (...) {
     }
   }
   return calls;
+}
+
+void append_eval_tool_calls_from_events(std::vector<std::string>& calls,
+                                        const std::vector<AgentRunnerStreamEvent>& events) {
+  for (const auto& event : events) {
+    if (event.type != AgentRunnerStreamEventType::Loop) {
+      continue;
+    }
+    const auto& loop = event.loop_event;
+    if (loop.type == AgentLoopStreamEventType::ReActActionBatch ||
+        loop.type == AgentLoopStreamEventType::ToolBatchStart) {
+      for (const auto& tool_call : loop.tool_calls) {
+        add_unique_string(calls, tool_call.name);
+      }
+      continue;
+    }
+    if (loop.type == AgentLoopStreamEventType::ToolStart && !loop.tool_call.name.empty()) {
+      add_unique_string(calls, loop.tool_call.name);
+      continue;
+    }
+    if (loop.type == AgentLoopStreamEventType::ToolComplete &&
+        !loop.tool_result.tool_call.name.empty()) {
+      add_unique_string(calls, loop.tool_result.tool_call.name);
+      continue;
+    }
+    if (loop.type == AgentLoopStreamEventType::ToolBatchComplete) {
+      for (const auto& tool_call : loop.tool_calls) {
+        add_unique_string(calls, tool_call.name);
+      }
+      for (const auto& result : loop.tool_results) {
+        add_unique_string(calls, result.tool_call.name);
+      }
+    }
+  }
 }
 
 std::size_t count_eval_citations(const AgentRunnerRunResult& run) {
@@ -564,7 +664,7 @@ Value agent_runner_status_to_value(const AgentRunnerStatus& status) {
   return payload;
 }
 
-EvalUsage eval_usage_from_model_response(const ModelResponse& response, const std::optional<EvalPricing>& pricing) {
+EvalUsage eval_usage_from_model_response(const AgentOutput& response, const std::optional<EvalPricing>& pricing) {
   const auto usage = extract_model_usage(response);
   EvalUsage output;
   output.input_tokens = usage.input_tokens;
@@ -590,16 +690,28 @@ EvalUsage eval_usage_from_model_response(const ModelResponse& response, const st
 
 Value runner_stream_event_to_value(const AgentRunnerStreamEvent& event) {
   if (event.type == AgentRunnerStreamEventType::Status) {
-    return Value::object({{"type", "status"}, {"status", agent_runner_status_to_value(event.status)}});
+    return Value::object({{"schemaVersion", event.schema_version},
+                          {"sequence", static_cast<long long>(event.sequence)},
+                          {"type", "status"},
+                          {"status", agent_runner_status_to_value(event.status)}});
   }
   if (event.type == AgentRunnerStreamEventType::KnowledgeRetrieval) {
-    return Value::object({{"type", "knowledge-retrieval"}, {"hitCount", event.knowledge_hits.size()}});
+    return Value::object({{"schemaVersion", event.schema_version},
+                          {"sequence", static_cast<long long>(event.sequence)},
+                          {"type", "knowledge-retrieval"},
+                          {"hitCount", event.knowledge_hits.size()}});
   }
   if (event.type == AgentRunnerStreamEventType::MemoryRetrieval) {
-    return Value::object({{"type", "memory-retrieval"}, {"hitCount", event.memory_hits.size()}});
+    return Value::object({{"schemaVersion", event.schema_version},
+                          {"sequence", static_cast<long long>(event.sequence)},
+                          {"type", "memory-retrieval"},
+                          {"hitCount", event.memory_hits.size()}});
   }
   if (event.type == AgentRunnerStreamEventType::Planning) {
-    Value payload = Value::object({{"type", "plan"}, {"hasPlan", event.plan.has_value()}});
+    Value payload = Value::object({{"schemaVersion", event.schema_version},
+                                   {"sequence", static_cast<long long>(event.sequence)},
+                                   {"type", "plan"},
+                                   {"hasPlan", event.plan.has_value()}});
     if (event.plan) {
       payload["goal"] = event.plan->goal;
       payload["stepCount"] = event.plan->steps.size();
@@ -607,22 +719,50 @@ Value runner_stream_event_to_value(const AgentRunnerStreamEvent& event) {
     return payload;
   }
   if (event.type == AgentRunnerStreamEventType::Done) {
-    return Value::object({{"type", "done"}, {"text", event.result.text}});
+    return Value::object({{"schemaVersion", event.schema_version},
+                          {"sequence", static_cast<long long>(event.sequence)},
+                          {"type", "done"},
+                          {"text", event.result.text}});
+  }
+  if (event.type == AgentRunnerStreamEventType::UserVisibleDelta) {
+    return Value::object({{"schemaVersion", event.schema_version},
+                          {"sequence", static_cast<long long>(event.sequence)},
+                          {"type", "user-visible-delta"},
+                          {"delta", event.delta},
+                          {"text", event.text}});
   }
   if (event.type == AgentRunnerStreamEventType::Error) {
-    return Value::object({{"type", "error"}, {"error", event.error}});
+    return Value::object({{"schemaVersion", event.schema_version},
+                          {"sequence", static_cast<long long>(event.sequence)},
+                          {"type", "error"},
+                          {"error", event.error}});
+  }
+  if (event.type == AgentRunnerStreamEventType::Cancelled) {
+    return Value::object({{"schemaVersion", event.schema_version},
+                          {"sequence", static_cast<long long>(event.sequence)},
+                          {"type", "cancelled"},
+                          {"cancellation", event.cancellation}});
   }
   if (event.type == AgentRunnerStreamEventType::ToolCallArgumentDelta) {
     return Value::object({
+        {"schemaVersion", event.schema_version},
+        {"sequence", static_cast<long long>(event.sequence)},
         {"type", "tool-call-argument-delta"},
+        {"iteration", static_cast<long long>(event.tool_call_iteration)},
+        {"provider", event.tool_call_provider},
+        {"model", event.tool_call_model},
         {"toolCallId", event.tool_call_id},
         {"toolName", event.tool_call_name},
         {"argsDelta", event.tool_call_args_delta},
         {"argsAccumulated", event.tool_call_args_accumulated},
     });
   }
-  Value payload = Value::object({{"type", "loop"}, {"event", to_string(event.loop_event.type)}});
+  Value payload = Value::object({{"schemaVersion", event.schema_version},
+                                 {"sequence", static_cast<long long>(event.sequence)},
+                                 {"type", "loop"},
+                                 {"event", to_string(event.loop_event.type)}});
   if (event.loop_event.type == AgentLoopStreamEventType::ModelTextDelta ||
+      event.loop_event.type == AgentLoopStreamEventType::UserVisibleDelta ||
       event.loop_event.type == AgentLoopStreamEventType::ModelReasoningDelta) {
     payload["delta"] = event.loop_event.delta;
   }
@@ -633,7 +773,10 @@ Value runner_stream_event_to_value(const AgentRunnerStreamEvent& event) {
     payload["toolName"] = event.loop_event.tool_result.tool_call.name;
     payload["ok"] = event.loop_event.tool_result.ok;
   }
-  if (event.loop_event.type == AgentLoopStreamEventType::Tools) {
+  if (event.loop_event.type == AgentLoopStreamEventType::ToolBatchStart) {
+    payload["toolCount"] = event.loop_event.tool_calls.size();
+  }
+  if (event.loop_event.type == AgentLoopStreamEventType::ToolBatchComplete) {
     payload["toolCount"] = event.loop_event.tool_results.size();
     std::size_t failed_count = 0;
     for (const auto& result : event.loop_event.tool_results) {
@@ -642,6 +785,15 @@ Value runner_stream_event_to_value(const AgentRunnerStreamEvent& event) {
       }
     }
     payload["failedCount"] = failed_count;
+  }
+  if (event.loop_event.type == AgentLoopStreamEventType::ReActMessage ||
+      event.loop_event.type == AgentLoopStreamEventType::ReActActionBatch ||
+      event.loop_event.type == AgentLoopStreamEventType::ReActObservation ||
+      event.loop_event.type == AgentLoopStreamEventType::ReActFinal ||
+      event.loop_event.type == AgentLoopStreamEventType::ReActFinalRejected ||
+      event.loop_event.type == AgentLoopStreamEventType::ReActReasoningProtocolLeak ||
+      event.loop_event.type == AgentLoopStreamEventType::ReActParseError) {
+    payload["react"] = react_trace_entry_to_value(event.loop_event.react_step);
   }
   return payload;
 }
@@ -680,9 +832,14 @@ std::string eval_case_text_projection(const Value& input) {
 AgentRunnerStreamResult stream_eval_case_input(AgentRunner& runner,
                                                const EvalCase& test_case,
                                                const std::string& session_id,
-                                               CancellationToken* cancellation) {
+                                               CancellationToken* cancellation,
+                                               std::vector<AgentRunnerStreamEvent>& stream_events) {
+  auto on_event = [&](const AgentRunnerStreamEvent& event) {
+    stream_events.push_back(event);
+  };
   if (eval_case_has_message_input(test_case)) {
-    return runner.stream(agent_message_from_value(test_case.input_value),
+    return runner.streaming().stream(agent_message_from_value(test_case.input_value),
+                         on_event,
                          session_id,
                          test_case.model_settings,
                          {}, {}, {},
@@ -691,7 +848,8 @@ AgentRunnerStreamResult stream_eval_case_input(AgentRunner& runner,
                          cancellation);
   }
   const auto input = test_case.input_value.is_null() ? test_case.input : eval_case_text_projection(test_case.input_value);
-  return runner.stream(input,
+  return runner.streaming().stream(input,
+                       on_event,
                        session_id,
                        test_case.model_settings,
                        {}, {}, {},
@@ -1398,6 +1556,7 @@ EvalReport run_eval_suite_impl(EvalSuite suite,
                                NativeConfigModuleLoader config_module_loader,
                                NativeProviderTransport provider_transport,
                                NativeProviderStreamTransport provider_stream_transport,
+                               NativeProviderStreamingTransport provider_streaming_transport,
                                NativeMCPTransportFactory mcp_transport_factory,
                                NativeWebAdapters web_adapters,
                                NativeDeveloperAdapters developer_adapters,
@@ -1415,6 +1574,19 @@ EvalReport run_eval_suite_impl(EvalSuite suite,
   const bool has_only = std::any_of(suite.cases.begin(), suite.cases.end(), [](const auto& test_case) {
     return test_case.only;
   });
+  const auto resolve_options_for_agent = [&](std::string requested_agent) {
+    NativeAgentAppResolveOptions options;
+    options.requested_agent_id = std::move(requested_agent);
+    options.provider_transport = provider_transport;
+    options.provider_stream_transport = provider_stream_transport;
+    options.provider_streaming_transport = provider_streaming_transport;
+    options.mcp_transport_factory = mcp_transport_factory;
+    options.web_adapters = web_adapters;
+    options.developer_adapters = developer_adapters;
+    options.browser_adapters = browser_adapters;
+    options.llama_adapters = llama_adapters;
+    return options;
+  };
   std::size_t selected_cases = 0;
   for (const auto& test_case : suite.cases) {
     throw_if_eval_cancelled(cancellation);
@@ -1460,43 +1632,20 @@ EvalReport run_eval_suite_impl(EvalSuite suite,
       if (!active_runner && loaded_config) {
         const auto requested_agent = agent.empty() ? suite.agent : agent;
         owned_app = std::make_shared<NativeResolvedAgentApp>(
-            resolve_native_agent_app(*loaded_config,
-                                     requested_agent,
-                                     provider_transport,
-                                     mcp_transport_factory,
-                                     web_adapters,
-                                     developer_adapters,
-                                     browser_adapters,
-                                     provider_stream_transport,
-                                     llama_adapters));
+            resolve_native_agent_app(*loaded_config, resolve_options_for_agent(requested_agent)));
         active_runner = owned_app->runner.get();
       }
       if (!active_runner && config.is_object()) {
         const auto requested_agent = agent.empty() ? suite.agent : agent;
         owned_app = std::make_shared<NativeResolvedAgentApp>(
-            resolve_native_agent_app(config,
-                                     requested_agent,
-                                     provider_transport,
-                                     mcp_transport_factory,
-                                     web_adapters,
-                                     developer_adapters,
-                                     browser_adapters,
-                                     provider_stream_transport,
-                                     llama_adapters));
+            resolve_native_agent_app(config, resolve_options_for_agent(requested_agent)));
         active_runner = owned_app->runner.get();
       }
       if (!active_runner && !config_path.empty()) {
         const auto requested_agent = agent.empty() ? suite.agent : agent;
         owned_app = std::make_shared<NativeResolvedAgentApp>(
             load_native_agent_app(config_path,
-                                  requested_agent,
-                                  provider_transport,
-                                  mcp_transport_factory,
-                                  web_adapters,
-                                  developer_adapters,
-                                  browser_adapters,
-                                  provider_stream_transport,
-                                  llama_adapters,
+                                  resolve_options_for_agent(requested_agent),
                                   config_module_loader));
         active_runner = owned_app->runner.get();
       }
@@ -1504,18 +1653,19 @@ EvalReport run_eval_suite_impl(EvalSuite suite,
         throw ConfigurationError("run_eval_suite requires runner, create_runner, loaded_config, config, or config_path.");
       }
       const auto permission_sink_id =
-          active_runner->register_event_sink([permission_events](const FrameworkEvent& event) {
+          active_runner->events().register_sink([permission_events](const FrameworkEvent& event) {
             if (event.category.rfind("permission.", 0) == 0) {
               permission_events->push_back(eval_permission_event_from_framework_event(event));
             }
           });
       ScopedRunnerEventSink permission_sink{*active_runner, permission_sink_id};
-      auto stream_result = stream_eval_case_input(*active_runner, test_case, case_result.session_id, cancellation);
+      auto stream_result = stream_eval_case_input(*active_runner, test_case, case_result.session_id,
+                                                  cancellation, stream_events);
       throw_if_eval_cancelled(cancellation);
-      stream_events = stream_result.events;
       auto run = std::move(stream_result.result);
       case_result.output = run.text;
       case_result.tool_calls = collect_eval_tool_calls(run);
+      append_eval_tool_calls_from_events(case_result.tool_calls, stream_events);
       case_result.status_stages = collect_eval_status_stages(stream_events);
       case_result.permission_events = *permission_events;
       case_result.usage = eval_usage_from_model_response(run.response, suite.pricing);
@@ -1604,8 +1754,7 @@ EvalReport run_eval_suite_impl(EvalSuite suite,
       if (cancellation && cancellation->cancelled()) {
         throw;
       }
-      if (stream_events.empty() && active_runner) {
-        stream_events = active_runner->last_stream_events();
+      if (!stream_events.empty()) {
         case_result.status_stages = collect_eval_status_stages(stream_events);
       }
       case_result.passed = false;
@@ -1656,6 +1805,7 @@ EvalReport run_eval_suite(EvalSuite suite, AgentRunner& runner, std::vector<std:
                              {},
                              {},
                              {},
+                             {},
                              std::move(case_ids),
                              std::move(tags),
                              stop_on_failure,
@@ -1676,6 +1826,7 @@ EvalReport run_eval_suite(RunEvalSuiteOptions options) {
                                     std::move(options.config_module_loader),
                                     std::move(options.provider_transport),
                                     std::move(options.provider_stream_transport),
+                                    std::move(options.provider_streaming_transport),
                                     std::move(options.mcp_transport_factory),
                                     std::move(options.web_adapters),
                                     std::move(options.developer_adapters),
@@ -1995,14 +2146,14 @@ EvalAssertion expect_llm_judge(std::string name, std::string rubric) {
         if (!context.result) {
           return EvalAssertionResult{name, false, "no run result to judge"};
         }
-        auto critique = context.runner->critique_adapter();
-        auto primary = context.runner->adapter();
+        auto critique = context.runner->models().critique();
+        auto primary = context.runner->models().primary();
         std::shared_ptr<ChatModelAdapter> judge = critique ? critique : primary;
         if (!judge) {
           return EvalAssertionResult{name, false, "no adapter available for LLM-as-judge"};
         }
         if (!critique) {
-          if (auto* bus = context.runner->event_bus()) {
+          if (auto* bus = context.runner->events().bus()) {
             bus->publish("eval.self_grading_detected", ExecutionTarget::Run,
                          Value::object({
                              {"assertion", name},
@@ -2021,7 +2172,7 @@ EvalAssertion expect_llm_judge(std::string name, std::string rubric) {
                                           "You are an impartial judge. Output PASS or FAIL first."));
         messages.push_back(create_message(MessageRole::User, user_text));
         try {
-          ModelResponse response = judge->generate(GenerateParams{.messages = messages});
+          AgentOutput response = judge->generate(GenerateParams{.messages = messages});
           std::string text = response.text;
           // Strip leading whitespace/punctuation.
           std::size_t start = 0;

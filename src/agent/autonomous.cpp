@@ -1,4 +1,4 @@
-#include "agent/agent.hpp"
+#include "agent/autonomous.hpp"
 
 #include <algorithm>
 #include <iterator>
@@ -195,19 +195,10 @@ std::string build_step_prompt(const AutonomousRun& run,
   return out.str();
 }
 
-Value model_response_to_value(const ModelResponse& response) {
-  return Value::object({
-      {"id", response.id.empty() ? Value() : Value(response.id)},
-      {"provider", response.provider},
-      {"model", response.model},
-      {"text", response.text},
-      {"finishReason", response.finish_reason},
-      {"reasoning", response.reasoning ? Value::object({{"text", response.reasoning->text},
-                                                        {"format", response.reasoning->format}})
-                                      : Value()},
-      {"message", agent_message_to_value(assistant_message_from_response(response))},
-      {"raw", response.raw},
-  });
+Value model_response_to_value(const AgentOutput& response) {
+  auto value = agent_output_to_value(response);
+  value["message"] = agent_message_to_value(assistant_message_from_output(response));
+  return value;
 }
 
 Value tool_invoke_result_to_value(const ToolInvokeResult& result) {
@@ -226,6 +217,17 @@ Value tool_invoke_result_to_value(const ToolInvokeResult& result) {
   return Value(std::move(object));
 }
 
+Value structured_tool_output_to_value(const std::optional<ToolInvokeResult>& result) {
+  if (!result) {
+    return Value();
+  }
+  if (std::holds_alternative<Value>(*result)) {
+    return std::get<Value>(*result);
+  }
+  const auto& envelope = std::get<ToolResultEnvelope>(*result);
+  return envelope.value ? *envelope.value : Value();
+}
+
 Value tool_execution_result_to_value(const ToolExecutionResult& result) {
   Value::Object object{
       {"toolCall", Value::object({{"id", result.tool_call.id},
@@ -234,6 +236,7 @@ Value tool_execution_result_to_value(const ToolExecutionResult& result) {
       {"ok", result.ok},
       {"error", result.error.empty() ? Value() : Value(result.error)},
       {"output", result.output},
+      {"structuredOutput", structured_tool_output_to_value(result.result)},
       {"message", agent_message_to_value(result.message)},
   };
   if (result.result) {
@@ -1257,7 +1260,7 @@ AgentAutonomousPlanner::AgentAutonomousPlanner(AgentAutonomousPlannerConfig conf
 
 AutonomousPlan AgentAutonomousPlanner::plan(const AutonomousPlanningInput& input) {
   const auto session_id = session_id_.empty() ? "autonomous:" + input.run.id + ":planner" : session_id_;
-  auto result = runner_->run(build_planning_prompt(input.run),
+  auto result = runner_->execution().run(build_planning_prompt(input.run),
                              session_id,
                              model_settings_,
                              RunnerRetrievalOptions{},
@@ -1283,7 +1286,14 @@ AgentRunnerStepExecutor::AgentRunnerStepExecutor(AgentRunnerStepExecutorConfig c
       session_id_(std::move(config.session_id)),
       session_resolver_(std::move(config.session_resolver)),
       model_settings_(std::move(config.model_settings)),
-      context_(std::move(config.context)) {
+      context_(std::move(config.context)),
+      retrieval_options_(std::move(config.retrieval_options)),
+      writeback_options_(std::move(config.writeback_options)),
+      skill_activations_(std::move(config.skill_activations)),
+      knowledge_retrieval_options_(std::move(config.knowledge_retrieval_options)),
+      prompt_builder_(std::move(config.prompt_builder)),
+      cancellation_(config.cancellation),
+      enable_planning_(config.enable_planning) {
   if (!runner_) {
     throw ConfigurationError("AgentRunnerStepExecutor requires an AgentRunner.");
   }
@@ -1297,13 +1307,19 @@ AutonomousStepExecutionResult AgentRunnerStepExecutor::execute(const AutonomousS
   if (session_id.empty()) {
     session_id = session_id_.empty() ? "autonomous:" + input.run.id : session_id_;
   }
-  auto result = runner_->run(build_step_prompt(input.run, input.step, input.previous_steps),
+  const auto prompt = prompt_builder_ ? prompt_builder_(input)
+                                      : build_step_prompt(input.run, input.step, input.previous_steps);
+  auto result = runner_->execution().run(prompt,
                              session_id,
                              model_settings_,
-                             RunnerRetrievalOptions{},
-                             RunnerWritebackOptions{},
-                             std::vector<SkillActivation>{},
-                             executor_context(context_, input));
+                             retrieval_options_,
+                             writeback_options_,
+                             skill_activations_,
+                             executor_context(context_, input),
+                             knowledge_retrieval_options_,
+                             AgentRunnerDurableOptions{},
+                             cancellation_,
+                             enable_planning_);
   const auto output = agent_runner_result_to_value(result);
   if (input.checkpoint) {
     input.checkpoint("runner.state", output);

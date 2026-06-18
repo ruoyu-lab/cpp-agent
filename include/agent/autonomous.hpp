@@ -345,6 +345,8 @@ struct AutonomousStepExecutionInput {
   std::function<AutonomousCheckpoint(std::string, Value)> checkpoint;
 };
 
+using AgentRunnerStepPromptBuilder = std::function<std::string(const AutonomousStepExecutionInput&)>;
+
 struct AutonomousStepExecutionResult {
   AutonomousStepStatus status = AutonomousStepStatus::Completed;
   Value output;
@@ -378,6 +380,13 @@ struct AgentRunnerStepExecutorConfig {
   AgentRunnerStepSessionResolver session_resolver;
   ModelSettings model_settings;
   Value context = Value::object({});
+  RunnerRetrievalOptions retrieval_options;
+  RunnerWritebackOptions writeback_options;
+  std::vector<SkillActivation> skill_activations;
+  std::optional<RunnerKnowledgeRetrievalOptions> knowledge_retrieval_options = std::nullopt;
+  AgentRunnerStepPromptBuilder prompt_builder;
+  CancellationToken* cancellation = nullptr;
+  bool enable_planning = true;
 };
 
 class AgentRunnerStepExecutor : public AutonomousStepExecutor {
@@ -391,6 +400,13 @@ class AgentRunnerStepExecutor : public AutonomousStepExecutor {
   AgentRunnerStepSessionResolver session_resolver_;
   ModelSettings model_settings_;
   Value context_;
+  RunnerRetrievalOptions retrieval_options_;
+  RunnerWritebackOptions writeback_options_;
+  std::vector<SkillActivation> skill_activations_;
+  std::optional<RunnerKnowledgeRetrievalOptions> knowledge_retrieval_options_;
+  AgentRunnerStepPromptBuilder prompt_builder_;
+  CancellationToken* cancellation_ = nullptr;
+  bool enable_planning_ = true;
 };
 
 struct AutonomousRunManagerConfig {

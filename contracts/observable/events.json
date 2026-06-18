@@ -2,75 +2,139 @@
   "version": 1,
   "cases": [
     {
-      "name": "event bus publishes stable observable envelope",
-      "publish": {
-        "category": "tool.completed",
-        "target": "tool",
+      "name": "event without trace keeps category target and payload only",
+      "input": {
+        "category": "system.ready",
+        "target": "run",
         "payload": {
-          "toolName": "fixture.weather",
-          "toolCallId": "call_weather"
-        },
-        "trace": {
-          "traceId": "trace_contract",
-          "spanId": "span_contract",
-          "parentSpanId": "parent_contract",
-          "spanName": "tool fixture",
-          "runId": "run_contract",
-          "workflowRunId": "workflow_contract"
+          "ok": true
         }
       },
-      "expectedShape": {
-        "eventId": {
-          "$type": "string",
-          "nonEmpty": true
+      "expected": {
+        "returned": {
+          "category": "system.ready",
+          "target": "run",
+          "payload": {
+            "ok": true
+          }
         },
-        "timestamp": {
-          "$type": "string",
-          "nonEmpty": true
-        },
-        "category": "tool.completed",
-        "target": "tool",
-        "payload": {
-          "toolName": "fixture.weather",
-          "toolCallId": "call_weather"
-        },
-        "traceId": "trace_contract",
-        "spanId": "span_contract",
-        "parentSpanId": "parent_contract",
-        "spanName": "tool fixture",
-        "runId": "run_contract",
-        "workflowRunId": "workflow_contract"
+        "captured": [
+          {
+            "category": "system.ready",
+            "target": "run",
+            "payload": {
+              "ok": true
+            }
+          }
+        ]
       }
     },
     {
-      "name": "event bus emits null trace fields when no trace is supplied",
-      "publish": {
-        "category": "model.text_delta",
-        "target": "model",
+      "name": "trace context is promoted onto the event envelope",
+      "input": {
+        "category": "tool.started",
+        "target": "tool",
+        "traceContext": {
+          "traceId": "trace-contract",
+          "spanId": "span-tool",
+          "spanName": "tool dispatch",
+          "runId": "run-contract"
+        },
         "payload": {
-          "delta": "hello"
+          "phase": "started",
+          "toolName": "contract.tool",
+          "toolCallId": "call_contract",
+          "iteration": 0,
+          "arguments": {
+            "command": "npm --version"
+          },
+          "startedAt": "2026-06-05T00:00:00Z"
         }
       },
-      "expectedShape": {
-        "eventId": {
-          "$type": "string",
-          "nonEmpty": true
+      "expected": {
+        "returned": {
+          "traceId": "trace-contract",
+          "spanId": "span-tool",
+          "spanName": "tool dispatch",
+          "category": "tool.started",
+          "target": "tool",
+          "payload": {
+            "phase": "started",
+            "toolName": "contract.tool",
+            "toolCallId": "call_contract",
+            "iteration": 0,
+            "arguments": {
+              "command": "npm --version"
+            },
+            "startedAt": "2026-06-05T00:00:00Z"
+          }
         },
-        "timestamp": {
-          "$type": "string",
-          "nonEmpty": true
-        },
-        "category": "model.text_delta",
+        "captured": [
+          {
+            "traceId": "trace-contract",
+            "spanId": "span-tool",
+            "spanName": "tool dispatch",
+            "category": "tool.started",
+            "target": "tool",
+            "payload": {
+              "phase": "started",
+              "toolName": "contract.tool",
+              "toolCallId": "call_contract",
+              "iteration": 0,
+              "arguments": {
+                "command": "npm --version"
+              },
+              "startedAt": "2026-06-05T00:00:00Z"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "explicit trace fields win over fallback context",
+      "input": {
+        "category": "model.completed",
         "target": "model",
-        "payload": {
-          "delta": "hello"
+        "traceId": "trace-explicit",
+        "spanId": "span-model",
+        "parentSpanId": "span-run",
+        "workflowRunId": "workflow-contract",
+        "traceContext": {
+          "traceId": "trace-fallback",
+          "spanId": "span-fallback"
         },
-        "traceId": null,
-        "spanId": null,
-        "parentSpanId": null,
-        "spanName": null,
-        "runId": null,
-        "workflowRunId": null
+        "payload": {
+          "provider": "fixture",
+          "finishReason": "stop"
+        }
+      },
+      "expected": {
+        "returned": {
+          "traceId": "trace-explicit",
+          "spanId": "span-model",
+          "parentSpanId": "span-run",
+          "workflowRunId": "workflow-contract",
+          "category": "model.completed",
+          "target": "model",
+          "payload": {
+            "provider": "fixture",
+            "finishReason": "stop"
+          }
+        },
+        "captured": [
+          {
+            "traceId": "trace-explicit",
+            "spanId": "span-model",
+            "parentSpanId": "span-run",
+            "workflowRunId": "workflow-contract",
+            "category": "model.completed",
+            "target": "model",
+            "payload": {
+              "provider": "fixture",
+              "finishReason": "stop"
+            }
+          }
+        ]
       }
     }
   ]

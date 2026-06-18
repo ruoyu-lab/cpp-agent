@@ -64,8 +64,8 @@ session, then hand a result back to the parent agent. This is the pattern to
 use for things like "spawn a read-only planner subagent before executing".
 
 **Primitives**:
-- `AgentRunnerConfig.skill_subagents` — `map<name, AgentRunner*>` of named child runners
-- `AgentRunnerConfig.skill_fork_handler` — callback that decides when/how to fork
+- `AgentRunnerConfig.context_runtime.skill_subagents` — `map<name, AgentRunner*>` of named child runners
+- `AgentRunnerConfig.context_runtime.skill_fork_handler` — callback that decides when/how to fork
 - `SkillForkRequest` / `SkillForkResult` — the bridge contract
 
 **Template — Planner-as-Subagent (the example we keep coming back to)**:
@@ -73,24 +73,24 @@ use for things like "spawn a read-only planner subagent before executing".
 ```cpp
 // 1. Build the planner subagent — read-only tools, cheap model, no session leak.
 AgentRunnerConfig planner_cfg;
-planner_cfg.adapter        = haiku_adapter();
-planner_cfg.tools          = {
+planner_cfg.model_runtime.adapter = haiku_adapter();
+planner_cfg.tool_runtime.definitions = std::vector<ToolDefinition>{
     create_builtin_tools({"core"})[0],   // tool.search / tool.describe
     fs_read_only_tool,
     knowledge_search_tool,
 };
-planner_cfg.max_iterations = 4;
-planner_cfg.system_prompt  =
+planner_cfg.context_runtime.max_iterations = 4;
+planner_cfg.context_runtime.system_prompt =
     "You are a read-only planner. Explore the task with available tools, "
     "then output a JSON plan with steps[].";
 auto planner_runner = std::make_shared<AgentRunner>(planner_cfg);
 
 // 2. Wire it onto the main agent under a named skill.
 AgentRunnerConfig main_cfg;
-main_cfg.adapter         = opus_adapter();
-main_cfg.tools           = create_builtin_tools({"core", "local", "developer"});
-main_cfg.skill_subagents = { {"plan", planner_runner.get()} };
-main_cfg.skill_fork_handler = [](const SkillForkRequest& req)
+main_cfg.model_runtime.adapter = opus_adapter();
+main_cfg.tool_runtime.definitions = create_builtin_tools({"core", "local", "developer"});
+main_cfg.context_runtime.skill_subagents = {{"plan", planner_runner.get()}};
+main_cfg.context_runtime.skill_fork_handler = [](const SkillForkRequest& req)
     -> std::optional<SkillForkResult> {
   if (req.skill.name != "plan") return std::nullopt;
   // The framework will invoke the named subagent with req.input_text;

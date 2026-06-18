@@ -6,7 +6,7 @@ switch.
 
 ## Runner Configuration
 
-Attach a planner through `AgentRunnerConfig::planner`:
+Attach a planner through `AgentRuntimeBuilder::planner`:
 
 ```cpp
 auto planner = std::make_shared<agent::ModelPlanner>(agent::ModelPlannerConfig{
@@ -14,12 +14,12 @@ auto planner = std::make_shared<agent::ModelPlanner>(agent::ModelPlannerConfig{
     .max_steps = 4,
 });
 
-agent::AgentRunner runner(agent::AgentRunnerConfig{
-    .adapter = answer_model,
-    .tools = tools,
-    .planner = planner,
-    .enable_planning = true,
-});
+auto runner = agent::AgentRuntimeBuilder()
+                  .model(answer_model)
+                  .tools(tools)
+                  .planner(planner)
+                  .enable_planning(true)
+                  .build();
 ```
 
 When planning is enabled, `AgentRunner::run` and `AgentRunner::stream` build an
@@ -51,11 +51,14 @@ auto result = runner.run(
 ```cpp
 auto stream = runner.stream(
     "answer directly",
+    [](const agent::AgentRunnerStreamEvent& event) {
+      (void)event;
+    },
     "session-1",
     agent::ModelSettings{},
     agent::RunnerRetrievalOptions{},
     agent::RunnerWritebackOptions{},
-    {},
+    std::vector<agent::SkillActivation>{},
     agent::Value::object({}),
     std::nullopt,
     nullptr,

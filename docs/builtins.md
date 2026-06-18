@@ -75,6 +75,36 @@ The default registry exposes these bundles:
 - `workflow`: workflow run inspection, resume, and checkpoint listing.
 - `state`: per-session scratchpad (`scratch.*`) and todo list (`todo.*`) tools
   for externalizing agent working memory across iterations.
+- `media`: image, video, and audio generation tools backed by
+  `MediaGenerationProviderRegistry`. The tools validate through the selected
+  provider, forward cancellation and progress events, and return
+  artifact-friendly asset values instead of large inline base64.
+
+### Media generation
+
+Register media generators separately from chat models:
+
+```cpp
+agent::MediaGenerationProviderRegistry media;
+media.register_provider(std::make_shared<MyMediaGenerator>());
+
+agent::InMemoryArtifactStore artifacts;
+agent::MediaGenerationToolOptions options;
+options.output_options.artifact_writer =
+    agent::create_in_memory_media_artifact_writer(&artifacts);
+options.output_options.artifact_key_prefix = "media/generated";
+
+agent::ToolRegistry tools(agent::create_media_generation_builtin_tools(&media, options));
+```
+
+The builtin bundle exposes:
+
+- `media.generateImage`
+- `media.generateVideo`
+- `media.generateAudio`
+
+Hosts can also create the generic `media` bundle and provide the registry at
+execution time through `ToolExecutionServices::media_generation_registry`.
 
 ### Output truncation envelope
 
@@ -129,21 +159,21 @@ Available factories:
 
 `create_builtin_tools()` defaults to the `core` bundle.
 
-## Injection And Service Fallbacks
+## Injection And Service Tokens
 
 Host-sensitive builtins accept injected services directly or resolve them from
-`ToolExecutionContext::service_refs`:
+declared service tokens on `ToolExecutionContext::service_refs.service_view`:
 
 - `shell.exec` requires a `DeveloperProcessExecutor`.
 - Browser tools use the injected `BrowserRenderer*` or
-  `service_refs.browser_renderer`.
+  `kToolServiceBrowserRenderer`.
 - `web.search` uses an injected `WebSearchProviderRegistry*` or
-  `service_refs.web_search_registry`.
+  `kToolServiceWebSearchRegistry`.
 - `web.fetch` uses an injected `NativeWebPageFetcher*`,
-  `service_refs.web_fetcher`, or the native zero-dependency page fetcher.
-- Agent tools use injected memory/knowledge services or service refs.
+  `kToolServiceWebFetcher`, or the native zero-dependency page fetcher.
+- Agent tools use injected memory/knowledge services or service tokens.
 - Workflow tools use an injected `WorkflowEngine*` or
-  `service_refs.workflow_engine`.
+  `kToolServiceWorkflowEngine`.
 
 HTTP builtins use the provided `HttpTransport`. If none is provided,
 `create_native_http_transport()` is used, which supports plain `http://` URLs.
@@ -190,12 +220,12 @@ iterations without consuming the context window. Storage is routed through
 an injected `ScratchStore` backend (see [Scratch](scratch.md)) — by default
 the runner constructs an `InMemoryScratchStore`, but hosts can supply
 `FileScratchStore` for restart-safe persistence or any custom implementation
-(SQLite, Redis, …) by setting `AgentRunnerConfig::scratch_store` or
-`ToolExecutionServices::scratch_store`. When invoking these tools through a
+(SQLite, Redis, …) by setting `AgentRunnerConfig::memory_runtime.scratch_store` or
+`kToolServiceScratchStore`. When invoking these tools through a
 raw `ToolExecutor` without going through `AgentRunner`, the caller is
-responsible for setting `ctx.service_refs.scratch_store`; otherwise the tool
-raises `ConfigurationError` mentioning both `Scratch` and `scratch_store` so
-the failure is grep-friendly.
+responsible for registering `kToolServiceScratchStore` in
+`ctx.service_refs.service_container`; otherwise the tool raises
+`ConfigurationError` mentioning both `Scratch` and `kToolServiceScratchStore`.
 
 State is keyed by `SessionMemory::session_id()` (or the literal `_` when no
 session is attached to the execution context). Todo lists live under a

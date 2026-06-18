@@ -13,7 +13,7 @@ namespace agent {
 // Per-session key→Value storage shared by builtin `scratch.*` and `todo.*`
 // tools (and any user-defined tool that wants short-term agent memory).
 // Hosts inject custom implementations to add persistence (e.g. SQLite,
-// Redis) via AgentRunnerConfig::scratch_store / ToolExecutionServices::scratch_store.
+// Redis) via AgentRunnerConfig::scratch_store or kToolServiceScratchStore.
 class ScratchStore {
  public:
   virtual ~ScratchStore() = default;

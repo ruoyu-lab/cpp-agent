@@ -1,6 +1,7 @@
 #pragma once
 
 #include "agent/config.hpp"
+#include "agent/model_providers.hpp"
 
 namespace agent {
 
@@ -115,6 +116,7 @@ struct RunEvalSuiteOptions {
   std::function<Value(const std::filesystem::path&)> config_module_loader;
   NativeProviderTransport provider_transport;
   NativeProviderStreamTransport provider_stream_transport;
+  NativeProviderStreamingTransport provider_streaming_transport;
   NativeMCPTransportFactory mcp_transport_factory;
   NativeWebAdapters web_adapters;
   NativeDeveloperAdapters developer_adapters;

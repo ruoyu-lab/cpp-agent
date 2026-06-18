@@ -1,13 +1,19 @@
-#include "agent/agent.hpp"
+#include "agent/app_api.hpp"
+#include "agent/knowledge_io.hpp"
+#include "agent/memory_vector.hpp"
+#include "agent/mcp_native.hpp"
+#include "agent/providers/reasoning.hpp"
+#include "agent/skills.hpp"
 #include "detail/helpers.hpp"
+#include "config_helpers.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <cstdlib>
 #include <ctime>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -24,6 +30,12 @@ constexpr std::array<const char*, 5> kNativeAgentConfigFiles = {
     "node-agent.config.json",
     "node-agent.config.ts",
 };
+
+using config_detail::embedding_dimensions_from_config;
+using config_detail::env_value;
+using config_detail::reasoning_mode_from_model_config;
+using config_detail::resolve_defaulted_env_config_value;
+using config_detail::resolve_env_config_value;
 
 std::string lowercase_copy(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
@@ -106,26 +118,6 @@ std::map<std::string, std::string> string_map_from_value(const Value& value) {
   return result;
 }
 
-std::string env_value(const std::string& key) {
-  if (key.empty()) {
-    return {};
-  }
-  if (const char* value = std::getenv(key.c_str())) {
-    return value;
-  }
-  return {};
-}
-
-std::string resolve_env_config_value(const Value& value, const Value& env_key) {
-  const auto direct = value.as_string();
-  return direct.empty() ? env_value(env_key.as_string()) : direct;
-}
-
-std::string resolve_defaulted_env_config_value(const Value& value,
-                                               const Value& explicit_env_key,
-                                               const std::string& default_env_key,
-                                               const std::string& fallback);
-
 void add_env_ref(std::set<std::string>& keys, const Value& value) {
   const auto key = value.as_string();
   if (!key.empty()) {
@@ -154,6 +146,17 @@ std::string allowed_values_text(std::initializer_list<const char*> values) {
   return allowed;
 }
 
+std::string allowed_values_text(const std::vector<std::string>& values) {
+  std::string allowed;
+  for (const auto& item : values) {
+    if (!allowed.empty()) {
+      allowed += ", ";
+    }
+    allowed += item;
+  }
+  return allowed;
+}
+
 const Value& require_config_resource(const Value& config,
                                      const std::string& collection,
                                      const std::string& name,
@@ -165,33 +168,9 @@ const Value& require_config_resource(const Value& config,
   return resources.at(name);
 }
 
-void validate_provider_config(const Value& value,
-                              const std::string& path,
-                              std::initializer_list<const char*> providers) {
-  if (!value.is_object()) {
-    throw ConfigurationError(path + " must be an object.");
-  }
-  const std::string provider = value.at("provider").as_string();
-  if (provider.empty()) {
-    throw ConfigurationError(path + ".provider is required.");
-  }
-  if (!is_one_of(provider, providers)) {
-    throw ConfigurationError(path + ".provider must be one of: " + allowed_values_text(providers) + ".");
-  }
-}
-
-bool provider_supports_reasoning_field(const std::string& provider, const std::string& field) {
-  if (field == "enabled") {
-    return is_one_of(provider, {"ollama", "openai", "gemini", "anthropic", "qwen", "deepseek",
-                                "llamacpp-native"});
-  }
-  if (field == "budget") {
-    return is_one_of(provider, {"openai", "gemini", "anthropic", "qwen"});
-  }
-  if (field == "includeThoughts") {
-    return is_one_of(provider, {"openai", "gemini", "qwen"});
-  }
-  return false;
+bool provider_supports_reasoning_field(const Value& model, const std::string& field) {
+  const auto profile = resolve_native_chat_provider_profile(model);
+  return provider_request_profile_supports_reasoning_field(profile, field);
 }
 
 void validate_reasoning_config(const Value& model, const std::string& path) {
@@ -201,14 +180,14 @@ void validate_reasoning_config(const Value& model, const std::string& path) {
   }
   assert_reasoning_settings(reasoning, path + ".reasoning");
   const std::string provider = model.at("provider").as_string();
-  if (reasoning.at("enabled").as_bool(false) && !provider_supports_reasoning_field(provider, "enabled")) {
+  if (reasoning.at("enabled").as_bool(false) && !provider_supports_reasoning_field(model, "enabled")) {
     throw ConfigurationError(path + ".reasoning.enabled requires the provider to support \"reasoning\".");
   }
-  if (!reasoning.at("budget").is_null() && !provider_supports_reasoning_field(provider, "budget")) {
+  if (!reasoning.at("budget").is_null() && !provider_supports_reasoning_field(model, "budget")) {
     throw ConfigurationError(path + ".reasoning.budget is not supported by provider \"" + provider + "\".");
   }
   if (reasoning.at("includeThoughts").is_bool() &&
-      !provider_supports_reasoning_field(provider, "includeThoughts")) {
+      !provider_supports_reasoning_field(model, "includeThoughts")) {
     throw ConfigurationError(path + ".reasoning.includeThoughts is not supported by provider \"" + provider + "\".");
   }
 }
@@ -227,46 +206,23 @@ void validate_string_array_values(const Value& value, const std::string& path) {
 }
 
 std::set<std::string> default_model_capabilities(const std::string& provider) {
-  if (provider == "ollama") {
-    return {"input.text", "input.image", "transport.inline", "reasoning"};
-  }
-  if (provider == "openai") {
-    return {"input.text", "input.image", "input.file", "output.structuredContent",
-            "transport.inline", "transport.reference", "reasoning", "reasoning.budget",
-            "reasoning.includeThoughts"};
-  }
-  if (provider == "gemini") {
-    return {"input.text", "input.image", "input.file", "output.structuredContent",
-            "transport.inline", "transport.reference", "reasoning", "reasoning.budget",
-            "reasoning.includeThoughts"};
-  }
-  if (provider == "anthropic") {
-    return {"input.text", "input.image", "input.file", "transport.inline", "transport.reference",
-            "reasoning", "reasoning.budget"};
-  }
-  if (provider == "qwen") {
-    return {"input.text", "input.image", "input.file", "output.structuredContent",
-            "transport.inline", "transport.reference", "reasoning", "reasoning.budget",
-            "reasoning.includeThoughts"};
-  }
-  if (provider == "mimo") {
-    return {"input.text", "input.image", "input.file", "output.structuredContent",
-            "transport.inline", "transport.reference"};
-  }
-  if (provider == "deepseek") {
-    return {"input.text", "output.structuredContent", "transport.inline", "reasoning"};
-  }
-  if (provider == "llamacpp-native") {
-    return {"input.text", "output.structuredContent", "transport.inline", "reasoning"};
+  const auto descriptor = find_native_chat_provider_descriptor(provider);
+  if (descriptor && !descriptor->default_capabilities.empty()) {
+    return descriptor->default_capabilities;
   }
   return {"input.text"};
 }
 
 std::set<std::string> model_capabilities_from_config(const Value& model) {
-  std::set<std::string> capabilities = default_model_capabilities(model.at("provider").as_string());
-  if (model.at("provider").as_string() == "llamacpp-native" &&
-      (model.at("mmprojPath").is_string() || model.at("mmprojPathEnv").is_string())) {
-    capabilities.insert("input.image");
+  const auto provider = model.at("provider").as_string();
+  const auto descriptor = find_native_chat_provider_descriptor(provider);
+  std::set<std::string> capabilities =
+      descriptor && descriptor->resolve_capabilities
+          ? descriptor->resolve_capabilities(model)
+          : default_model_capabilities(provider);
+  const auto profile = resolve_native_chat_provider_profile(model);
+  if (provider_request_profile_supports_reasoning_field(profile, "budget")) {
+    capabilities.insert("reasoning.budget");
   }
   for (const auto& item : model.at("capabilities").as_array()) {
     const auto capability = item.as_string();
@@ -338,14 +294,30 @@ std::vector<Value> select_model_candidates(const Value& model) {
 }
 
 void validate_model_config(const Value& model, const std::string& path) {
-  validate_provider_config(model, path, {"echo", "ollama", "openai", "gemini", "anthropic", "qwen", "mimo",
-                                         "deepseek", "llamacpp-native"});
+  if (!model.is_object()) {
+    throw ConfigurationError(path + " must be an object.");
+  }
+  const std::string provider = model.at("provider").as_string();
+  if (provider.empty()) {
+    throw ConfigurationError(path + ".provider is required.");
+  }
+  const auto descriptor = find_native_chat_provider_descriptor(provider);
+  if (!descriptor) {
+    throw ConfigurationError(path + ".provider \"" + provider +
+                             "\" is not registered as a native chat provider.");
+  }
+  if (descriptor->validate_model) {
+    descriptor->validate_model(model, path);
+  }
   validate_string_array_values(model.at("capabilities"), path + ".capabilities");
   validate_string_array_values(model.at("requireCapabilities"), path + ".requireCapabilities");
-  if (model.at("provider").as_string() == "qwen" && model.contains("reasoningApi")) {
-    const auto reasoning_api = model.at("reasoningApi").as_string();
-    if (reasoning_api != "chat-completions" && reasoning_api != "responses") {
-      throw ConfigurationError(path + ".reasoningApi must be \"chat-completions\" or \"responses\".");
+  const auto reasoning_mode = reasoning_mode_from_model_config(model, path);
+  if (reasoning_mode != ProviderReasoningMode::None) {
+    const auto profile = resolve_native_chat_provider_profile(model);
+    if (!provider_request_profile_supports_reasoning_field(profile, "enabled")) {
+      throw ConfigurationError(path + ".reasoningMode \"" + model.at("reasoningMode").as_string() +
+                               "\" is not valid for provider \"" +
+                               model.at("provider").as_string() + "\".");
     }
   }
   validate_reasoning_config(model, path);
@@ -360,12 +332,31 @@ void validate_model_config(const Value& model, const std::string& path) {
 }
 
 void validate_embedding_config(const Value& value, const std::string& path) {
-  validate_provider_config(value, path, {"hash", "clip", "ollama", "openai", "gemini", "qwen",
-                                         "llamacpp-native"});
+  if (!value.is_object()) {
+    throw ConfigurationError(path + " must be an object.");
+  }
+  const std::string provider = value.at("provider").as_string();
+  if (provider.empty()) {
+    throw ConfigurationError(path + ".provider is required.");
+  }
+  if (!find_native_text_embedding_provider_descriptor(provider)) {
+    throw ConfigurationError(path + ".provider must be one of: " +
+                             allowed_values_text(native_text_embedding_provider_names()) + ".");
+  }
 }
 
 void validate_image_embedding_config(const Value& value, const std::string& path) {
-  validate_provider_config(value, path, {"hash", "clip"});
+  if (!value.is_object()) {
+    throw ConfigurationError(path + " must be an object.");
+  }
+  const std::string provider = value.at("provider").as_string();
+  if (provider.empty()) {
+    throw ConfigurationError(path + ".provider is required.");
+  }
+  if (!find_native_image_embedding_provider_descriptor(provider)) {
+    throw ConfigurationError(path + ".provider must be one of: " +
+                             allowed_values_text(native_image_embedding_provider_names()) + ".");
+  }
 }
 
 void validate_optional_string_value(const Value& value, const std::string& path) {
@@ -747,6 +738,49 @@ ModelSettings model_settings_from_value(const Value& value) {
   return settings;
 }
 
+ContextStatsBucketInput context_stats_bucket_input_from_value(const Value& value,
+                                                              const std::string& path) {
+  if (!value.is_object()) {
+    throw ConfigurationError(path + " must be an object.");
+  }
+  ContextStatsBucketInput bucket;
+  bucket.id = value.at("id").as_string();
+  if (bucket.id.empty()) {
+    throw ConfigurationError(path + ".id is required.");
+  }
+  bucket.label = value.at("label").as_string(bucket.id);
+  const std::string kind = value.at("kind").as_string("other");
+  bucket.kind = context_stats_bucket_kind_from_string(kind, ContextStatsBucketKind::Other);
+  if (to_string(bucket.kind) != kind) {
+    throw ConfigurationError(path + ".kind must be one of: system_prompt, rules, tool_definitions, skills, "
+                             "mcp, subagents, memory, knowledge, planning, conversation, context, other.");
+  }
+  bucket.text = value.at("text").as_string();
+  if (bucket.text.empty()) {
+    throw ConfigurationError(path + ".text is required.");
+  }
+  bucket.metadata = value.at("metadata").is_object() ? value.at("metadata") : Value::object({});
+  return bucket;
+}
+
+std::vector<ContextStatsBucketInput> context_stats_bucket_inputs_from_value(const Value& value,
+                                                                            const std::string& path) {
+  std::vector<ContextStatsBucketInput> buckets;
+  if (value.is_null()) {
+    return buckets;
+  }
+  if (!value.is_array()) {
+    throw ConfigurationError(path + " must be an array when provided.");
+  }
+  buckets.reserve(value.as_array().size());
+  for (std::size_t index = 0; index < value.as_array().size(); ++index) {
+    buckets.push_back(context_stats_bucket_input_from_value(
+        value.as_array()[index],
+        path + "[" + std::to_string(index) + "]"));
+  }
+  return buckets;
+}
+
 RunnerRetrievalOptions retrieval_options_from_value(const Value& value) {
   RunnerRetrievalOptions options;
   if (!value.is_object()) {
@@ -959,9 +993,18 @@ SessionMemoryOptions session_memory_options_from_value(const Value& value) {
   return options;
 }
 
-std::shared_ptr<SessionStore> session_store_from_value(const Value& root, const Value& session) {
+std::shared_ptr<SessionStore> session_store_from_value(
+    const Value& root,
+    const Value& session,
+    const NativeSessionMemoryConfigurator& configure_session_memory = {}) {
   if (!session.is_object()) {
-    return std::make_shared<InMemorySessionStore>();
+    SessionMemoryOptions session_options;
+    if (configure_session_memory) {
+      configure_session_memory(session_options, session);
+    }
+    return std::make_shared<InMemorySessionStore>(InMemorySessionStoreConfig{
+        .session_options = std::move(session_options),
+    });
   }
 
   const auto& resolved_session = [&]() -> const Value& {
@@ -977,10 +1020,13 @@ std::shared_ptr<SessionStore> session_store_from_value(const Value& root, const 
   }();
 
   const std::string kind = resolved_session.at("kind").as_string("memory");
-  const auto session_options = session_memory_options_from_value(resolved_session.at("sessionOptions"));
+  auto session_options = session_memory_options_from_value(resolved_session.at("sessionOptions"));
+  if (configure_session_memory) {
+    configure_session_memory(session_options, resolved_session);
+  }
   if (kind == "memory") {
     return std::make_shared<InMemorySessionStore>(InMemorySessionStoreConfig{
-        .session_options = session_options,
+        .session_options = std::move(session_options),
     });
   }
   if (kind == "file") {
@@ -991,7 +1037,7 @@ std::shared_ptr<SessionStore> session_store_from_value(const Value& root, const 
     return std::make_shared<FileSessionStore>(FileSessionStoreConfig{
         .base_dir = resolve_config_path(root, base_dir),
         .file_extension = resolved_session.at("fileExtension").as_string(".json"),
-        .session_options = session_options,
+        .session_options = std::move(session_options),
     });
   }
   throw ConfigurationError("Unsupported session store kind \"" + kind + "\".");
@@ -1207,8 +1253,9 @@ PermissionApprovalHandler approval_handler_from_value(const Value& root, const V
   const std::string kind = resolved.at("kind").as_string("static");
   if (kind == "static" || kind.empty()) {
     return create_static_approval_handler(PermissionDecision{
-        permission_decision_kind_from_string(resolved.at("decision").as_string(), PermissionDecisionKind::Allow),
-        resolved.at("reason").as_string(),
+        .decision = permission_decision_kind_from_string(resolved.at("decision").as_string(),
+                                                         PermissionDecisionKind::Allow),
+        .reason = resolved.at("reason").as_string(),
     });
   }
   if (kind == "cli") {
@@ -1653,138 +1700,6 @@ void ingest_knowledge_sources_from_config(const Value& root,
   (void)sync_job.sync(sources, sync_options);
 }
 
-int embedding_dimensions_from_config(const Value& value, int fallback) {
-  if (value.is_object() && value.at("dimensions").is_number()) {
-    return static_cast<int>(std::max<long long>(0, value.at("dimensions").as_integer(fallback)));
-  }
-  return fallback;
-}
-
-std::string resolve_defaulted_env_config_value(const Value& value,
-                                               const Value& explicit_env_key,
-                                               const std::string& default_env_key,
-                                               const std::string& fallback = {}) {
-  const auto direct = value.as_string();
-  if (!direct.empty()) {
-    return direct;
-  }
-  const auto explicit_env_value = env_value(explicit_env_key.as_string());
-  if (!explicit_env_value.empty()) {
-    return explicit_env_value;
-  }
-  const auto default_env_value = env_value(default_env_key);
-  return default_env_value.empty() ? fallback : default_env_value;
-}
-
-std::optional<int> optional_int_config_value(const Value& value, const std::string& key) {
-  if (value.is_object() && value.at(key).is_number()) {
-    return static_cast<int>(value.at(key).as_integer());
-  }
-  return std::nullopt;
-}
-
-std::optional<double> optional_number_config_value(const Value& value, const std::string& key) {
-  if (value.is_object() && value.at(key).is_number()) {
-    return value.at(key).as_number();
-  }
-  return std::nullopt;
-}
-
-std::optional<bool> optional_bool_config_value(const Value& value, const std::string& key) {
-  if (value.is_object() && value.at(key).is_bool()) {
-    return value.at(key).as_bool();
-  }
-  return std::nullopt;
-}
-
-LlamaCppNativeRuntimeConfig llama_runtime_config_from_value(const Value& value) {
-  LlamaCppNativeRuntimeConfig config;
-  config.model_path = resolve_env_config_value(value.at("modelPath"), value.at("modelPathEnv"));
-  config.library_path = resolve_env_config_value(value.at("libraryPath"), value.at("libraryPathEnv"));
-  config.library_dir = resolve_env_config_value(value.at("libraryDir"), value.at("libraryDirEnv"));
-  config.context_size = optional_int_config_value(value, "contextSize");
-  config.batch_size = optional_int_config_value(value, "batchSize");
-  config.threads = optional_int_config_value(value, "threads");
-  config.batch_threads = optional_int_config_value(value, "batchThreads");
-  config.gpu_layers = optional_int_config_value(value, "gpuLayers");
-  config.mmap = optional_bool_config_value(value, "mmap");
-  config.mlock = optional_bool_config_value(value, "mlock");
-  config.mmproj_path = resolve_env_config_value(value.at("mmprojPath"), value.at("mmprojPathEnv"));
-  config.mtmd_library_path = resolve_env_config_value(value.at("mtmdLibraryPath"), value.at("mtmdLibraryPathEnv"));
-  config.mtmd_library_dir = resolve_env_config_value(value.at("mtmdLibraryDir"), value.at("mtmdLibraryDirEnv"));
-  config.mmproj_use_gpu = optional_bool_config_value(value, "mmprojUseGpu");
-  config.mmproj_threads = optional_int_config_value(value, "mmprojThreads");
-  config.mmproj_image_min_tokens = optional_int_config_value(value, "mmprojImageMinTokens");
-  config.mmproj_image_max_tokens = optional_int_config_value(value, "mmprojImageMaxTokens");
-  config.media_marker = value.at("mediaMarker").as_string("<__media__>");
-  const auto& lora_adapters = value.at("loraAdapters").is_array()
-                                  ? value.at("loraAdapters")
-                                  : value.at("lora_adapters");
-  for (const auto& item : lora_adapters.as_array()) {
-    if (!item.is_object()) {
-      continue;
-    }
-    const auto path = item.at("path").as_string();
-    if (path.empty()) {
-      continue;
-    }
-    config.lora_adapters.push_back(LlamaCppNativeLoraAdapter{
-        .path = path,
-        .scale = item.at("scale").is_number() ? item.at("scale").as_number() : 1.0,
-    });
-  }
-  return config;
-}
-
-LlamaCppNativeSamplingConfig llama_sampling_config_from_value(const Value& value) {
-  LlamaCppNativeSamplingConfig config;
-  config.temperature = optional_number_config_value(value, "temperature");
-  config.max_output_tokens = optional_int_config_value(value, "maxOutputTokens");
-  config.top_k = optional_int_config_value(value, "topK");
-  config.top_p = optional_number_config_value(value, "topP");
-  config.min_p = optional_number_config_value(value, "minP");
-  config.repeat_penalty = optional_number_config_value(value, "repeatPenalty");
-  config.seed = optional_int_config_value(value, "seed");
-  return config;
-}
-
-LlamaCppNativeChatModelAdapterConfig llama_chat_config_from_value(
-    const Value& value,
-    NativeLlamaCppAdapters llama_adapters) {
-  LlamaCppNativeChatModelAdapterConfig config;
-  static_cast<LlamaCppNativeRuntimeConfig&>(config) = llama_runtime_config_from_value(value);
-  static_cast<LlamaCppNativeSamplingConfig&>(config) = llama_sampling_config_from_value(value);
-  config.model = value.at("model").as_string();
-  config.chat_template = value.at("chatTemplate").as_string(value.at("chat_template").as_string());
-  config.strict_template = value.at("strictTemplate").as_bool(value.at("strict_template").as_bool(false));
-  config.tool_mode = value.at("toolMode").as_string(value.at("tool_mode").as_string("auto"));
-  config.grammar = value.at("grammar").as_string();
-  config.grammar_root = value.at("grammarRoot").as_string(value.at("grammar_root").as_string());
-  config.session_id = value.at("sessionId").as_string(value.at("session_id").as_string());
-  if (value.at("reasoning").is_object()) {
-    config.reasoning = reasoning_settings_from_json_value(value.at("reasoning"));
-  }
-  config.binding = std::move(llama_adapters.binding);
-  return config;
-}
-
-LlamaCppNativeEmbeddingAdapterConfig llama_embedding_config_from_value(
-    const Value& value,
-    NativeLlamaCppAdapters llama_adapters) {
-  LlamaCppNativeEmbeddingAdapterConfig config;
-  static_cast<LlamaCppNativeRuntimeConfig&>(config) = llama_runtime_config_from_value(value);
-  config.model = value.at("model").as_string();
-  config.pooling = value.at("pooling").as_string("mean");
-  config.normalize = value.contains("normalize") ? value.at("normalize").as_bool() : true;
-  const auto dimensions = embedding_dimensions_from_config(value, 0);
-  if (dimensions > 0) {
-    config.dimensions = dimensions;
-  }
-  config.space_id = value.at("spaceId").as_string(value.at("space_id").as_string());
-  config.binding = std::move(llama_adapters.binding);
-  return config;
-}
-
 std::shared_ptr<TextEmbeddingAdapter> text_embedding_adapter_from_value(const Value& value,
                                                                         NativeProviderTransport transport,
                                                                         NativeLlamaCppAdapters llama_adapters) {
@@ -1792,75 +1707,18 @@ std::shared_ptr<TextEmbeddingAdapter> text_embedding_adapter_from_value(const Va
     return std::make_shared<HashEmbeddingAdapter>();
   }
   const std::string provider = value.at("provider").as_string();
-  if (provider == "hash") {
-    return std::make_shared<HashEmbeddingAdapter>(
-        embedding_dimensions_from_config(value, 256),
-        value.at("model").as_string("hash-embedding"),
-        value.at("spaceId").as_string("hash-shared-v1"));
+  const auto descriptor = find_native_text_embedding_provider_descriptor(provider);
+  if (!descriptor) {
+    throw ConfigurationError("Unsupported embedding provider \"" + provider + "\".");
   }
-
-  const auto dimensions = embedding_dimensions_from_config(value, 0);
-  const auto space_id = value.at("spaceId").as_string();
-  if (provider == "clip") {
-    return std::make_shared<ClipTextEmbeddingAdapter>(
-        value.at("model").as_string("Xenova/clip-vit-base-patch32"),
-        dimensions,
-        value.at("spaceId").as_string("clip-shared-v1"));
+  auto adapter = descriptor->create_adapter(value, NativeEmbeddingProviderBuildContext{
+                                                       .transport = std::move(transport),
+                                                       .llama_adapters = std::move(llama_adapters),
+                                                   });
+  if (!adapter) {
+    throw ConfigurationError("Embedding provider factory returned null for \"" + provider + "\".");
   }
-  if (provider == "llamacpp-native") {
-    return std::make_shared<LlamaCppNativeTextEmbeddingAdapter>(
-        llama_embedding_config_from_value(value, std::move(llama_adapters)));
-  }
-
-  if (!transport) {
-    transport = create_native_provider_http_transport(create_native_http_transport());
-  }
-  const auto base_url = [&](const std::string& default_env_key, const std::string& fallback) {
-    return resolve_defaulted_env_config_value(value.at("baseUrl"), value.at("baseUrlEnv"),
-                                             default_env_key, fallback);
-  };
-  if (provider == "openai") {
-    return std::make_shared<OpenAIEmbeddingAdapter>(
-        resolve_defaulted_env_config_value(value.at("model"), Value(), "OPENAI_EMBEDDING_MODEL",
-                                           "text-embedding-3-small"),
-        transport,
-        resolve_defaulted_env_config_value(value.at("apiKey"), value.at("apiKeyEnv"), "OPENAI_API_KEY"),
-        base_url("OPENAI_BASE_URL", "https://api.openai.com/v1"),
-        resolve_defaulted_env_config_value(value.at("organization"), value.at("organizationEnv"), "OPENAI_ORG_ID"),
-        dimensions,
-        space_id);
-  }
-  if (provider == "qwen") {
-    return std::make_shared<QwenEmbeddingAdapter>(
-        resolve_defaulted_env_config_value(value.at("model"), Value(), "QWEN_EMBEDDING_MODEL",
-                                           "text-embedding-v4"),
-        transport,
-        resolve_defaulted_env_config_value(value.at("apiKey"), value.at("apiKeyEnv"), "QWEN_API_KEY"),
-        base_url("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        dimensions,
-        space_id);
-  }
-  if (provider == "ollama") {
-    return std::make_shared<OllamaEmbeddingAdapter>(
-        resolve_defaulted_env_config_value(value.at("model"), Value(), "OLLAMA_EMBEDDING_MODEL",
-                                           "embeddinggemma"),
-        transport,
-        base_url("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
-        dimensions,
-        space_id);
-  }
-  if (provider == "gemini") {
-    return std::make_shared<GeminiEmbeddingAdapter>(
-        resolve_defaulted_env_config_value(value.at("model"), Value(), "GEMINI_EMBEDDING_MODEL",
-                                           "gemini-embedding-001"),
-        transport,
-        resolve_defaulted_env_config_value(value.at("apiKey"), value.at("apiKeyEnv"), "GEMINI_API_KEY"),
-        base_url("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"),
-        dimensions,
-        value.at("taskType").as_string(),
-        space_id);
-  }
-  throw ConfigurationError("Unsupported embedding provider \"" + provider + "\".");
+  return adapter;
 }
 
 std::shared_ptr<ImageEmbeddingAdapter> image_embedding_adapter_from_value(const Value& value) {
@@ -1868,26 +1726,22 @@ std::shared_ptr<ImageEmbeddingAdapter> image_embedding_adapter_from_value(const 
     return std::make_shared<HashImageEmbeddingAdapter>();
   }
   const std::string provider = value.at("provider").as_string();
-  if (provider == "hash") {
-    return std::make_shared<HashImageEmbeddingAdapter>(
-        embedding_dimensions_from_config(value, 256),
-        value.at("model").as_string("hash-image-embedding"),
-        value.at("spaceId").as_string("hash-shared-v1"));
+  const auto descriptor = find_native_image_embedding_provider_descriptor(provider);
+  if (!descriptor) {
+    throw ConfigurationError("Unsupported image embedding provider \"" + provider + "\".");
   }
-  if (provider == "clip") {
-    return std::make_shared<ClipImageEmbeddingAdapter>(
-        value.at("model").as_string("Xenova/clip-vit-base-patch32"),
-        embedding_dimensions_from_config(value, 0),
-        value.at("spaceId").as_string("clip-shared-v1"));
+  auto adapter = descriptor->create_adapter(value);
+  if (!adapter) {
+    throw ConfigurationError("Image embedding provider factory returned null for \"" + provider + "\".");
   }
-  throw ConfigurationError("Unsupported image embedding provider \"" + provider + "\".");
+  return adapter;
 }
 
 std::shared_ptr<KnowledgeSourceLoader> knowledge_loader_for_web(const std::shared_ptr<NativeWebRuntime>& web,
                                                                 const std::shared_ptr<NativeBrowserRuntime>& browser) {
-  return create_default_knowledge_loader(web && web->fetcher ? web->fetcher.get() : nullptr,
-                                         web && web->crawler ? web->crawler.get() : nullptr,
-                                         browser && browser->renderer ? browser->renderer.get() : nullptr);
+  return create_web_enabled_knowledge_loader(web && web->fetcher ? web->fetcher.get() : nullptr,
+                                             web && web->crawler ? web->crawler.get() : nullptr,
+                                             browser && browser->renderer ? browser->renderer.get() : nullptr);
 }
 
 std::shared_ptr<KnowledgeBase> knowledge_base_from_value(const Value& root,
@@ -2056,10 +1910,12 @@ std::vector<ToolDefinition> builtin_tools_for_bundles(const std::vector<std::str
       continue;
     }
     if (bundle == "agent" && knowledge) {
+      KnowledgeContextProvider* knowledge_provider =
+          knowledge->manager ? static_cast<KnowledgeContextProvider*>(knowledge->manager.get())
+                             : static_cast<KnowledgeContextProvider*>(knowledge->base.get());
       auto agent_tools = create_agent_builtin_tools(
           nullptr,
-          knowledge->base.get(),
-          knowledge->manager.get());
+          knowledge_provider);
       for (auto& tool : agent_tools) {
         auto execute = std::move(tool.execute);
         tool.execute = [knowledge, execute = std::move(execute)](const Value& input,
@@ -2121,15 +1977,20 @@ ToolExecutionServices tool_services_from_native_runtimes(
   ToolExecutionServices services;
   services.values = Value::object({});
   if (workflow && workflow->engine) {
-    services.workflow_engine = workflow->engine.get();
+    services.service_container.set(kToolServiceWorkflowEngine, workflow->engine.get());
     services.values["workflow"] = Value::object({{"engineAvailable", true}});
   }
   if (web) {
-    services.web_search_registry = web->search_registry.get();
-    services.default_search_provider = web->default_search_provider;
-    services.web_fetcher = web->fetcher.get();
-    services.web_crawler = web->crawler.get();
-    services.default_crawler_profile = web->default_crawler_profile;
+    services.service_container.set(kToolServiceWebSearchRegistry, web->search_registry.get());
+    if (!web->default_search_provider.empty()) {
+      services.service_container.set(kToolServiceDefaultSearchProvider, &web->default_search_provider);
+    }
+    services.service_container.set(kToolServiceWebFetcher, web->fetcher.get());
+    services.service_container.set(kToolServiceWebCrawler, web->crawler.get());
+    if (web->default_crawler_profile.is_object() &&
+        !web->default_crawler_profile.as_object().empty()) {
+      services.service_container.set(kToolServiceDefaultCrawlerProfile, &web->default_crawler_profile);
+    }
     services.values["web"] = Value::object({
         {"searchRegistryAvailable", web->search_registry != nullptr},
         {"defaultSearchProvider", web->default_search_provider},
@@ -2139,15 +2000,17 @@ ToolExecutionServices tool_services_from_native_runtimes(
     });
   }
   if (browser && browser->renderer) {
-    services.browser_renderer = browser->renderer.get();
+    services.service_container.set(kToolServiceBrowserRenderer, browser->renderer.get());
     services.values["browser"] = Value::object({
         {"rendererAvailable", true},
         {"renderer", browser->renderer->metadata().name},
     });
   }
   if (knowledge) {
-    services.knowledge_base = knowledge->base.get();
-    services.knowledge_base_manager = knowledge->manager.get();
+    KnowledgeContextProvider* knowledge_provider =
+        knowledge->manager ? static_cast<KnowledgeContextProvider*>(knowledge->manager.get())
+                           : static_cast<KnowledgeContextProvider*>(knowledge->base.get());
+    services.service_container.set(kToolServiceKnowledgeProvider, knowledge_provider);
     Value::Object knowledge_values{
         {"baseAvailable", knowledge->base != nullptr},
         {"managerAvailable", knowledge->manager != nullptr},
@@ -2161,10 +2024,36 @@ ToolExecutionServices tool_services_from_native_runtimes(
   return services;
 }
 
+NativeChatProviderBuildContext default_native_chat_provider_context(
+    NativeProviderTransport transport,
+    NativeProviderStreamTransport stream_transport,
+    NativeProviderStreamingTransport streaming_transport,
+    NativeLlamaCppAdapters llama_adapters) {
+  const bool has_injected_transport = static_cast<bool>(transport);
+  const bool has_injected_stream_transport = static_cast<bool>(stream_transport);
+  if (!transport) {
+    transport = create_native_provider_http_transport(create_native_http_transport());
+  }
+  if (!stream_transport && !has_injected_transport) {
+    stream_transport = create_native_provider_http_stream_transport(create_native_http_transport());
+  }
+  if (!streaming_transport && !has_injected_transport && !has_injected_stream_transport) {
+    streaming_transport = create_native_provider_http_streaming_transport(
+        create_native_http_streaming_transport());
+  }
+  return NativeChatProviderBuildContext{
+      .transport = std::move(transport),
+      .stream_transport = std::move(stream_transport),
+      .streaming_transport = std::move(streaming_transport),
+      .llama_adapters = std::move(llama_adapters),
+  };
+}
+
 std::shared_ptr<ChatModelAdapter> concrete_model_adapter_from_value(const Value& model,
                                                                     NativeProviderTransport transport,
                                                                     NativeProviderStreamTransport stream_transport,
-                                                                    NativeLlamaCppAdapters llama_adapters) {
+                                                                    NativeLlamaCppAdapters llama_adapters,
+                                                                    NativeProviderStreamingTransport streaming_transport) {
   if (!model.is_object()) {
     throw ConfigurationError("Agent model must be an object.");
   }
@@ -2172,130 +2061,14 @@ std::shared_ptr<ChatModelAdapter> concrete_model_adapter_from_value(const Value&
   if (provider.empty()) {
     throw ConfigurationError("Agent model requires provider.");
   }
-  std::shared_ptr<ChatModelAdapter> adapter;
-  if (provider == "echo") {
-    adapter = std::make_shared<EchoChatModelAdapter>();
-  } else if (provider == "llamacpp-native") {
-    adapter = std::make_shared<LlamaCppNativeChatModelAdapter>(
-        llama_chat_config_from_value(model, std::move(llama_adapters)));
-  } else {
-    const bool has_injected_transport = static_cast<bool>(transport);
-    const bool has_injected_stream_transport = static_cast<bool>(stream_transport);
-    if (!transport) {
-      transport = create_native_provider_http_transport(create_native_http_transport());
-    }
-    if (!stream_transport && !has_injected_transport) {
-      stream_transport = create_native_provider_http_stream_transport(create_native_http_transport());
-    }
-    NativeProviderStreamingTransport streaming_transport;
-    if (!has_injected_transport && !has_injected_stream_transport) {
-      streaming_transport = create_native_provider_http_streaming_transport(
-          create_native_http_streaming_transport());
-    }
-    std::string name = model.at("model").as_string();
-    const std::string api_key = resolve_env_config_value(model.at("apiKey"), model.at("apiKeyEnv"));
-    const std::string base_url = resolve_env_config_value(model.at("baseUrl"), model.at("baseUrlEnv"));
-    const auto default_base_url = [&](const std::string& fallback) {
-      return base_url.empty() ? fallback : base_url;
-    };
-    if (provider == "ollama") {
-      if (name.empty()) {
-        throw ConfigurationError("Provider \"" + provider + "\" requires model.");
-      }
-      const std::string ollama_base_url =
-          resolve_defaulted_env_config_value(model.at("baseUrl"), model.at("baseUrlEnv"), "OLLAMA_BASE_URL",
-                                             "http://127.0.0.1:11434");
-      adapter = std::make_shared<OllamaChatModelAdapter>(
-          name, std::move(transport), ollama_base_url,
-          std::move(stream_transport), std::move(streaming_transport));
-    } else if (provider == "qwen") {
-      name = resolve_defaulted_env_config_value(model.at("model"), Value(), "QWEN_MODEL", "qwen-plus");
-      const std::string qwen_api_key =
-          resolve_defaulted_env_config_value(model.at("apiKey"), model.at("apiKeyEnv"), "QWEN_API_KEY", {});
-      const std::string qwen_base_url =
-          resolve_defaulted_env_config_value(model.at("baseUrl"), model.at("baseUrlEnv"), "QWEN_BASE_URL",
-                                             "https://dashscope.aliyuncs.com/compatible-mode/v1");
-      const std::string reasoning_api = model.at("reasoningApi").as_string("chat-completions");
-      adapter = std::make_shared<QwenChatModelAdapter>(
-          name, std::move(transport), qwen_api_key, qwen_base_url,
-          std::move(stream_transport), reasoning_api, std::move(streaming_transport));
-    } else if (provider == "mimo") {
-      name = resolve_defaulted_env_config_value(model.at("model"), Value(), "MIMO_MODEL", "mimo-v2-flash");
-      const std::string mimo_api_key =
-          resolve_defaulted_env_config_value(model.at("apiKey"), model.at("apiKeyEnv"), "MIMO_API_KEY", {});
-      const std::string mimo_base_url =
-          resolve_defaulted_env_config_value(model.at("baseUrl"), model.at("baseUrlEnv"), "MIMO_BASE_URL",
-                                             "https://api.xiaomimimo.com/v1");
-      adapter = std::make_shared<MiMoChatModelAdapter>(
-          name, std::move(transport), mimo_api_key, mimo_base_url,
-          std::move(stream_transport), std::move(streaming_transport));
-    } else if (provider == "anthropic") {
-      if (name.empty()) {
-        throw ConfigurationError("Provider \"" + provider + "\" requires model.");
-      }
-      const std::string anthropic_api_key =
-          resolve_defaulted_env_config_value(model.at("apiKey"), model.at("apiKeyEnv"), "ANTHROPIC_API_KEY", {});
-      const std::string anthropic_base_url =
-          resolve_defaulted_env_config_value(model.at("baseUrl"), model.at("baseUrlEnv"), "ANTHROPIC_BASE_URL",
-                                             "https://api.anthropic.com/v1");
-      adapter = std::make_shared<AnthropicChatModelAdapter>(
-          name, std::move(transport), anthropic_api_key, anthropic_base_url,
-          std::move(stream_transport), std::move(streaming_transport));
-    } else if (provider == "deepseek") {
-      name = resolve_defaulted_env_config_value(model.at("model"), Value(), "DEEPSEEK_MODEL", "deepseek-v4-flash");
-      const std::string deepseek_api_key =
-          resolve_defaulted_env_config_value(model.at("apiKey"), model.at("apiKeyEnv"), "DEEPSEEK_API_KEY", {});
-      const std::string deepseek_base_url =
-          resolve_defaulted_env_config_value(model.at("baseUrl"), model.at("baseUrlEnv"), "DEEPSEEK_BASE_URL",
-                                             "https://api.deepseek.com/anthropic");
-      adapter = std::make_shared<DeepSeekChatModelAdapter>(
-          name, std::move(transport), deepseek_api_key, deepseek_base_url,
-          std::move(stream_transport), std::move(streaming_transport));
-    } else if (provider == "gemini") {
-      if (name.empty()) {
-        throw ConfigurationError("Provider \"" + provider + "\" requires model.");
-      }
-      const std::string gemini_api_key =
-          resolve_defaulted_env_config_value(model.at("apiKey"), model.at("apiKeyEnv"), "GEMINI_API_KEY", {});
-      const std::string gemini_base_url =
-          resolve_defaulted_env_config_value(model.at("baseUrl"), model.at("baseUrlEnv"), "GEMINI_BASE_URL",
-                                             "https://generativelanguage.googleapis.com/v1beta");
-      adapter = std::make_shared<GeminiChatModelAdapter>(
-          name, std::move(transport), gemini_api_key, gemini_base_url,
-          std::move(stream_transport), std::move(streaming_transport));
-    } else {
-      if (name.empty()) {
-        throw ConfigurationError("Provider \"" + provider + "\" requires model.");
-      }
-      std::string endpoint = model.at("endpoint").as_string("/v1/chat/completions");
-      std::string openai_base_url = default_base_url("https://api.openai.com");
-      std::string openai_api_key = api_key;
-      std::string openai_organization;
-      if (provider == "openai") {
-        openai_base_url = resolve_defaulted_env_config_value(model.at("baseUrl"), model.at("baseUrlEnv"),
-                                                             "OPENAI_BASE_URL", "https://api.openai.com/v1");
-        openai_api_key = resolve_defaulted_env_config_value(model.at("apiKey"), model.at("apiKeyEnv"),
-                                                            "OPENAI_API_KEY", {});
-        openai_organization = resolve_defaulted_env_config_value(model.at("organization"),
-                                                                 model.at("organizationEnv"),
-                                                                 "OPENAI_ORG_ID", {});
-        if (!model.contains("endpoint")) {
-          std::string normalized_openai_base = openai_base_url;
-          while (!normalized_openai_base.empty() && normalized_openai_base.back() == '/') {
-            normalized_openai_base.pop_back();
-          }
-          openai_base_url = normalized_openai_base;
-          endpoint = normalized_openai_base.size() >= 3 &&
-                             normalized_openai_base.compare(normalized_openai_base.size() - 3, 3, "/v1") == 0
-                         ? "/chat/completions"
-                         : "/v1/chat/completions";
-        }
-      }
-      adapter = std::make_shared<OpenAICompatibleChatModelAdapter>(
-          provider, name, std::move(transport), endpoint, openai_base_url, openai_api_key,
-          std::move(stream_transport), openai_organization, std::move(streaming_transport));
-    }
+  const auto descriptor = find_native_chat_provider_descriptor(provider);
+  if (!descriptor) {
+    throw ConfigurationError("Unsupported model provider \"" + provider + "\".");
   }
+  auto adapter = descriptor->create_adapter(
+      model,
+      default_native_chat_provider_context(std::move(transport), std::move(stream_transport),
+                                           std::move(streaming_transport), std::move(llama_adapters)));
   adapter->set_capabilities(model_capabilities_from_config(model));
   return adapter;
 }
@@ -2303,12 +2076,14 @@ std::shared_ptr<ChatModelAdapter> concrete_model_adapter_from_value(const Value&
 std::shared_ptr<ChatModelAdapter> model_adapter_from_value(const Value& model,
                                                            NativeProviderTransport transport,
                                                            NativeProviderStreamTransport stream_transport,
-                                                           NativeLlamaCppAdapters llama_adapters) {
+                                                           NativeLlamaCppAdapters llama_adapters,
+                                                           NativeProviderStreamingTransport streaming_transport = {}) {
   const auto candidates = select_model_candidates(model);
   std::vector<std::shared_ptr<ChatModelAdapter>> adapters;
   adapters.reserve(candidates.size());
   for (const auto& candidate : candidates) {
-    adapters.push_back(concrete_model_adapter_from_value(candidate, transport, stream_transport, llama_adapters));
+    adapters.push_back(concrete_model_adapter_from_value(candidate, transport, stream_transport, llama_adapters,
+                                                        streaming_transport));
   }
   return adapters.size() == 1 ? adapters.front()
                               : std::make_shared<FallbackChatModelAdapter>(std::move(adapters));
@@ -2319,7 +2094,8 @@ std::shared_ptr<Planner> planner_from_value(const Value& value,
                                             const std::shared_ptr<ChatModelAdapter>& default_model,
                                             NativeProviderTransport transport,
                                             NativeProviderStreamTransport stream_transport,
-                                            NativeLlamaCppAdapters llama_adapters) {
+                                            NativeLlamaCppAdapters llama_adapters,
+                                            NativeProviderStreamingTransport streaming_transport) {
   if (value.is_bool()) {
     if (!value.as_bool()) {
       return nullptr;
@@ -2346,7 +2122,8 @@ std::shared_ptr<Planner> planner_from_value(const Value& value,
   if (kind == "model") {
     auto planner_model = value.at("model").is_object()
                              ? model_adapter_from_value(value.at("model"), std::move(transport),
-                                                        std::move(stream_transport), std::move(llama_adapters))
+                                                        std::move(stream_transport), std::move(llama_adapters),
+                                                        std::move(streaming_transport))
                              : default_model;
     ModelPlannerConfig config;
     config.model = std::move(planner_model);
@@ -2370,6 +2147,62 @@ std::shared_ptr<Planner> planner_from_value(const Value& value,
   throw ConfigurationError("Unsupported planner kind \"" + kind + "\".");
 }
 
+ReActPromptMode react_prompt_mode_from_value(const Value& value, const std::string& path) {
+  if (value.is_null()) {
+    return ReActPromptMode::Managed;
+  }
+  const auto mode = value.as_string("managed");
+  if (mode == "managed") {
+    return ReActPromptMode::Managed;
+  }
+  if (mode == "custom") {
+    return ReActPromptMode::Custom;
+  }
+  if (mode == "external") {
+    return ReActPromptMode::External;
+  }
+  throw ConfigurationError(path + " must be one of: managed, custom, external.");
+}
+
+AgentToolCallingStrategy tool_calling_strategy_from_value(const Value& value, const std::string& path) {
+  if (value.is_null()) {
+    return AgentToolCallingStrategy::TextReAct;
+  }
+  const auto strategy = value.as_string("text-react");
+  if (strategy == "text-react") {
+    return AgentToolCallingStrategy::TextReAct;
+  }
+  if (strategy == "native-tool-calling") {
+    return AgentToolCallingStrategy::NativeToolCalling;
+  }
+  throw ConfigurationError(path + " must be one of: text-react, native-tool-calling.");
+}
+
+ReActParserOptions react_parser_options_from_value(const Value& value, const std::string& path) {
+  ReActParserOptions options;
+  if (value.is_null()) {
+    return options;
+  }
+  if (!value.is_object()) {
+    throw ConfigurationError(path + " must be an object when provided.");
+  }
+  if (value.contains("maxActions")) {
+    const auto& max_actions = value.at("maxActions");
+    if (max_actions.is_null()) {
+      return options;
+    }
+    if (!max_actions.is_number()) {
+      throw ConfigurationError(path + ".maxActions must be a positive integer when provided.");
+    }
+    const auto count = max_actions.as_integer();
+    if (count <= 0) {
+      throw ConfigurationError(path + ".maxActions must be greater than zero.");
+    }
+    options.max_actions = static_cast<std::size_t>(count);
+  }
+  return options;
+}
+
 const Value* find_config_resource(const Value& config,
                                   const std::string& collection,
                                   const std::string& name) {
@@ -2385,22 +2218,13 @@ void collect_model_env_refs(const Value& model, std::set<std::string>& keys) {
     return;
   }
   const std::string provider = model.at("provider").as_string();
-  if (provider == "ollama") {
-    add_env_ref(keys, model.at("baseUrlEnv"));
-  } else if (provider == "openai") {
-    add_env_ref(keys, model.at("apiKeyEnv"));
-    add_env_ref(keys, model.at("baseUrlEnv"));
-    add_env_ref(keys, model.at("organizationEnv"));
-  } else if (is_one_of(provider, {"gemini", "anthropic", "qwen", "mimo", "deepseek"})) {
-    add_env_ref(keys, model.at("apiKeyEnv"));
-    add_env_ref(keys, model.at("baseUrlEnv"));
-  } else if (provider == "llamacpp-native") {
-    add_env_ref(keys, model.at("modelPathEnv"));
-    add_env_ref(keys, model.at("libraryPathEnv"));
-    add_env_ref(keys, model.at("libraryDirEnv"));
-    add_env_ref(keys, model.at("mmprojPathEnv"));
-    add_env_ref(keys, model.at("mtmdLibraryPathEnv"));
-    add_env_ref(keys, model.at("mtmdLibraryDirEnv"));
+  if (const auto descriptor = find_native_chat_provider_descriptor(provider);
+      descriptor && descriptor->collect_env_refs) {
+    for (const auto& key : descriptor->collect_env_refs(model)) {
+      if (!key.empty()) {
+        keys.insert(key);
+      }
+    }
   }
   for (const auto& fallback : model.at("fallbacks").as_array()) {
     collect_model_env_refs(fallback, keys);
@@ -2412,22 +2236,21 @@ void collect_embedding_env_refs(const Value& embedding, std::set<std::string>& k
     return;
   }
   const std::string provider = embedding.at("provider").as_string();
-  if (provider == "ollama") {
-    add_env_ref(keys, embedding.at("baseUrlEnv"));
-  } else if (provider == "openai") {
-    add_env_ref(keys, embedding.at("apiKeyEnv"));
-    add_env_ref(keys, embedding.at("baseUrlEnv"));
-    add_env_ref(keys, embedding.at("organizationEnv"));
-  } else if (provider == "gemini" || provider == "qwen") {
-    add_env_ref(keys, embedding.at("apiKeyEnv"));
-    add_env_ref(keys, embedding.at("baseUrlEnv"));
-  } else if (provider == "llamacpp-native") {
-    add_env_ref(keys, embedding.at("modelPathEnv"));
-    add_env_ref(keys, embedding.at("libraryPathEnv"));
-    add_env_ref(keys, embedding.at("libraryDirEnv"));
-    add_env_ref(keys, embedding.at("mmprojPathEnv"));
-    add_env_ref(keys, embedding.at("mtmdLibraryPathEnv"));
-    add_env_ref(keys, embedding.at("mtmdLibraryDirEnv"));
+  if (const auto descriptor = find_native_text_embedding_provider_descriptor(provider);
+      descriptor && descriptor->collect_env_refs) {
+    for (const auto& key : descriptor->collect_env_refs(embedding)) {
+      if (!key.empty()) {
+        keys.insert(key);
+      }
+    }
+  }
+  if (const auto descriptor = find_native_image_embedding_provider_descriptor(provider);
+      descriptor && descriptor->collect_env_refs) {
+    for (const auto& key : descriptor->collect_env_refs(embedding)) {
+      if (!key.empty()) {
+        keys.insert(key);
+      }
+    }
   }
 }
 
@@ -2546,6 +2369,14 @@ void validate_native_agent_config(const Value& config) {
                                          agent_path + ".knowledge.retrievalOptions");
     validate_knowledge_retrieval_options(definition.at("runtime").at("knowledgeRetrievalOptions"),
                                          agent_path + ".runtime.knowledgeRetrievalOptions");
+    (void)tool_calling_strategy_from_value(definition.at("runtime").at("toolCallingStrategy"),
+                                           agent_path + ".runtime.toolCallingStrategy");
+    (void)react_prompt_mode_from_value(definition.at("runtime").at("reactPromptMode"),
+                                       agent_path + ".runtime.reactPromptMode");
+    (void)react_parser_options_from_value(definition.at("runtime").at("reactParserOptions"),
+                                          agent_path + ".runtime.reactParserOptions");
+    (void)context_stats_bucket_inputs_from_value(definition.at("runtime").at("promptStatsBuckets"),
+                                                 agent_path + ".runtime.promptStatsBuckets");
     validate_web_config(definition.at("web"), agent_path + ".web");
     validate_planner_config(definition.at("runtime").at("planner"), agent_path + ".runtime.planner");
   }
@@ -2720,20 +2551,29 @@ Value resolve_agent_definition(const NativeLoadedAgentConfig& loaded_config,
   return resolve_agent_definition(normalized.config, std::move(requested_agent_id));
 }
 
-NativeResolvedAgentApp resolve_native_agent_app(const Value& config, std::string requested_agent_id,
-                                                NativeProviderTransport provider_transport,
-                                                NativeMCPTransportFactory mcp_transport_factory,
-                                                NativeWebAdapters web_adapters,
-                                                NativeDeveloperAdapters developer_adapters,
-                                                NativeBrowserAdapters browser_adapters,
-                                                NativeProviderStreamTransport provider_stream_transport,
-                                                NativeLlamaCppAdapters llama_adapters) {
+NativeResolvedAgentApp resolve_native_agent_app(const Value& config, std::string requested_agent_id) {
+  NativeAgentAppResolveOptions options;
+  options.requested_agent_id = std::move(requested_agent_id);
+  return resolve_native_agent_app(config, std::move(options));
+}
+
+NativeResolvedAgentApp resolve_native_agent_app(const Value& config, NativeAgentAppResolveOptions options) {
   validate_native_agent_config(config);
-  const std::string agent_id = resolve_agent_id(config, std::move(requested_agent_id));
+  const std::string agent_id = resolve_agent_id(config, std::move(options.requested_agent_id));
   const auto& definition = config.at("agents").at(agent_id);
   if (!definition.is_object()) {
     throw ConfigurationError("Agent definition \"" + agent_id + "\" must be an object.");
   }
+
+  auto provider_transport = std::move(options.provider_transport);
+  auto provider_stream_transport = std::move(options.provider_stream_transport);
+  auto provider_streaming_transport = std::move(options.provider_streaming_transport);
+  auto mcp_transport_factory = std::move(options.mcp_transport_factory);
+  auto web_adapters = std::move(options.web_adapters);
+  auto developer_adapters = std::move(options.developer_adapters);
+  auto browser_adapters = std::move(options.browser_adapters);
+  auto llama_adapters = std::move(options.llama_adapters);
+  auto configure_session_memory = std::move(options.configure_session_memory);
 
   const auto& tools_config = definition.at("tools");
   std::vector<std::string> bundles = string_array_from_value(tools_config.at("bundles"));
@@ -2758,47 +2598,62 @@ NativeResolvedAgentApp resolve_native_agent_app(const Value& config, std::string
 
   const auto& runtime = definition.at("runtime");
   AgentRunnerConfig runner_config;
-  runner_config.adapter =
-      model_adapter_from_value(definition.at("model"), provider_transport, provider_stream_transport, llama_adapters);
-  runner_config.tools = tools;
-  runner_config.system_prompt = definition.at("systemPrompt").as_string();
-  runner_config.max_iterations =
+  runner_config.model_runtime.adapter =
+      model_adapter_from_value(definition.at("model"), provider_transport, provider_stream_transport,
+                               llama_adapters, provider_streaming_transport);
+  runner_config.tool_runtime.definitions = tools;
+  runner_config.context_runtime.system_prompt = definition.at("systemPrompt").as_string();
+  runner_config.context_runtime.max_iterations =
       static_cast<int>(definition.at("maxIterations").as_integer(runtime.at("maxIterations").as_integer(8)));
-  runner_config.model_settings = model_settings_from_value(runtime.at("modelSettings"));
-  if (runner_config.model_settings.model.empty() && runner_config.adapter) {
-    runner_config.model_settings.model = runner_config.adapter->model();
+  runner_config.model_runtime.settings = model_settings_from_value(runtime.at("modelSettings"));
+  if (runner_config.model_runtime.settings.model.empty() && runner_config.model_runtime.adapter) {
+    runner_config.model_runtime.settings.model = runner_config.model_runtime.adapter->model();
   }
-  runner_config.memory_store = session_store_from_value(config, definition.at("memory").at("session"));
-  runner_config.long_term_memory = long_term_memory_from_value(config, runtime.at("longTermMemory"));
-  runner_config.knowledge_base = knowledge && knowledge->base ? knowledge->base.get() : nullptr;
-  runner_config.knowledge_base_manager = knowledge && knowledge->manager ? knowledge->manager.get() : nullptr;
-  runner_config.knowledge_retrieval_options =
+  runner_config.memory_runtime.session_store = session_store_from_value(
+      config, definition.at("memory").at("session"), configure_session_memory);
+  runner_config.memory_runtime.long_term_memory = long_term_memory_from_value(config, runtime.at("longTermMemory"));
+  runner_config.knowledge_runtime.provider =
+      knowledge && knowledge->manager ? static_cast<KnowledgeContextProvider*>(knowledge->manager.get())
+      : knowledge && knowledge->base ? static_cast<KnowledgeContextProvider*>(knowledge->base.get())
+                                     : nullptr;
+  runner_config.knowledge_runtime.retrieval_options =
       knowledge_retrieval_options_from_value(definition.at("knowledge").at("retrievalOptions"));
   if (!runtime.at("knowledgeRetrievalOptions").is_null()) {
-    runner_config.knowledge_retrieval_options =
+    runner_config.knowledge_runtime.retrieval_options =
         knowledge_retrieval_options_from_value(runtime.at("knowledgeRetrievalOptions"));
   }
-  runner_config.retrieval_options = retrieval_options_from_value(runtime.at("retrievalOptions"));
-  runner_config.writeback_options = writeback_options_from_value(runtime.at("writebackOptions"));
-  runner_config.planner = planner_from_value(runtime.at("planner"), definition.at("model"),
-                                             runner_config.adapter, std::move(provider_transport),
-                                             std::move(provider_stream_transport), std::move(llama_adapters));
+  runner_config.memory_runtime.retrieval_options = retrieval_options_from_value(runtime.at("retrievalOptions"));
+  runner_config.memory_runtime.writeback_options = writeback_options_from_value(runtime.at("writebackOptions"));
+  runner_config.governance.planner = planner_from_value(runtime.at("planner"), definition.at("model"),
+                                                        runner_config.model_runtime.adapter, std::move(provider_transport),
+                                                        std::move(provider_stream_transport), std::move(llama_adapters),
+                                                        std::move(provider_streaming_transport));
   if (runtime.contains("enablePlanning")) {
-    runner_config.enable_planning = runtime.at("enablePlanning").as_bool();
+    runner_config.governance.enable_planning = runtime.at("enablePlanning").as_bool();
   }
-  runner_config.permission_policy = std::move(permission_policy);
-  runner_config.approval_handler = std::move(approval_handler);
-  runner_config.tool_services = tool_services_from_native_runtimes(workflow, web, browser, knowledge);
-  runner_config.skills = skills_registry_from_value(config, definition.at("skills"));
-  runner_config.default_skills = string_array_from_value(definition.at("skills").at("defaultSkills"));
+  runner_config.tool_runtime.permission_policy = std::move(permission_policy);
+  runner_config.tool_runtime.approval_handler = std::move(approval_handler);
+  runner_config.tool_runtime.services = tool_services_from_native_runtimes(workflow, web, browser, knowledge);
+  runner_config.context_runtime.skills = skills_registry_from_value(config, definition.at("skills"));
+  runner_config.context_runtime.default_skills = string_array_from_value(definition.at("skills").at("defaultSkills"));
   if (definition.at("skills").contains("advertiseSkills")) {
-    runner_config.advertise_skills = definition.at("skills").at("advertiseSkills").as_bool();
+    runner_config.context_runtime.advertise_skills = definition.at("skills").at("advertiseSkills").as_bool();
   }
+  runner_config.react_runtime.max_parse_errors =
+      static_cast<int>(definition.at("maxParseErrors").as_integer(runtime.at("maxParseErrors").as_integer(2)));
+  runner_config.tool_runtime.calling_strategy =
+      tool_calling_strategy_from_value(runtime.at("toolCallingStrategy"), "runtime.toolCallingStrategy");
+  runner_config.react_runtime.prompt_mode =
+      react_prompt_mode_from_value(runtime.at("reactPromptMode"), "runtime.reactPromptMode");
+  runner_config.react_runtime.parser_options =
+      react_parser_options_from_value(runtime.at("reactParserOptions"), "runtime.reactParserOptions");
+  runner_config.observability.prompt_stats_buckets =
+      context_stats_bucket_inputs_from_value(runtime.at("promptStatsBuckets"), "runtime.promptStatsBuckets");
 
   NativeResolvedAgentApp app;
   app.agent_id = agent_id;
   app.tools = tools;
-  app.skills = runner_config.skills;
+  app.skills = runner_config.context_runtime.skills;
   app.mcp_clients = std::move(mcp_clients);
   app.workflow = std::move(workflow);
   app.web = std::move(web);
@@ -2809,72 +2664,38 @@ NativeResolvedAgentApp resolve_native_agent_app(const Value& config, std::string
 }
 
 NativeResolvedAgentApp resolve_native_agent_app(NativeLoadedAgentConfig loaded_config,
-                                                std::string requested_agent_id,
-                                                NativeProviderTransport provider_transport,
-                                                NativeMCPTransportFactory mcp_transport_factory,
-                                                NativeWebAdapters web_adapters,
-                                                NativeDeveloperAdapters developer_adapters,
-                                                NativeBrowserAdapters browser_adapters,
-                                                NativeProviderStreamTransport provider_stream_transport,
-                                                NativeLlamaCppAdapters llama_adapters) {
+                                                std::string requested_agent_id) {
+  NativeAgentAppResolveOptions options;
+  options.requested_agent_id = std::move(requested_agent_id);
+  return resolve_native_agent_app(std::move(loaded_config), std::move(options));
+}
+
+NativeResolvedAgentApp resolve_native_agent_app(NativeLoadedAgentConfig loaded_config,
+                                                NativeAgentAppResolveOptions options) {
   loaded_config = define_native_loaded_agent_config(std::move(loaded_config.config),
                                                     std::move(loaded_config.cwd),
                                                     std::move(loaded_config.path));
-  return resolve_native_agent_app(loaded_config.config,
-                                  std::move(requested_agent_id),
-                                  std::move(provider_transport),
-                                  std::move(mcp_transport_factory),
-                                  std::move(web_adapters),
-                                  std::move(developer_adapters),
-                                  std::move(browser_adapters),
-                                  std::move(provider_stream_transport),
-                                  std::move(llama_adapters));
-}
-
-NativeResolvedAgentApp load_native_agent_app(const std::filesystem::path& config_path,
-                                             std::string requested_agent_id,
-                                             NativeProviderTransport provider_transport,
-                                             NativeMCPTransportFactory mcp_transport_factory,
-                                             NativeWebAdapters web_adapters,
-                                             NativeDeveloperAdapters developer_adapters,
-                                             NativeBrowserAdapters browser_adapters,
-                                             NativeProviderStreamTransport provider_stream_transport,
-                                             NativeLlamaCppAdapters llama_adapters,
-                                             NativeConfigModuleLoader config_module_loader) {
-  auto config = load_native_agent_config(config_path, std::move(config_module_loader));
-  return resolve_native_agent_app(config, std::move(requested_agent_id), std::move(provider_transport),
-                                  std::move(mcp_transport_factory), std::move(web_adapters),
-                                  std::move(developer_adapters), std::move(browser_adapters),
-                                  std::move(provider_stream_transport), std::move(llama_adapters));
+  return resolve_native_agent_app(loaded_config.config, std::move(options));
 }
 
 NativeResolvedAgentApp load_native_agent_app(const std::filesystem::path& config_path,
                                              NativeConfigModuleLoader config_module_loader) {
-  return load_native_agent_app(config_path,
-                               {},
-                               {},
-                               {},
-                               {},
-                               {},
-                               {},
-                               {},
-                               {},
-                               std::move(config_module_loader));
+  return load_native_agent_app(config_path, NativeAgentAppResolveOptions{}, std::move(config_module_loader));
 }
 
 NativeResolvedAgentApp load_native_agent_app(const std::filesystem::path& config_path,
                                              std::string requested_agent_id,
                                              NativeConfigModuleLoader config_module_loader) {
-  return load_native_agent_app(config_path,
-                               std::move(requested_agent_id),
-                               {},
-                               {},
-                               {},
-                               {},
-                               {},
-                               {},
-                               {},
-                               std::move(config_module_loader));
+  NativeAgentAppResolveOptions options;
+  options.requested_agent_id = std::move(requested_agent_id);
+  return load_native_agent_app(config_path, std::move(options), std::move(config_module_loader));
+}
+
+NativeResolvedAgentApp load_native_agent_app(const std::filesystem::path& config_path,
+                                             NativeAgentAppResolveOptions options,
+                                             NativeConfigModuleLoader config_module_loader) {
+  auto loaded_config = load_native_loaded_agent_config(config_path, std::move(config_module_loader));
+  return resolve_native_agent_app(std::move(loaded_config), std::move(options));
 }
 
 NativeLoadedAgentConfig load_native_loaded_agent_config(const std::filesystem::path& config_path,

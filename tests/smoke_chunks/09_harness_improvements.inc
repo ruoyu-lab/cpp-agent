@@ -26,8 +26,8 @@
     class MarkerModel final : public agent::ChatModelAdapter {
      public:
       MarkerModel() : ChatModelAdapter("test", "marker", 0.0, 64) {}
-      agent::ModelResponse generate(const agent::GenerateParams&) override {
-        return build_response(agent::ModelResponse{.text = "ok"});
+      agent::AgentOutput generate(const agent::GenerateParams&) override {
+        return build_output(agent::AgentOutput{.text = "ok"});
       }
     };
 
@@ -39,7 +39,7 @@
     auto_compact_bus.register_sink([&](const agent::FrameworkEvent& event) {
       if (event.category == "session.auto_compact") ++auto_compact_events;
     });
-    agent::AgentLoop loop(agent::AgentLoopConfig{
+    agent::internal::AgentLoop loop(agent::internal::AgentLoopConfig{
         .model = std::make_shared<MarkerModel>(),
         .tool_registry = &empty_registry,
         .tool_executor = &empty_executor,
@@ -255,14 +255,21 @@
   }
 
   // (3b) fs.writeText returns unified diff + line counts for UI rendering.
-  {
-    const auto base = std::filesystem::temp_directory_path() / "agent_native_smoke_diff";
-    std::filesystem::create_directories(base);
-    const auto path = base / "doc.txt";
+	{
+	    const auto base = std::filesystem::temp_directory_path() / "agent_native_smoke_diff";
+	    std::filesystem::create_directories(base);
+	    const auto path = base / "doc.txt";
 
-    auto fs_tools = agent::create_local_builtin_tools({}, true);
-    agent::ToolRegistry fs_registry(fs_tools);
-    agent::ToolExecutor fs_executor(fs_registry);
+	    auto fs_tools = agent::create_local_builtin_tools({}, true);
+	    agent::ToolRegistry fs_registry(fs_tools);
+	    agent::EventBus fs_progress_bus;
+	    std::vector<agent::FrameworkEvent> fs_progress_events;
+	    fs_progress_bus.register_sink([&](const agent::FrameworkEvent& event) {
+	      if (event.category == "tool.progress") {
+	        fs_progress_events.push_back(event);
+	      }
+	    });
+	    agent::ToolExecutor fs_executor(fs_registry, {}, {}, &fs_progress_bus);
 
     auto do_write = [&](const std::string& content) {
       return fs_executor.execute_tool_call(agent::ToolCall{
@@ -282,10 +289,23 @@
     auto payload1 = agent::parse_json(r1.output);
     assert(payload1.at("ok").as_bool());
     assert(payload1.at("newFile").as_bool());
-    assert(payload1.at("linesAdded").as_integer() == 3);
-    assert(payload1.at("linesRemoved").as_integer() == 0);
-    assert(payload1.at("diff").as_string().find("+++ b/") != std::string::npos);
-    assert(payload1.at("diff").as_string().find("+alpha") != std::string::npos);
+	    assert(payload1.at("linesAdded").as_integer() == 3);
+	    assert(payload1.at("linesRemoved").as_integer() == 0);
+	    assert(payload1.at("diff").as_string().find("+++ b/") != std::string::npos);
+	    assert(payload1.at("diff").as_string().find("+alpha") != std::string::npos);
+	    assert(std::any_of(
+	        fs_progress_events.begin(), fs_progress_events.end(),
+	        [&](const agent::FrameworkEvent& event) {
+	          return event.payload.at("kind").as_string() == "file.edit.preview"
+	                 && event.payload.at("payload").at("path").as_string() == path.string()
+	                 && event.payload.at("payload").at("linesAdded").as_integer() == 3;
+	        }));
+	    assert(std::any_of(
+	        fs_progress_events.begin(), fs_progress_events.end(),
+	        [&](const agent::FrameworkEvent& event) {
+	          return event.payload.at("kind").as_string() == "file.edit.applied"
+	                 && event.payload.at("payload").at("path").as_string() == path.string();
+	        }));
 
     // Case B: rewrite identical content → no diff, zero counts.
     auto r2 = do_write("alpha\nbeta\ngamma\n");
@@ -331,29 +351,29 @@
     class EchoMain final : public agent::ChatModelAdapter {
      public:
       EchoMain() : ChatModelAdapter("test", "echo-main", 0.0, 64) {}
-      agent::ModelResponse generate(const agent::GenerateParams& params) override {
+      agent::AgentOutput generate(const agent::GenerateParams& params) override {
         std::string text = "main:";
         if (!params.messages.empty()) {
           text += agent::extract_text_content(params.messages.back().content);
         }
-        return build_response(agent::ModelResponse{.text = text});
+        return build_output(agent::AgentOutput{.text = text});
       }
     };
     class CritiquePrefix final : public agent::ChatModelAdapter {
      public:
       CritiquePrefix() : ChatModelAdapter("test", "critique-prefix", 0.0, 64) {}
       int calls = 0;
-      agent::ModelResponse generate(const agent::GenerateParams&) override {
+      agent::AgentOutput generate(const agent::GenerateParams&) override {
         ++calls;
-        return build_response(agent::ModelResponse{.text = "PASS [critique] graded"});
+        return build_output(agent::AgentOutput{.text = "PASS [critique] graded"});
       }
     };
 
     auto critique = std::make_shared<CritiquePrefix>();
     agent::AgentRunnerConfig runner_config;
-    runner_config.adapter = std::make_shared<EchoMain>();
-    runner_config.critique_adapter = critique;
-    runner_config.memory_store = std::make_shared<agent::InMemorySessionStore>();
+    runner_config.model_runtime.adapter = std::make_shared<EchoMain>();
+    runner_config.model_runtime.critique_adapter = critique;
+    runner_config.memory_runtime.session_store = std::make_shared<agent::InMemorySessionStore>();
     agent::AgentRunner critique_runner(runner_config);
 
     agent::EvalSuite suite;
@@ -370,11 +390,11 @@
 
     // Without a critique adapter, falls back + emits the warning event.
     agent::AgentRunnerConfig fallback_config;
-    fallback_config.adapter = std::make_shared<EchoMain>();
-    fallback_config.memory_store = std::make_shared<agent::InMemorySessionStore>();
+    fallback_config.model_runtime.adapter = std::make_shared<EchoMain>();
+    fallback_config.memory_runtime.session_store = std::make_shared<agent::InMemorySessionStore>();
     agent::AgentRunner fallback_runner(fallback_config);
     std::atomic<int> self_grade_events{0};
-    fallback_runner.register_event_sink([&](const agent::FrameworkEvent& event) {
+    fallback_runner.events().register_sink([&](const agent::FrameworkEvent& event) {
       if (event.category == "eval.self_grading_detected") ++self_grade_events;
     });
     agent::EvalSuite fallback_suite;
@@ -473,9 +493,48 @@
 
     std::filesystem::remove(script_path);
   }
+  {
+    const auto script_path = std::filesystem::temp_directory_path() / "agent_native_smoke_process_hook_early_exit.sh";
+    {
+      std::ofstream out(script_path);
+      out << "#!/bin/sh\n"
+             "exit 2\n";
+    }
+    std::filesystem::permissions(script_path,
+                                 std::filesystem::perms::owner_all | std::filesystem::perms::group_read |
+                                     std::filesystem::perms::others_read);
+    agent::ProcessHookConfig config;
+    config.executable = script_path;
+    config.timeout = std::chrono::milliseconds(2000);
+
+    auto early_exit_result = agent::run_process_hook(
+        config,
+        agent::Value::object({{"msg", std::string(1024 * 1024, 'x')}}));
+    assert(early_exit_result.decision == agent::ProcessHookDecision::Block);
+    assert(early_exit_result.exit_code == 2);
+
+    std::filesystem::remove(script_path);
+  }
 #endif
 
-  // (8) Default logging hook set: success silent, failure verbose.
+  // (8) Atomic JSON/text writes leave complete files and clean up temp names.
+  {
+    const auto atomic_dir = std::filesystem::temp_directory_path() / "agent_native_smoke_atomic_write";
+    const auto atomic_path = atomic_dir / "state.json";
+    std::filesystem::remove_all(atomic_dir);
+    std::filesystem::create_directories(atomic_dir);
+    agent::write_json_file(atomic_path, agent::Value::object({{"version", 1}}));
+    agent::write_json_file(atomic_path, agent::Value::object({{"version", 2}, {"ok", true}}));
+    const auto loaded = agent::read_json_file(atomic_path);
+    assert(loaded.at("version").as_integer() == 2);
+    assert(loaded.at("ok").as_bool());
+    for (const auto& entry : std::filesystem::directory_iterator(atomic_dir)) {
+      assert(entry.path().filename().string().find(".tmp-") == std::string::npos);
+    }
+    std::filesystem::remove_all(atomic_dir);
+  }
+
+  // (9) Default logging hook set: success silent, failure verbose.
   {
     std::vector<agent::HookLogEntry> log_entries;
     auto sink = [&](const agent::HookLogEntry& entry) { log_entries.push_back(entry); };
@@ -514,14 +573,14 @@
           : ChatModelAdapter("test", "capture-tools", 0.0, 64),
             captured_names_(captured_names),
             captured_descriptors_(captured_descriptors) {}
-      agent::ModelResponse generate(const agent::GenerateParams& params) override {
+      agent::AgentOutput generate(const agent::GenerateParams& params) override {
         captured_names_->clear();
         captured_descriptors_->clear();
         for (const auto& tool : params.tools) {
           captured_names_->push_back(tool.name);
           captured_descriptors_->push_back(tool.name);
         }
-        return build_response(agent::ModelResponse{.text = "lazy-ok"});
+        return build_output(agent::AgentOutput{.text = "lazy-ok"});
       }
 
      private:
@@ -555,19 +614,43 @@
     auto model = std::make_shared<CaptureToolsModel>(&captured_names, &captured_descriptors);
 
     agent::AgentRunnerConfig lazy_config;
-    lazy_config.adapter = model;
-    lazy_config.tools = tools;
-    lazy_config.lazy_tool_mode = true;
-    lazy_config.forced_visible_tools = {"fs.readText"};
-    lazy_config.max_iterations = 1;
-    lazy_config.memory_store = std::make_shared<agent::InMemorySessionStore>();
+    lazy_config.model_runtime.adapter = model;
+    lazy_config.tool_runtime.definitions = tools;
+    lazy_config.tool_runtime.lazy_mode = true;
+    lazy_config.tool_runtime.forced_visible_tools = {"fs.readText"};
+    lazy_config.context_runtime.max_iterations = 1;
+    lazy_config.memory_runtime.session_store = std::make_shared<agent::InMemorySessionStore>();
     agent::AgentRunner lazy_runner(lazy_config);
 
     // get_session works under the new config.
-    auto session = lazy_runner.get_session("lazy-session");
+    auto session = lazy_runner.sessions().get("lazy-session");
     assert(session);
 
-    auto run_result = lazy_runner.run("hi", "lazy-session");
+    agent::SessionMemoryOptions manual_compact_options;
+    manual_compact_options.compaction.compaction_budget.max_messages = 1;
+    auto manual_compact_store =
+        std::make_shared<agent::InMemorySessionStore>(manual_compact_options);
+    agent::EventBus manual_compact_bus;
+    std::atomic<int> manual_compact_events{0};
+    manual_compact_bus.register_sink([&](const agent::FrameworkEvent& event) {
+      if (event.category == "session.compact") ++manual_compact_events;
+    });
+    agent::AgentRunnerConfig manual_compact_config;
+    manual_compact_config.model_runtime.adapter = std::make_shared<CaptureToolsModel>(&captured_names, &captured_descriptors);
+    manual_compact_config.memory_runtime.session_store = manual_compact_store;
+    manual_compact_config.observability.event_bus = &manual_compact_bus;
+    agent::AgentRunner manual_compact_runner(manual_compact_config);
+    auto manual_compact_session = manual_compact_runner.sessions().get("manual-compact");
+    manual_compact_session->add(agent::create_message(agent::MessageRole::User, "first"));
+    manual_compact_session->add(agent::create_message(agent::MessageRole::Assistant, "second"));
+    manual_compact_session->add(agent::create_message(agent::MessageRole::User, "third"));
+    auto manual_compact_snapshot = manual_compact_runner.sessions().compact("manual-compact");
+    assert(manual_compact_snapshot.session_id == "manual-compact");
+    assert(manual_compact_snapshot.messages.size() == 1);
+    assert(manual_compact_snapshot.summary.find("first") != std::string::npos);
+    assert(manual_compact_events.load() == 1);
+
+    auto run_result = lazy_runner.execution().run("hi", "lazy-session");
     assert(run_result.text == "lazy-ok");
 
     // The adapter should have seen only tool.search + tool.describe + fs.readText.
@@ -587,13 +670,13 @@
     auto default_model = std::make_shared<CaptureToolsModel>(&default_names, &default_descriptors);
 
     agent::AgentRunnerConfig default_config;
-    default_config.adapter = default_model;
-    default_config.tools = tools;
-    default_config.max_iterations = 1;
-    default_config.memory_store = std::make_shared<agent::InMemorySessionStore>();
+    default_config.model_runtime.adapter = default_model;
+    default_config.tool_runtime.definitions = tools;
+    default_config.context_runtime.max_iterations = 1;
+    default_config.memory_runtime.session_store = std::make_shared<agent::InMemorySessionStore>();
     agent::AgentRunner default_runner(default_config);
 
-    (void)default_runner.run("hi", "default-session");
+    (void)default_runner.execution().run("hi", "default-session");
     auto default_has = [&](std::string_view name) {
       return std::any_of(default_names.begin(), default_names.end(),
                          [&](const std::string& n) { return n == name; });
@@ -605,3 +688,61 @@
     assert(default_has("web.fetch"));
   }
 
+  {
+    auto provider = std::make_shared<agent::DeterministicMediaGenerationProvider>(
+        "fixture-media", "fixture-media-v1",
+        std::vector<agent::MediaGenerationKind>{agent::MediaGenerationKind::Image,
+                                                agent::MediaGenerationKind::Video,
+                                                agent::MediaGenerationKind::Audio});
+    agent::MediaGenerationProviderRegistry media_registry({provider});
+    assert(media_registry.require_by_kind(agent::MediaGenerationKind::Image)->name() == "fixture-media");
+    bool unsupported_kind_threw = false;
+    try {
+      auto image_only = std::make_shared<agent::DeterministicMediaGenerationProvider>(
+          "image-only", "fixture-image-v1",
+          std::vector<agent::MediaGenerationKind>{agent::MediaGenerationKind::Image});
+      agent::MediaGenerationProviderRegistry image_registry({image_only});
+      (void)image_registry.require_by_kind(agent::MediaGenerationKind::Video, "image-only");
+    } catch (const agent::ConfigurationError& error) {
+      unsupported_kind_threw = std::string(error.what()).find("does not support video") != std::string::npos;
+    }
+    assert(unsupported_kind_threw);
+
+    agent::InMemoryArtifactStore media_artifacts;
+    agent::MediaGenerationToolOptions media_options;
+    media_options.default_provider = "fixture-media";
+    media_options.output_options.artifact_writer =
+        agent::create_in_memory_media_artifact_writer(&media_artifacts);
+    media_options.output_options.artifact_key_prefix = "tool-media";
+    auto media_tools = agent::create_media_generation_builtin_tools(&media_registry, media_options);
+    assert(media_tools.size() == 3);
+    for (auto& tool : media_tools) {
+      agent::ToolExecutionContext tool_context;
+      const auto invoked = tool.invoke(agent::Value::object({
+          {"prompt", "make " + tool.name},
+          {"count", 2},
+      }), tool_context);
+      const auto& envelope = std::get<agent::ToolResultEnvelope>(invoked);
+      const auto& result = *envelope.value;
+      const auto& artifacts = result.at("artifacts").as_array();
+      assert(artifacts.size() == 2);
+      assert(artifacts.front().at("source").at("kind").as_string() == "artifact");
+      assert(artifacts.front().at("source").at("key").as_string().find("tool-media/") == 0);
+      assert(media_artifacts.get(artifacts.front().at("source").at("key").as_string()).has_value());
+    }
+
+    auto inline_tools = agent::create_media_generation_builtin_tools(
+        &media_registry,
+        agent::MediaGenerationToolOptions{.default_provider = "fixture-media"});
+    auto image_tool = std::find_if(inline_tools.begin(), inline_tools.end(), [](const auto& tool) {
+      return tool.name == "media.generateImage";
+    });
+    assert(image_tool != inline_tools.end());
+    agent::ToolExecutionContext inline_context;
+    const auto inline_invoked = image_tool->invoke(agent::Value::object({
+        {"prompt", "inline result"},
+    }), inline_context);
+    const auto& inline_envelope = std::get<agent::ToolResultEnvelope>(inline_invoked);
+    const auto& inline_result = *inline_envelope.value;
+    assert(inline_result.at("artifacts").as_array().front().at("source").at("kind").as_string() == "inline");
+  }

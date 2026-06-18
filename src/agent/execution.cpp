@@ -1,4 +1,4 @@
-#include "agent/agent.hpp"
+#include "agent/core_api.hpp"
 #include "detail/helpers.hpp"
 
 #include <algorithm>
@@ -30,6 +30,8 @@ std::string to_string(ExecutionTarget target) {
       return "workflow-node";
     case ExecutionTarget::ChildAgent:
       return "child-agent";
+    case ExecutionTarget::Skill:
+      return "skill";
   }
   return "run";
 }
@@ -76,7 +78,10 @@ void CancellationToken::throw_if_cancelled(ExecutionTarget target) const {
     }
     reason = reason_;
   }
-  throw AgentFrameworkError("Execution aborted for " + to_string(target) + ": " + reason);
+  const auto target_name = to_string(target);
+  throw CancellationError("Execution aborted for " + target_name + ": " + reason,
+                          target_name,
+                          reason);
 }
 
 std::size_t CancellationToken::add_callback(Callback callback) {

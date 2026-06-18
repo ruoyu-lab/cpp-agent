@@ -2,89 +2,42 @@
   "version": 1,
   "cases": [
     {
-      "name": "tool result envelope keeps content and value output",
-      "toolCall": {
-        "id": "call_weather",
-        "name": "fixture.weather",
-        "arguments": {
-          "city": "Seoul"
-        }
-      },
-      "handler": {
-        "kind": "envelope",
-        "content": [
-          {
-            "type": "text",
-            "text": "Weather: sunny 21c",
-            "metadata": {
-              "source": "contract"
-            }
+      "name": "plain object result becomes text output and ok metadata",
+      "input": {
+        "toolCall": {
+          "id": "call_plain",
+          "name": "contract.plain",
+          "arguments": {
+            "value": 42
           }
-        ],
-        "value": {
-          "answer": 42,
-          "ok": true
         },
-        "metadata": {
-          "source": "fixture"
+        "result": {
+          "answer": 42,
+          "unit": "contract"
         }
       },
       "expected": {
         "ok": true,
-        "resultKind": "envelope",
-        "error": "",
-        "output": "{\n  \"answer\": 42,\n  \"ok\": true\n}",
+        "result": {
+          "answer": 42,
+          "unit": "contract"
+        },
+        "structuredOutput": {
+          "answer": 42,
+          "unit": "contract"
+        },
+        "output": "{\n  \"answer\": 42,\n  \"unit\": \"contract\"\n}",
+        "error": null,
         "message": {
           "role": "tool",
           "content": [
             {
               "type": "text",
-              "text": "Weather: sunny 21c",
-              "metadata": {
-                "source": "contract"
-              }
+              "text": "{\n  \"answer\": 42,\n  \"unit\": \"contract\"\n}"
             }
           ],
-          "name": "fixture.weather",
-          "toolCallId": "call_weather",
-          "toolCalls": [],
-          "metadata": {
-            "ok": true,
-            "source": "fixture"
-          }
-        }
-      }
-    },
-    {
-      "name": "plain value result becomes text tool message",
-      "toolCall": {
-        "id": "call_echo",
-        "name": "fixture.echo",
-        "arguments": {
-          "text": "hello"
-        }
-      },
-      "handler": {
-        "kind": "value",
-        "value": {
-          "echo": "hello"
-        }
-      },
-      "expected": {
-        "ok": true,
-        "resultKind": "value",
-        "error": "",
-        "output": "{\n  \"echo\": \"hello\"\n}",
-        "message": {
-          "role": "tool",
-          "content": [
-            {
-              "type": "text",
-              "text": "{\n  \"echo\": \"hello\"\n}"
-            }
-          ],
-          "name": "fixture.echo",
-          "toolCallId": "call_echo",
+          "name": "contract.plain",
+          "toolCallId": "call_plain",
           "toolCalls": [],
           "metadata": {
             "ok": true
@@ -93,31 +46,138 @@
       }
     },
     {
-      "name": "throwing tool returns failure envelope",
-      "toolCall": {
-        "id": "call_fail",
-        "name": "fixture.fail",
-        "arguments": {}
+      "name": "result envelope separates model content from machine value",
+      "input": {
+        "toolCall": {
+          "id": "call_envelope",
+          "name": "contract.envelope",
+          "arguments": {
+            "path": "contract/result.json"
+          }
+        },
+        "result": {
+          "value": {
+            "artifactKey": "artifact://contract/result.json",
+            "items": 2
+          },
+          "content": [
+            {
+              "type": "file",
+              "source": {
+                "kind": "artifact",
+                "key": "artifact://contract/result.json",
+                "mimeType": "application/json",
+                "filename": "result.json"
+              },
+              "title": "Contract result",
+              "textHint": "2 contract items",
+              "metadata": {
+                "audited": true
+              }
+            }
+          ],
+          "metadata": {
+            "artifactKey": "artifact://contract/result.json"
+          }
+        }
       },
-      "handler": {
-        "kind": "throw",
-        "error": "contract failure"
+      "expected": {
+        "ok": true,
+        "result": {
+          "value": {
+            "artifactKey": "artifact://contract/result.json",
+            "items": 2
+          },
+          "content": [
+            {
+              "type": "file",
+              "source": {
+                "kind": "artifact",
+                "key": "artifact://contract/result.json",
+                "mimeType": "application/json",
+                "filename": "result.json"
+              },
+              "title": "Contract result",
+              "textHint": "2 contract items",
+              "metadata": {
+                "audited": true
+              }
+            }
+          ],
+          "metadata": {
+            "artifactKey": "artifact://contract/result.json"
+          }
+        },
+        "structuredOutput": {
+          "artifactKey": "artifact://contract/result.json",
+          "items": 2
+        },
+        "output": "{\n  \"artifactKey\": \"artifact://contract/result.json\",\n  \"items\": 2\n}",
+        "error": null,
+        "message": {
+          "role": "tool",
+          "content": [
+            {
+              "type": "file",
+              "source": {
+                "kind": "artifact",
+                "key": "artifact://contract/result.json",
+                "mimeType": "application/json",
+                "filename": "result.json"
+              },
+              "title": "Contract result",
+              "textHint": "2 contract items",
+              "metadata": {
+                "audited": true
+              }
+            }
+          ],
+          "name": "contract.envelope",
+          "toolCallId": "call_envelope",
+          "toolCalls": [],
+          "metadata": {
+            "ok": true,
+            "artifactKey": "artifact://contract/result.json"
+          }
+        }
+      }
+    },
+    {
+      "name": "thrown error becomes failed tool result message",
+      "input": {
+        "toolCall": {
+          "id": "call_throw",
+          "name": "contract.throw",
+          "arguments": {}
+        },
+        "throws": {
+          "message": "contract exploded"
+        }
       },
       "expected": {
         "ok": false,
-        "resultKind": null,
-        "error": "Tool \"fixture.fail\" failed.",
-        "output": "{\n  \"error\": \"contract failure\",\n  \"ok\": false\n}",
+        "structuredOutput": null,
+        "output": "{\n  \"ok\": false,\n  \"error\": \"contract exploded\"\n}",
+        "error": {
+          "name": "ToolExecutionError",
+          "message": "Tool \"contract.throw\" failed.",
+          "toolName": "contract.throw",
+          "toolCallId": "call_throw",
+          "cause": {
+            "name": "Error",
+            "message": "contract exploded"
+          }
+        },
         "message": {
           "role": "tool",
           "content": [
             {
               "type": "text",
-              "text": "{\n  \"error\": \"contract failure\",\n  \"ok\": false\n}"
+              "text": "{\n  \"ok\": false,\n  \"error\": \"contract exploded\"\n}"
             }
           ],
-          "name": "fixture.fail",
-          "toolCallId": "call_fail",
+          "name": "contract.throw",
+          "toolCallId": "call_throw",
           "toolCalls": [],
           "metadata": {
             "ok": false

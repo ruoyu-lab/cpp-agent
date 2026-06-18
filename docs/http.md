@@ -1,8 +1,10 @@
 # HTTP API
 
-The native HTTP module provides small transport abstractions plus a
-zero-dependency plain-HTTP client used by model, web, media, and builtin tool
-adapters. Production network policy stays injectable.
+The core HTTP module provides small transport abstractions and request/stream
+helpers. The optional native HTTP module adds a zero-dependency plain-HTTP
+client used by full/app I/O adapters when the host opts into `agent_platform`
+directly or through native helper targets such as `agent_runtime_io_native`.
+Production network policy stays injectable.
 
 ## Transport Interface
 
@@ -71,6 +73,8 @@ returns the raw `HttpResponse` body for callers that parse their own stream.
 `create_native_http_transport` creates a POSIX socket-backed HTTP/1.1 transport:
 
 ```cpp
+#include "agent/http_native.hpp"
+
 auto transport = agent::create_native_http_transport(agent::NativeHttpClientConfig{
     .timeout_ms = 30000,
     .max_response_bytes = 10 * 1024 * 1024,
@@ -110,7 +114,8 @@ newlines, ignores comment lines, and flushes the final unterminated event.
 
 ## Zero-Dependency Boundary
 
-The HTTP module uses only the C++ standard library plus POSIX sockets for the
-default plain-HTTP client. It does not link TLS, HTTP/2, proxy, cookie, cloud
-SDK, or JavaScript runtime dependencies. Those features belong in injected
-transports.
+`agent/http.hpp` uses only the C++ standard library and stays platform-neutral.
+`agent/http_native.hpp` and `agent_platform` use POSIX sockets for the optional
+default plain-HTTP client. Neither layer links TLS, HTTP/2, proxy, cookie,
+cloud SDK, or JavaScript runtime dependencies. Those features belong in
+injected transports.

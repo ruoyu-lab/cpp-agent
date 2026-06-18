@@ -5,26 +5,24 @@
 #include "agent/hooks.hpp"
 #include "agent/sandbox.hpp"
 #include "agent/scratch.hpp"
+#include "agent/security_governance.hpp"
 
+#include <cstdint>
 #include <iosfwd>
+#include <map>
 #include <mutex>
 #include <set>
+#include <string>
+#include <type_traits>
+#include <typeinfo>
+#include <vector>
 
 namespace agent {
 
-class BrowserRenderer;
-class DocumentPreprocessorRegistry;
-class DocumentRasterizerRegistry;
-class KnowledgeBase;
-class KnowledgeBaseManager;
-class LongTermMemory;
-class NativeWebCrawler;
-class NativeWebPageFetcher;
-class OCRProviderRegistry;
+class KnowledgeContextProvider;
+class LongTermMemoryPort;
 class SessionMemory;
-class WebSearchProviderRegistry;
-class WorkflowEngine;
-struct WorkflowDefinition;
+class ToolRunManager;
 
 enum class ToolRiskLevel {
   Low,
@@ -37,48 +35,119 @@ ToolRiskLevel tool_risk_level_from_string(const std::string& value, ToolRiskLeve
 
 class ToolRegistry;
 struct HookSet;  // forward to avoid header cycle
+
+struct ToolServiceRequirement {
+  std::string name;
+  bool optional = false;
+};
+
+template <typename T>
+struct ToolServiceToken {
+  std::string name;
+};
+
+template <typename T>
+inline ToolServiceRequirement tool_service_requirement(const ToolServiceToken<T>& token,
+                                                       bool optional = false) {
+  return ToolServiceRequirement{.name = token.name, .optional = optional};
+}
+
+inline const ToolServiceToken<SessionMemory> kToolServiceSessionMemory{"memory.session"};
+inline const ToolServiceToken<ScratchStore> kToolServiceScratchStore{"state.scratch"};
+inline const ToolServiceToken<ToolRegistry> kToolServiceToolRegistry{"tool.registry"};
+inline const ToolServiceToken<const HookSet> kToolServiceHooks{"tool.hooks"};
+inline const ToolServiceToken<LongTermMemoryPort> kToolServiceLongTermMemory{"memory.long_term"};
+inline const ToolServiceToken<KnowledgeContextProvider> kToolServiceKnowledgeProvider{"knowledge.provider"};
+inline const ToolServiceToken<ToolRunManager> kToolServiceToolRunManager{"tool_runs.manager"};
+inline const ToolServiceToken<Sandbox> kToolServiceSandbox{"sandbox"};
+inline const ToolServiceToken<SandboxScope> kToolServiceSandboxScope{"sandbox.scope"};
+
+struct ToolServiceBinding {
+  void* pointer = nullptr;
+  std::string type_name;
+};
+
+class ToolServiceView {
+ public:
+  [[nodiscard]] bool has(const std::string& name) const;
+  [[nodiscard]] std::vector<std::string> names() const;
+
+  template <typename T>
+  [[nodiscard]] T* get(const ToolServiceToken<T>& token) const {
+    const auto found = services_.find(token.name);
+    if (found == services_.end() || found->second.type_name != typeid(T*).name()) {
+      return nullptr;
+    }
+    return static_cast<T*>(found->second.pointer);
+  }
+
+  template <typename T>
+  T& require(const ToolServiceToken<T>& token) const {
+    auto* service = get(token);
+    if (!service) {
+      throw ConfigurationError("Tool service \"" + token.name + "\" is required but was not provided.");
+    }
+    return *service;
+  }
+
+ private:
+  friend class ToolServiceContainer;
+  std::map<std::string, ToolServiceBinding> services_;
+};
+
+class ToolServiceContainer {
+ public:
+  [[nodiscard]] bool has(const std::string& name) const;
+  [[nodiscard]] ToolServiceView view(const std::vector<ToolServiceRequirement>& requirements) const;
+  void merge_from(const ToolServiceContainer& other);
+
+  template <typename T>
+  void set(const ToolServiceToken<T>& token, T* service) {
+    if (token.name.empty()) {
+      throw ConfigurationError("Tool service token name is required.");
+    }
+    if (!service) {
+      services_.erase(token.name);
+      return;
+    }
+    services_[token.name] = ToolServiceBinding{
+        .pointer = const_cast<void*>(static_cast<const void*>(service)),
+        .type_name = typeid(T*).name(),
+    };
+  }
+
+  template <typename T, typename U,
+            typename = std::enable_if_t<!std::is_same_v<T, U> && std::is_convertible_v<U*, T*>>>
+  void set(const ToolServiceToken<T>& token, U* service) {
+    set(token, static_cast<T*>(service));
+  }
+
+  template <typename T>
+  [[nodiscard]] T* get(const ToolServiceToken<T>& token) const {
+    return view({ToolServiceRequirement{.name = token.name, .optional = true}}).get(token);
+  }
+
+ private:
+  std::map<std::string, ToolServiceBinding> services_;
+};
+
 struct ToolExecutionServices {
   Value values = Value::object({});
-  SessionMemory* session = nullptr;
-  // Injected by the runner; required by `scratch.*` / `todo.*` builtin tools
-  // (and any user tool that wants shared short-term memory). Non-owning.
-  ScratchStore* scratch_store = nullptr;
-  // Registry the tool was dispatched from. Set by the executor before
-  // each invocation; consumed by lazy-discovery tools like `tool.search`
-  // and `tool.describe`.
-  ToolRegistry* registry = nullptr;
-  // Active hook set (set by the executor). Lets tools that want to fire
-  // domain-specific hooks (e.g. fs.writeText's `before_fs_write`) reach them
-  // without threading another argument through every signature.
-  const HookSet* hooks = nullptr;
-  LongTermMemory* long_term_memory = nullptr;
-  KnowledgeBase* knowledge_base = nullptr;
-  KnowledgeBaseManager* knowledge_base_manager = nullptr;
-  WorkflowEngine* workflow_engine = nullptr;
-  const WorkflowDefinition* workflow_definition = nullptr;
-  WebSearchProviderRegistry* web_search_registry = nullptr;
-  std::string default_search_provider;
-  NativeWebPageFetcher* web_fetcher = nullptr;
-  NativeWebCrawler* web_crawler = nullptr;
-  Value default_crawler_profile = Value::object({});
-  BrowserRenderer* browser_renderer = nullptr;
-  DefaultMediaResolver::ArtifactLookup artifact_lookup;
-  OCRProviderRegistry* ocr_registry = nullptr;
-  std::string default_ocr_provider;
-  DocumentRasterizerRegistry* document_rasterizers = nullptr;
-  DocumentPreprocessorRegistry* document_preprocessors = nullptr;
-  // Active sandbox the executor will enforce before each tool invocation.
-  // Non-owning pointer; lifetime managed by the host. nullptr means "no
-  // sandbox installed" — tools whose policy demands non-empty capabilities
-  // will refuse to run in that case.
-  Sandbox* sandbox = nullptr;
-  // Set by the executor for the duration of `invoke()` after a successful
-  // `enter()`. Lets tools (notably shell.exec) read the active request to
-  // pass allowlists / capability axes through to a downstream process
-  // executor without rethreading arguments. Non-owning; cleared by the
-  // executor before the underlying scope is destroyed.
-  SandboxScope* sandbox_scope = nullptr;
+  ToolServiceContainer service_container;
+  ToolServiceView service_view;
 };
+
+struct ToolProgressEvent {
+  std::string kind;
+  std::string tool_call_id;
+  std::string tool_name;
+  int iteration = 0;
+  std::uint64_t sequence = 0;
+  Value payload = Value::object({});
+  TraceContext trace;
+};
+
+using ToolProgressEmitter = std::function<void(ToolProgressEvent)>;
 
 struct ToolExecutionContext {
   Value services = Value::object({});
@@ -88,6 +157,7 @@ struct ToolExecutionContext {
   int iteration = 0;
   TraceContext trace_context;
   CancellationToken* cancellation = nullptr;
+  ToolProgressEmitter emit_progress;
 };
 
 Value merge_tool_service_values(const Value& base, const Value& overlay);
@@ -97,6 +167,9 @@ ToolExecutionContext with_tool_execution_services(ToolExecutionContext context,
                                                   const ToolExecutionServices& configured_services,
                                                   const ToolExecutionServices& runtime_services = {});
 ToolExecutionContext normalize_tool_execution_context(ToolExecutionContext context);
+void emit_tool_progress(ToolExecutionContext& context,
+                        std::string kind,
+                        Value payload = Value::object({}));
 
 struct ToolResultEnvelope {
   std::optional<std::vector<MessageContentPart>> content;
@@ -112,13 +185,21 @@ struct ToolDefinition {
   std::string description;
   JsonSchema input_schema;
   std::vector<std::string> capabilities;
+  std::vector<ToolServiceRequirement> service_requirements;
   ToolRiskLevel risk_level = ToolRiskLevel::Low;
   std::vector<std::string> tags;
   std::string bundle;
   bool builtin = false;
+  bool read_only = false;
+  bool mutates_files = false;
+  bool interactive = false;
+  bool long_running = false;
+  bool batchable = false;
+  std::string concurrency_key;
+  std::string side_effect_level = "unknown";
   // Sandbox capabilities this tool requires (and optionally prefers). The
   // executor calls `enforce_sandbox_contract(sandbox_policy,
-  // ctx.service_refs.sandbox, event_bus)` before dispatch; contract
+  // ctx.service_refs.service_container, event_bus)` before dispatch; contract
   // violations throw `SandboxContractError`.
   ToolSandboxPolicy sandbox_policy;
   ToolHandler execute;
@@ -177,15 +258,25 @@ PermissionDecisionKind permission_decision_kind_from_string(
 struct PermissionDecision {
   PermissionDecisionKind decision = PermissionDecisionKind::Allow;
   std::string reason;
+  PermissionDecisionSource source = PermissionDecisionSource::Default;
+  std::string rule_id;
+  PermissionPriority priority = 0;
+  std::vector<PermissionResource> resources;
+  std::optional<SandboxRequest> sandbox_request;
 };
 
 struct PermissionRequest {
+  PermissionToolRef tool;
   std::string tool_name;
   std::vector<std::string> capabilities;
   ToolRiskLevel risk_level = ToolRiskLevel::Low;
   std::vector<std::string> tags;
   std::string bundle;
   bool builtin = false;
+  std::vector<PermissionAction> actions;
+  std::vector<PermissionResource> resources;
+  PermissionDecisionSource source = PermissionDecisionSource::Default;
+  PermissionPriority priority = 0;
   ToolCall tool_call;
   ToolExecutionContext context;
 };
@@ -196,6 +287,8 @@ using PermissionApprovalHandler = std::function<PermissionDecision(const Permiss
 struct ToolPermissionMatcher {
   std::vector<std::string> tool_names;
   std::vector<std::string> capabilities;
+  std::vector<PermissionAction> actions;
+  std::vector<PermissionResourceMatcher> resource_matchers;
   std::vector<std::string> tags;
   std::vector<ToolRiskLevel> risk_levels;
   std::optional<bool> builtin;
@@ -219,6 +312,35 @@ struct CapabilityPermissionPolicyConfig {
   std::vector<std::string> deny;
   std::vector<std::string> ask;
   PermissionDecisionKind high_risk_mode = PermissionDecisionKind::Ask;
+};
+
+struct FineGrainedPermissionMatcher {
+  std::vector<std::string> tool_names;
+  std::vector<std::string> capabilities;
+  std::vector<PermissionAction> actions;
+  std::vector<PermissionResourceMatcher> resource_matchers;
+  std::vector<std::string> tags;
+  std::vector<ToolRiskLevel> risk_levels;
+  std::optional<bool> builtin;
+  std::vector<std::string> bundles;
+};
+
+struct FineGrainedPermissionRule {
+  std::string id;
+  std::string description;
+  PermissionPriority priority = 0;
+  PermissionDecisionSource source = PermissionDecisionSource::Rule;
+  FineGrainedPermissionMatcher match;
+  PermissionDecisionKind decision = PermissionDecisionKind::Deny;
+  std::string reason;
+  std::vector<PermissionResource> resources;
+  std::optional<SandboxRequest> sandbox_request;
+};
+
+struct FineGrainedPermissionPolicyConfig {
+  std::vector<FineGrainedPermissionRule> rules;
+  PermissionDecisionKind default_decision = PermissionDecisionKind::Deny;
+  std::string default_reason;
 };
 
 struct CliApprovalHandlerConfig {
@@ -247,6 +369,7 @@ class MemoryApprovalRecorder {
 
 PermissionPolicy create_rule_based_permission_policy(RuleBasedPermissionPolicyConfig config = {});
 PermissionPolicy create_capability_policy(CapabilityPermissionPolicyConfig config = {});
+PermissionPolicy create_fine_grained_permission_policy(FineGrainedPermissionPolicyConfig config = {});
 PermissionApprovalHandler create_static_approval_handler(PermissionDecision decision = {});
 PermissionApprovalHandler create_cli_approval_handler(CliApprovalHandlerConfig config = {});
 

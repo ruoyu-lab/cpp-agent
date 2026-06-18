@@ -1,4 +1,4 @@
-#include "agent/agent.hpp"
+#include "agent/core_api.hpp"
 #include "detail/helpers.hpp"
 
 #include <algorithm>
@@ -117,6 +117,16 @@ std::string DefaultMediaResolver::extension_to_mime(const std::filesystem::path&
   if (ext == ".gif") return "image/gif";
   if (ext == ".webp") return "image/webp";
   if (ext == ".svg") return "image/svg+xml";
+  if (ext == ".mp4") return "video/mp4";
+  if (ext == ".webm") return "video/webm";
+  if (ext == ".mov") return "video/quicktime";
+  if (ext == ".m4v") return "video/x-m4v";
+  if (ext == ".mp3") return "audio/mpeg";
+  if (ext == ".m4a") return "audio/mp4";
+  if (ext == ".wav") return "audio/wav";
+  if (ext == ".ogg") return "audio/ogg";
+  if (ext == ".aac") return "audio/aac";
+  if (ext == ".flac") return "audio/flac";
   return {};
 }
 
@@ -143,6 +153,27 @@ void put_if_present(Value::Object& object, const std::string& key, const std::st
   if (!value.empty()) {
     object[key] = value;
   }
+}
+
+void put_if_present(Value::Object& object, const std::string& key,
+                    const std::optional<double>& value) {
+  if (value) {
+    object[key] = *value;
+  }
+}
+
+bool has_media_source_payload(const MediaSource& source) {
+  switch (source.kind) {
+    case MediaSourceKind::Inline:
+      return !source.data.empty();
+    case MediaSourceKind::Url:
+      return !source.url.empty();
+    case MediaSourceKind::Path:
+      return !source.path.empty();
+    case MediaSourceKind::Artifact:
+      return !source.key.empty();
+  }
+  return false;
 }
 
 Value media_source_to_contract_value(const MediaSource& source) {
@@ -175,6 +206,18 @@ Value content_part_to_contract_value(const MessageContentPart& part) {
     object["source"] = media_source_to_contract_value(part.source);
     put_if_present(object, "title", part.title);
     put_if_present(object, "textHint", part.text_hint);
+  } else if (part.type == ContentPartType::Audio) {
+    object["source"] = media_source_to_contract_value(part.source);
+    put_if_present(object, "title", part.title);
+    put_if_present(object, "transcriptHint", part.transcript_hint);
+  } else if (part.type == ContentPartType::Video) {
+    object["source"] = media_source_to_contract_value(part.source);
+    put_if_present(object, "title", part.title);
+    put_if_present(object, "textHint", part.text_hint);
+    put_if_present(object, "transcriptHint", part.transcript_hint);
+    put_if_present(object, "startTimeSeconds", part.start_time_seconds);
+    put_if_present(object, "endTimeSeconds", part.end_time_seconds);
+    put_if_present(object, "frameRateHint", part.frame_rate_hint);
   }
   if (is_non_empty_object(part.metadata)) {
     object["metadata"] = part.metadata;
@@ -255,6 +298,27 @@ MessageContentPart normalize_content_part_from_value(const Value& value) {
         normalize_media_source_from_value(value.at("source")),
         value.at("title").as_string(),
         value.at("textHint").as_string(),
+        normalized_metadata(value.at("metadata")));
+  }
+  if (type == "audio") {
+    return audio_part(
+        normalize_media_source_from_value(value.at("source")),
+        value.at("title").as_string(),
+        value.at("transcriptHint").as_string(),
+        normalized_metadata(value.at("metadata")));
+  }
+  if (type == "video") {
+    const auto start_time = value.at("startTimeSeconds");
+    const auto end_time = value.at("endTimeSeconds");
+    const auto frame_rate = value.at("frameRateHint");
+    return video_part(
+        normalize_media_source_from_value(value.at("source")),
+        value.at("title").as_string(),
+        value.at("textHint").as_string(),
+        value.at("transcriptHint").as_string(),
+        start_time.is_number() ? std::optional<double>(start_time.as_number()) : std::nullopt,
+        end_time.is_number() ? std::optional<double>(end_time.as_number()) : std::nullopt,
+        frame_rate.is_number() ? std::optional<double>(frame_rate.as_number()) : std::nullopt,
         normalized_metadata(value.at("metadata")));
   }
 
@@ -350,6 +414,36 @@ MessageContentPart file_part(MediaSource source, std::string title, std::string 
   return part;
 }
 
+MessageContentPart audio_part(MediaSource source, std::string title, std::string transcript_hint,
+                              Value metadata) {
+  MessageContentPart part;
+  part.type = ContentPartType::Audio;
+  part.source = std::move(source);
+  part.title = std::move(title);
+  part.transcript_hint = std::move(transcript_hint);
+  part.metadata = std::move(metadata);
+  return part;
+}
+
+MessageContentPart video_part(MediaSource source, std::string title, std::string text_hint,
+                              std::string transcript_hint,
+                              std::optional<double> start_time_seconds,
+                              std::optional<double> end_time_seconds,
+                              std::optional<double> frame_rate_hint,
+                              Value metadata) {
+  MessageContentPart part;
+  part.type = ContentPartType::Video;
+  part.source = std::move(source);
+  part.title = std::move(title);
+  part.text_hint = std::move(text_hint);
+  part.transcript_hint = std::move(transcript_hint);
+  part.start_time_seconds = start_time_seconds;
+  part.end_time_seconds = end_time_seconds;
+  part.frame_rate_hint = frame_rate_hint;
+  part.metadata = std::move(metadata);
+  return part;
+}
+
 AgentMessage create_message(MessageRole role, std::string content, Value metadata) {
   return create_message(role, std::vector<MessageContentPart>{text_part(std::move(content))}, std::move(metadata));
 }
@@ -429,7 +523,7 @@ AgentMessage agent_message_from_value(const Value& value) {
   return message;
 }
 
-AgentMessage assistant_message_from_response(const ModelResponse& response) {
+AgentMessage assistant_message_from_output(const AgentOutput& response) {
   AgentMessage message;
   message.role = MessageRole::Assistant;
   message.content = response.content.empty() && !response.text.empty()
@@ -445,6 +539,122 @@ AgentMessage assistant_message_from_response(const ModelResponse& response) {
                                       : Value()},
   });
   return message;
+}
+
+Value agent_artifact_to_value(const AgentArtifact& artifact, bool include_inline_data) {
+  MediaSource source = artifact.source;
+  if (!include_inline_data && source.kind == MediaSourceKind::Inline) {
+    source.data.clear();
+  }
+  Value::Object object{
+      {"id", artifact.id.empty() ? Value() : Value(artifact.id)},
+      {"kind", artifact.kind},
+      {"source", has_media_source_payload(source) ? media_source_to_contract_value(source) : Value()},
+      {"mimeType", artifact.mime_type.empty() ? Value() : Value(artifact.mime_type)},
+      {"filename", artifact.filename.empty() ? Value() : Value(artifact.filename)},
+      {"byteLength", static_cast<long long>(artifact.byte_length ? artifact.byte_length : artifact.bytes.size())},
+      {"providerAssetId", artifact.provider_asset_id.empty() ? Value() : Value(artifact.provider_asset_id)},
+      {"metadata", artifact.metadata},
+  };
+  if (include_inline_data && !artifact.bytes.empty()) {
+    object["bytes"] = base64_encode(artifact.bytes);
+    object["encoding"] = "base64";
+  }
+  return Value(std::move(object));
+}
+
+Value agent_output_to_value(const AgentOutput& output, bool include_inline_data) {
+  Value::Array content;
+  content.reserve(output.content.size());
+  for (const auto& part : output.content) {
+    content.push_back(content_part_to_contract_value(part));
+  }
+  Value::Array tool_calls;
+  tool_calls.reserve(output.tool_calls.size());
+  for (const auto& tool_call : output.tool_calls) {
+    tool_calls.push_back(Value::object({
+        {"id", tool_call.id},
+        {"name", tool_call.name},
+        {"arguments", tool_call.arguments},
+    }));
+  }
+  Value::Array artifacts;
+  artifacts.reserve(output.artifacts.size());
+  for (const auto& artifact : output.artifacts) {
+    artifacts.push_back(agent_artifact_to_value(artifact, include_inline_data));
+  }
+  return Value::object({
+      {"id", output.id.empty() ? Value() : Value(output.id)},
+      {"provider", output.provider},
+      {"model", output.model},
+      {"content", Value(std::move(content))},
+      {"text", output.text},
+      {"reasoning", output.reasoning ? Value::object({{"text", output.reasoning->text},
+                                                      {"format", output.reasoning->format}})
+                                    : Value()},
+      {"toolCalls", Value(std::move(tool_calls))},
+      {"finishReason", output.finish_reason},
+      {"artifacts", Value(std::move(artifacts))},
+      {"usage", output.usage},
+      {"metadata", output.metadata},
+      {"raw", output.raw},
+  });
+}
+
+AgentOutput agent_output_from_value(const Value& value) {
+  AgentOutput output;
+  if (!value.is_object()) {
+    return output;
+  }
+  output.id = value.at("id").as_string();
+  output.provider = value.at("provider").as_string();
+  output.model = value.at("model").as_string();
+  output.content = normalize_message_content_from_value(value.at("content"));
+  output.text = value.at("text").as_string();
+  if (value.at("reasoning").is_object()) {
+    output.reasoning = ModelReasoning{
+        value.at("reasoning").at("text").as_string(),
+        value.at("reasoning").at("format").as_string("summary"),
+    };
+  }
+  const auto& tool_calls = value.at("toolCalls");
+  if (tool_calls.is_array()) {
+    std::size_t index = 0;
+    for (const auto& item : tool_calls.as_array()) {
+      output.tool_calls.push_back(normalize_tool_call_from_value(item, index++));
+    }
+  }
+  output.finish_reason = value.at("finishReason").as_string("stop");
+  const auto& artifacts = value.at("artifacts");
+  if (artifacts.is_array()) {
+    for (const auto& item : artifacts.as_array()) {
+      if (!item.is_object()) {
+        continue;
+      }
+      AgentArtifact artifact;
+      artifact.id = item.at("id").as_string();
+      artifact.kind = item.at("kind").as_string();
+      if (item.at("source").is_object()) {
+        artifact.source = normalize_media_source_from_value(item.at("source"));
+      }
+      artifact.mime_type = item.at("mimeType").as_string();
+      artifact.filename = item.at("filename").as_string();
+      if (item.at("byteLength").is_number()) {
+        artifact.byte_length = static_cast<std::size_t>(std::max<long long>(0, item.at("byteLength").as_integer()));
+      }
+      if (item.at("bytes").is_string() && item.at("encoding").as_string() == "base64") {
+        artifact.bytes = decode_base64(item.at("bytes").as_string());
+        artifact.byte_length = artifact.bytes.size();
+      }
+      artifact.provider_asset_id = item.at("providerAssetId").as_string();
+      artifact.metadata = normalized_metadata(item.at("metadata"));
+      output.artifacts.push_back(std::move(artifact));
+    }
+  }
+  output.usage = value.at("usage");
+  output.metadata = normalized_metadata(value.at("metadata"));
+  output.raw = value.at("raw");
+  return output;
 }
 
 std::string normalize_finish_reason(std::string raw) {

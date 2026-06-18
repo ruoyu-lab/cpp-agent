@@ -3,13 +3,48 @@
 The native memory module mirrors the NodeJS session and vector memory surfaces
 while staying synchronous and dependency-free.
 
+## Storage Role
+
+Memory storage is intentionally dual-mode:
+
+- In small local deployments, `SessionMemory`, `FileSessionStore`, and
+  `FileVectorStore` may be the canonical application store.
+- In host-owned or larger deployments, session memory is `runtime-owned` state
+  for continuity, resume, and compaction. Vector memory, knowledge stores,
+  text indexes, vector indexes, and rerank caches are `derived` substrate that
+  can be rebuilt from host-owned business data or runtime events.
+
+The framework does not define business entities, tenant records, reporting
+tables, or the long-term chat archive format for a production host. Those stay
+owned by the embedding application and are exposed to the runner through tools,
+repositories, or injected adapters.
+
+## Header Boundary
+
+`agent/memory.hpp` is limited to session memory, session stores, long-term
+memory records, vector stores, and writeback hooks. The embeddable runner only
+needs `agent/knowledge_runtime.hpp` and a `KnowledgeContextProvider`; full
+knowledge-base assembly is a separate opt-in concern:
+
+- include `agent/knowledge_core.hpp` or `agent/knowledge.hpp` for
+  `KnowledgeSourceLoader`, `KnowledgeStore`, indexes, rerankers,
+  `KnowledgeBase`, and `KnowledgeBaseManager`;
+- include `agent/knowledge_io.hpp` and link `agent_runtime_io` for
+  repository, web, website, and sitemap loaders.
+
+This keeps embeddable hosts from pulling host I/O or knowledge-base assembly
+details when they only need chat history or long-term memory.
+
 ## Session Memory
 
 `SessionMemory` stores chat history, compacts old messages into a summary, and
 can expose a summary-prefixed message list:
 
 ```cpp
-agent::SessionMemory session("support", agent::CompactionBudget{.max_messages = 24});
+agent::SessionMemoryOptions options;
+options.storage.session_id = "support";
+options.compaction.compaction_budget.max_messages = 24;
+agent::SessionMemory session(options);
 session.add(agent::create_message(agent::MessageRole::User, "hello"));
 auto messages = session.get_messages();
 ```
@@ -48,13 +83,13 @@ The three idiomatic shapes:
 
 ```cpp
 // Count-only: keep the most recent N messages, no token awareness.
-options.compaction_budget = {.max_messages = 24};
+options.compaction.compaction_budget = {.max_messages = 24};
 
 // Token-only: drop oldest until estimated tokens fit the cap.
-options.compaction_budget = {.max_tokens = 100000};
+options.compaction.compaction_budget = {.max_tokens = 100000};
 
 // Both: cap by N messages, then drop more if tokens still exceed cap.
-options.compaction_budget = {.max_messages = 24, .max_tokens = 100000};
+options.compaction.compaction_budget = {.max_messages = 24, .max_tokens = 100000};
 ```
 
 #### Unit alignment (and the bug this prevents)
@@ -79,15 +114,55 @@ messages when compaction moves old turns out of the live window:
 
 ```cpp
 agent::SessionMemoryOptions options;
-options.session_id = "support";
-options.compaction_budget.max_messages = 24;
-options.summarizer = [](const agent::SessionMemorySummaryInput& input) {
+options.storage.session_id = "support";
+options.compaction.compaction_budget.max_messages = 24;
+options.compaction.summarizer = [](const agent::SessionMemorySummaryInput& input) {
   return "Archived " + std::to_string(input.archived_messages.size()) +
          " messages for " + input.session_id;
 };
 
 agent::SessionMemory session(options);
 ```
+
+#### LLM summarizer
+
+The native module also exposes a reusable LLM-backed summarizer factory. It is
+still just a `SessionMemorySummarizer`: `plan_compaction` remains deterministic
+and decides which messages leave the live window; the model only merges
+`previous_summary` and `archived_messages` into a better summary.
+
+```cpp
+auto model = std::make_shared<agent::OpenAICompatibleChatModelAdapter>(
+    "openai",
+    "gpt-5-mini",
+    transport,
+    "/v1/chat/completions",
+    "https://api.openai.com",
+    api_key);
+
+agent::SessionMemoryOptions options;
+options.compaction.compaction_budget.max_tokens = 80000;
+options.compaction.token_budget = 128000;
+options.compaction.summarizer_mode = agent::SummarizerMode::Background;
+options.compaction.summarizer = agent::create_llm_session_summarizer({
+    .model = model,
+    .max_input_chars = 24000,
+    .max_summary_chars = 8000,
+    .max_summary_tokens = 2000,
+});
+```
+
+Defaults target agent-state summaries: current goal, durable facts, user
+preferences, decisions, open tasks, constraints, tool/environment state, and
+recent progress. Advanced hosts can replace `format_message`, `build_messages`,
+and `parse_response` on `LLMSessionSummarizerOptions` for redaction, auditing,
+provider-specific schemas, or strict structured output.
+
+`on_error` defaults to `LLMSessionSummarizerErrorMode::Throw`, which lets
+`SessionMemory` preserve pending overflow and emit a `Failed` compaction event.
+Set `on_error = LLMSessionSummarizerErrorMode::Fallback` to use the deterministic
+summary fallback when the model is unavailable. The factory is explicit opt-in;
+the default `SessionMemory` never sends history to an external model.
 
 ### Auto-compaction by token budget
 
@@ -100,9 +175,9 @@ provider-accurate tokenizer.
 
 ```cpp
 agent::SessionMemoryOptions options;
-options.token_budget = 8000;
-options.auto_compact_at = 0.8;
-options.token_counter = [](const std::vector<agent::AgentMessage>& msgs) {
+options.compaction.token_budget = 8000;
+options.compaction.auto_compact_at = 0.8;
+options.compaction.token_counter = [](const std::vector<agent::AgentMessage>& msgs) {
   return my_tokenizer_count(msgs);
 };
 ```
@@ -111,6 +186,21 @@ The runner emits a `session.auto_compact` event on its `EventBus` whenever
 auto-compaction fires, carrying `tokensBefore`, `tokensAfter`, and
 `tokenBudget` for observability. When `token_budget == 0` (the default)
 auto-compaction is disabled and behaviour is unchanged.
+
+### Manual compaction
+
+Call `SessionMemory::compact()` whenever the host wants to reduce the live
+window immediately. It uses the same three-phase pipeline as the automatic
+runtime trigger and requires at least one `compaction_budget` cap:
+
+```cpp
+session.compact();
+```
+
+When working through a runner, `AgentRunner::compact_session("session-1")`
+fetches the session from the configured store, calls `compact()`, returns the
+post-compaction snapshot, and emits a `session.compact` event on the runner
+`EventBus`.
 
 ### Compaction pipeline (`plan_compaction` + three-phase contract)
 
@@ -142,15 +232,15 @@ no-ops.
 
 ### Per-append compaction opt-out (`compact_on_append`)
 
-By default `add()` / `add_many()` immediately attempt compaction when a
-`CompactionBudget` is set. Hosts that run an external compaction driver
-(for example, runtime-side `maybe_auto_compact` between iterations) can
-opt out so that append latency is bounded:
+By default `add()` / `add_many()` do not compact on the append path. Hosts that
+want eager per-append compaction can opt in; hosts that run an external
+compaction driver (for example, runtime-side `maybe_auto_compact` between
+iterations) should keep the default so append latency stays bounded:
 
 ```cpp
 agent::SessionMemoryOptions options;
-options.compaction_budget.max_tokens = 100000;
-options.compact_on_append = false;  // only explicit compact() reduces messages
+options.compaction.compaction_budget.max_tokens = 100000;
+options.compaction.compact_on_append = true;  // add()/add_many() may compact immediately
 ```
 
 NodeJS mirror name: `compactOnAppend` on `SessionMemoryOptions`.
@@ -186,8 +276,8 @@ explicitly:
 
 ```cpp
 agent::SessionMemoryOptions options;
-options.summary_label = "Support summary";
-options.compaction_budget.max_messages = 32;
+options.storage.summary_label = "Support summary";
+options.compaction.compaction_budget.max_messages = 32;
 
 agent::FileSessionStore store("sessions", options);
 auto session = store.get("srv:one/path");
